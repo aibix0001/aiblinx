@@ -63,3 +63,32 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # A GitHub release per v* tag, with that version's CHANGELOG.md section as
+  # its notes. Runs after the images are published.
+  release:
+    needs: image
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: release notes from CHANGELOG.md
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            $0 == "## " v { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          test -s notes.md || { echo "no CHANGELOG.md section for $version" >&2; exit 1; }
+          {
+            echo
+            echo "Image: \`ghcr.io/${GITHUB_REPOSITORY}:${version}\` (linux/amd64, linux/arm64)"
+          } >> notes.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: aiblinx ${{ github.ref_name }}
+          body_path: notes.md
+
