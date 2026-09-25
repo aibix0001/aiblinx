@@ -38,19 +38,22 @@ async def _embed_pending(
     skipped = 0
     # Build text for every row up front, clamping to the per-doc budget.
     prepared: list[str] = []
-    for i, row in enumerate(rows):
+    truncated = 0
+    for row in rows:
         raw = (row["text"] or "").strip() or row["url"] or "untitled"
         if len(raw) > settings.embed_max_chars:
-            log.warning(
-                "%s row %d oversized (%d chars, cap %d); truncated — url=%s",
-                table,
-                i,
-                len(raw),
-                settings.embed_max_chars,
-                row["url"],
-            )
+            # long article text is normal; the head carries the topic
+            truncated += 1
             raw = raw[: settings.embed_max_chars]
         prepared.append(raw)
+    if truncated:
+        log.info(
+            "%s: %d of %d texts cut to the %d-char embedding cap",
+            table,
+            truncated,
+            len(rows),
+            settings.embed_max_chars,
+        )
     # Group into batches bounded by aggregate character budget, never
     # exceeding the fixed row limit.
     batch_size = BATCH
@@ -127,3 +130,58 @@ async def embed_pending_candidates(settings: Settings, llm: LLMClient) -> int:
         settings,
         llm,
     )
+
+
+# Saves, feedback and ratings carry a copy of their page's vector (so they
+# outlive the candidate prune). After an embedding-model change those copies
+# are cleared, and this re-embeds them from the text still at hand: the
+# candidate's title and snippet while it exists, else the saved title, else
+# the URL. Mood feedback never feeds the profile, so it is left alone.
+_SIGNAL_TEXT = {
+    "saves": "SELECT s.id, COALESCE(s.title, '') || ' ' || s.url AS text "
+    "FROM saves s WHERE s.embedding IS NULL",
+    "feedback": "SELECT f.id, COALESCE(c.title || ' ' || COALESCE(c.snippet, ''), "
+    "s.title || ' ' || s.url, f.url) AS text FROM feedback f "
+    "LEFT JOIN candidates c ON c.id = f.candidate_id "
+    "LEFT JOIN saves s ON s.url_key = f.url "
+    "WHERE f.embedding IS NULL AND f.axis != 'mood'",
+    "ratings": "SELECT r.id, COALESCE(c.title || ' ' || COALESCE(c.snippet, ''), "
+    "s.title || ' ' || s.url, r.url) AS text FROM ratings r "
+    "LEFT JOIN candidates c ON c.id = r.candidate_id "
+    "LEFT JOIN saves s ON s.url_key = r.url WHERE r.embedding IS NULL",
+}
+
+
+async def embed_pending_signals(settings: Settings, llm: LLMClient) -> int:
+    """Re-embed saves, feedback and ratings that have no vector; returns the
+    number embedded. A no-op in normal operation."""
+    done = 0
+    for table, query in _SIGNAL_TEXT.items():
+        with connection(settings) as conn:
+            rows = conn.execute(query).fetchall()
+        texts = [(row["text"] or "untitled")[: settings.embed_max_chars] for row in rows]
+        i = 0
+        while i < len(rows):
+            end, chars = i, 0
+            while end < len(rows) and end - i < BATCH:
+                if end > i and chars + len(texts[end]) > settings.embed_max_batch_chars:
+                    break
+                chars += len(texts[end])
+                end += 1
+            try:
+                vectors = await llm.embed(texts[i:end])
+            except Exception:  # noqa: BLE001 - retried next cycle
+                log.warning("%s re-embed batch at row %d failed", table, i)
+                i = end
+                continue
+            with connection(settings) as conn:
+                for row, vec in zip(rows[i:end], vectors, strict=True):
+                    conn.execute(
+                        f"UPDATE {table} SET embedding = ? WHERE id = ?",  # noqa: S608
+                        (sqlite_vec.serialize_float32(vec), row["id"]),
+                    )
+            done += end - i
+            i = end
+    if done:
+        log.info("embedded %d saved/feedback signals", done)
+    return done

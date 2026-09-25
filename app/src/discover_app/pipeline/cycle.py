@@ -17,7 +17,7 @@ from ..clients.llm import LLMClient
 from ..config import Settings, get_settings
 from ..db import connection
 from .candidates import gather_candidates
-from .embedding import embed_pending_imports
+from .embedding import embed_pending_imports, embed_pending_links, embed_pending_signals
 from .enrich import enrich_feed
 from .feeds import sync_feeds
 from .ingest import ingest_links
@@ -83,6 +83,15 @@ async def run_cycle(settings: Settings | None = None) -> dict:
             except Exception:
                 log.exception("run_cycle: candidate gather failed, continuing")
                 errors.append("gather_candidates")
+            # Normally a no-op; after an embedding-model change this re-embeds
+            # bookmarks (even with Linkwarden disconnected) and the saved and
+            # feedback signals before the profile is rebuilt from them.
+            try:
+                await embed_pending_links(settings, llm)
+                await embed_pending_signals(settings, llm)
+            except Exception:
+                log.exception("run_cycle: re-embedding signals failed")
+                errors.append("embed_signals")
             # KMeans.fit + the sqlite loops are synchronous; keep them off the
             # event loop so HTTP endpoints stay responsive during the cycle.
             try:

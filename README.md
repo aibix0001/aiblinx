@@ -77,9 +77,9 @@ aiblinx talks to any OpenAI-compatible API. `.env.example` has ready blocks
 for **OpenRouter** (recommended without your own GPU), **Ollama** (fully
 local), **NVIDIA NIM**, and any other server (vLLM, llama.cpp, LocalAI).
 
-Pick the embedding model before your first feed: switching it later requires
-rebuilding the index, and doing that without losing local saves is
-[not supported yet](https://github.com/aibix0001/aiblinx/issues).
+You can switch presets later. When the embedding model changes, aiblinx backs
+up its database and re-computes every vector from the text it keeps over the
+next cycle; your saves, imports and votes stay.
 
 ## Security
 

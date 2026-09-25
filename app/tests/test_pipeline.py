@@ -27,7 +27,7 @@ from discover_app.pipeline import ingest
 from discover_app.pipeline import miniflux_key as mf_key_mod
 from discover_app.pipeline.candidates import gather_candidates, is_ad, prune_candidates
 from discover_app.pipeline.cycle import run_cycle
-from discover_app.pipeline.embedding import _embed_pending
+from discover_app.pipeline.embedding import _embed_pending, embed_pending_signals
 from discover_app.pipeline.enrich import enrich_feed, fetch_meta
 from discover_app.pipeline.feedback import (
     capture_candidate,
@@ -2489,3 +2489,91 @@ def test_opml_import_without_miniflux_goes_to_builtin_reader(tmp_path, monkeypat
     assert resp.status_code == 200 and resp.json()["added"] == 2
     with connection(settings) as conn:
         assert conn.execute("SELECT COUNT(*) FROM feeds").fetchone()[0] == 2
+
+
+# ── embedding-model change: re-embed in place ───────────────────────────────
+
+
+def _vec(dim: int, first: float = 1.0) -> bytes:
+    return sqlite_vec.serialize_float32([first] + [0.0] * (dim - 1))
+
+
+def test_model_change_keeps_data_backs_up_and_resets_vectors(tmp_path):
+    old = Settings(_env_file=None, data_dir=tmp_path, llm_embed_model="old-embedder", embed_dim=4)
+    init_db(old)
+    with connection(old) as conn:
+        conn.execute(
+            "INSERT INTO links(id, url, name, embedded, embedding) "
+            "VALUES(1, 'https://ex.com/l', 'Bookmark', 1, ?)",
+            (_vec(4),),
+        )
+        conn.execute("INSERT INTO vec_links(rowid, embedding) VALUES(1, ?)", (_vec(4),))
+        _add_candidate(conn, 2, "https://ex.com/c", "Candidate", [1.0, 0, 0, 0])
+        conn.execute(
+            "INSERT INTO saves(url, url_key, title, embedding) "
+            "VALUES('https://ex.com/s', 'ex.com/s', 'Saved page', ?)",
+            (_vec(4),),
+        )
+        conn.execute(
+            "INSERT INTO imports(url, url_key, title, source, embedded, embedding) "
+            "VALUES('https://ex.com/i', 'ex.com/i', 'Imported', 'bookmarks', 1, ?)",
+            (_vec(4),),
+        )
+        _add_centroid(conn, [1.0, 0, 0, 0])
+    record_feedback(old, 2, "interest", "up")
+    set_topic(old, "Science", True)
+
+    new = Settings(_env_file=None, data_dir=tmp_path, llm_embed_model="new-embedder", embed_dim=8)
+    init_db(new)  # used to refuse to start; now migrates
+    backups = list(tmp_path.glob("discover.db.before-old-embedder@4-*"))
+    assert len(backups) == 1
+    b = sqlite3.connect(backups[0])  # the backup still has the old vectors
+    assert b.execute("SELECT embedding IS NOT NULL FROM saves").fetchone()[0] == 1
+    b.close()
+    with connection(new) as conn:
+        assert get_meta(conn, "embed_model") == "new-embedder"
+        assert get_meta(conn, "embed_dim") == "8"
+        for table in ("links", "imports", "candidates"):
+            assert (
+                conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE embedded = 0 AND embedding IS NULL"  # noqa: S608
+                ).fetchone()[0]
+                == 1
+            ), table
+        assert conn.execute("SELECT COUNT(*) FROM saves WHERE embedding IS NULL").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM profile").fetchone()[0] == 0
+        # data that exists only here survived
+        assert conn.execute("SELECT title FROM saves").fetchone()[0] == "Saved page"
+        assert conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0] == 1
+        # vec tables were recreated at the new width
+        conn.execute("INSERT INTO vec_links(rowid, embedding) VALUES(1, ?)", (_vec(8),))
+    assert selected_topics(new) == ["Science"]
+    init_db(new)  # a second start is a no-op: no further backup
+    assert len(list(tmp_path.glob("discover.db.before-*"))) == 1
+
+
+async def test_embed_pending_signals_uses_stored_text(tmp_path):
+    settings = _no_linkwarden(tmp_path)
+    init_db(settings)
+    with connection(settings) as conn:
+        _add_candidate(conn, 1, "https://ex.com/a", "Candidate title", [1.0, 0, 0, 0])
+        conn.execute(
+            "INSERT INTO saves(url, url_key, title) VALUES('https://ex.com/s', 'ex.com/s', 'Saved')"
+        )
+        conn.execute(
+            "INSERT INTO feedback(candidate_id, url, axis, value) VALUES"
+            "(1, 'ex.com/a', 'interest', 'up'), (NULL, 'gone.example/x', 'interest', 'down'),"
+            "(NULL, 'ex.com/a', 'mood', 'happy')"
+        )
+    seen: list[str] = []
+
+    class _Rec:
+        async def embed(self, texts):
+            seen.extend(texts)
+            return [[1.0, 0, 0, 0] for _ in texts]
+
+    assert await embed_pending_signals(settings, _Rec()) == 3  # mood feedback skipped
+    assert "Saved https://ex.com/s" in seen
+    assert any(t.startswith("Candidate title") for t in seen)
+    assert "gone.example/x" in seen  # pruned candidate: falls back to the URL
+    assert await embed_pending_signals(settings, _Rec()) == 0  # nothing pending

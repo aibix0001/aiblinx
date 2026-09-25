@@ -59,8 +59,15 @@ description, never cut mid-word.
 ## Data
 
 One SQLite file in `DATA_DIR`: bookmarks, imports, saves, candidate stories and
-their vectors, the feedback log, the profile, topics and feed history. The
-embedding model and its dimension are fixed per database.
+their vectors, the feedback log, the profile, topics and feed history.
+
+Vectors from different embedding models can't be compared, so the database
+records which model built it. When the configured model changes, the app
+copies the database next to itself (`discover.db.before-<model>-<time>`),
+clears every vector and re-computes them over the next cycle from the stored
+text: bookmark and article text, import titles and descriptions, save titles
+and URLs. Saves, imports, votes and topics are kept. To undo a change, stop the
+app, restore the copy and set the old model again.
 
 ## Endpoints
 

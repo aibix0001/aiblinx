@@ -9,13 +9,19 @@ without depending on how vec0 round-trips a SELECT.
 
 from __future__ import annotations
 
+import logging
+import re
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime
+from pathlib import Path
 
 import sqlite_vec
 
 from .config import Settings, get_settings
+
+log = logging.getLogger(__name__)
 
 
 def _connect(path: str) -> sqlite3.Connection:
@@ -187,14 +193,14 @@ def init_db(settings: Settings | None = None) -> None:
     """Create the relational schema and the sqlite-vec virtual tables.
 
     The vec column width is taken from ``embed_dim`` so it always matches the
-    embedding model in use — changing the embed model means re-ingesting.
+    embedding model in use. When the model changes, the database is backed up
+    and every vector is re-computed from stored text over the next cycle.
     """
     settings = settings or get_settings()
     dim = int(settings.embed_dim)
     with connection(settings) as conn:
         conn.executescript(SCHEMA)
-        # Migration for DBs created while profile had no weight column (the
-        # an early version had no weight column).
+        # Migration for DBs from before profile weights existed.
         try:
             conn.execute("ALTER TABLE profile ADD COLUMN weight REAL NOT NULL DEFAULT 1.0")
         except sqlite3.OperationalError as exc:
@@ -232,34 +238,69 @@ def init_db(settings: Settings | None = None) -> None:
         from .topics import seed_topics
 
         seed_topics(conn)
-        conn.execute(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS vec_links "
-            f"USING vec0(embedding float[{dim}] distance_metric=cosine)"
-        )
-        conn.execute(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS vec_imports "
-            f"USING vec0(embedding float[{dim}] distance_metric=cosine)"
-        )
-        conn.execute(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS vec_candidates "
-            f"USING vec0(embedding float[{dim}] distance_metric=cosine)"
-        )
-        # Refuse to start against a DB built for a different embedder: vectors
-        # from different models/dims are incompatible and fail only at insert
-        # time with opaque errors. A mismatch requires wiping and re-ingesting.
         stored_model = get_meta(conn, "embed_model")
         stored_dim = get_meta(conn, "embed_dim")
-        if stored_model is None:
+    changed = stored_model is not None and (
+        stored_model != settings.llm_embed_model or int(stored_dim or 0) != dim
+    )
+    if changed:
+        # Vectors from different models/dims are incompatible. Everything the
+        # vectors were made from is still stored, so re-embed rather than
+        # wipe: local saves, imports and feedback exist only here.
+        backup = _backup(settings, f"{stored_model}@{stored_dim}")
+        with connection(settings) as conn:
+            _reset_embeddings(conn)
+        log.warning(
+            "embedding model changed from %s@%s to %s@%d: all vectors are "
+            "re-computed over the next cycle; backup of the old database: %s",
+            stored_model,
+            stored_dim,
+            settings.llm_embed_model,
+            dim,
+            backup,
+        )
+    with connection(settings) as conn:
+        for table in _VEC_TABLES:
+            conn.execute(
+                f"CREATE VIRTUAL TABLE IF NOT EXISTS {table} "
+                f"USING vec0(embedding float[{dim}] distance_metric=cosine)"
+            )
+        if stored_model is None or changed:
             set_meta(conn, "embed_model", settings.llm_embed_model)
             set_meta(conn, "embed_dim", str(dim))
-        elif stored_model != settings.llm_embed_model or int(stored_dim or 0) != dim:
-            raise RuntimeError(
-                f"database at {settings.db_path} was built with embedder "
-                f"{stored_model}@{stored_dim}, but the configuration says "
-                f"{settings.llm_embed_model}@{dim} — delete the database file "
-                "to re-ingest with the new embedder (the backfill restores "
-                "the full Linkwarden history automatically)"
-            )
+
+
+_VEC_TABLES = ("vec_links", "vec_imports", "vec_candidates")
+
+
+def _backup(settings: Settings, label: str) -> Path:
+    """Consistent copy of the database next to it (SQLite's online backup)."""
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    safe = re.sub(r"[^A-Za-z0-9._@-]+", "_", label)
+    target = settings.db_path.with_name(f"{settings.db_path.name}.before-{safe}-{stamp}")
+    source = _connect(str(settings.db_path))
+    dest = sqlite3.connect(str(target))
+    try:
+        source.backup(dest)
+        # one self-contained file, not WAL with -wal/-shm side files
+        dest.execute("PRAGMA journal_mode=DELETE")
+    finally:
+        dest.close()
+        source.close()
+    return target
+
+
+def _reset_embeddings(conn: sqlite3.Connection) -> None:
+    """Forget every vector so the next cycle re-embeds from stored text:
+    bookmarks, imports and candidates via their ``embedded`` flag, saves and
+    feedback via a NULL embedding (``embedding.embed_pending_signals``)."""
+    for table in _VEC_TABLES:
+        conn.execute(f"DROP TABLE IF EXISTS {table}")
+    for table in ("links", "imports", "candidates"):
+        conn.execute(f"UPDATE {table} SET embedded = 0, embedding = NULL")  # noqa: S608
+    for table in ("saves", "feedback", "ratings"):
+        conn.execute(f"UPDATE {table} SET embedding = NULL")  # noqa: S608
+    conn.execute("DELETE FROM profile")
 
 
 def get_meta(conn: sqlite3.Connection, key: str, default: str | None = None) -> str | None:

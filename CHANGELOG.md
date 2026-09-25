@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1
+
+- **Switch AI presets without losing anything:** when the embedding model
+  changes, aiblinx backs up its database and re-computes every vector from the
+  text it keeps, instead of refusing to start. Saves, imports, votes and topics
+  are kept.
+- Quieter logs: one summary line instead of a warning per long article.
+
 ## 0.1.0
 
 First release: a private, self-hosted Discover feed.
