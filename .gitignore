@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Local env & data
+.env
+.data/
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# OS / editor
+.DS_Store
+.claude/worktrees/
+
+# opencode
+opencode.json
+

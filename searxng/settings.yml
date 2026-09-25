@@ -1,0 +1,23 @@
+# Minimal SearXNG config for aiblinx's anti-bubble topical fetches.
+#
+# Two deliberate deviations from stock:
+# - JSON output is OFF by default upstream -> enabled here, the app consumes
+#   GET /search?format=json.
+# - The bot limiter blocks programmatic clients -> disabled; this instance is
+#   only reachable on the compose network (no published port).
+#
+# The secret key below is overridden at runtime by SearXNG's own
+# SEARXNG_SECRET env support (settings_defaults) — the entrypoint never
+# rewrites a mounted settings file, which is why the :ro mount is safe.
+
+use_default_settings: true
+
+server:
+  secret_key: "ultrasecretkey"  # overridden at runtime via SEARXNG_SECRET
+  limiter: false
+  public_instance: false
+
+search:
+  formats:
+    - html
+    - json

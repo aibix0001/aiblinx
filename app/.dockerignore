@@ -1,0 +1,13 @@
+# Keep the build context (and image) lean and free of host-only / secret files.
+.venv/
+.env
+.data/
+data/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.db
+*.db-wal
+*.db-shm
+.DS_Store

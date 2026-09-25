@@ -1,0 +1,140 @@
+# aiblinx stack. Only discover-app is required; everything else is an opt-in
+# Compose profile, enabled with COMPOSE_PROFILES in .env (or --profile):
+#   miniflux  a full RSS reader (+Postgres) for your sites' feeds; without it the
+#             app reads feeds itself
+#   searxng   private meta-search that fills the Exploring section
+#   ollama    local AI models instead of a hosted API
+# Linkwarden and a hosted AI API stay external: point at them in .env.
+#
+# Copy .env.example -> .env first; Compose interpolates its values via ${VAR}.
+
+services:
+  discover-app:
+    # Released images (amd64 + arm64). Pin a version with DISCOVER_APP_IMAGE in
+    # .env; to build from source instead:
+    #   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+    image: ${DISCOVER_APP_IMAGE:-ghcr.io/aibix0001/aiblinx:latest}
+    environment:
+      # Every value may stay unset: the app ignores empty variables and uses its
+      # own defaults, so these lines only pass through what .env sets.
+      DATA_DIR: ${DATA_DIR:-/data}
+      # AI model: OPENROUTER_API_KEY alone is enough (preset); LLM_* override it
+      # or configure NIM / Ollama / any OpenAI-compatible server instead.
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_TOKEN: ${LLM_TOKEN:-}
+      LLM_CHAT_MODEL: ${LLM_CHAT_MODEL:-}
+      LLM_RERANK: ${LLM_RERANK:-}
+      LLM_EMBED_BASE_URL: ${LLM_EMBED_BASE_URL:-}
+      LLM_EMBED_MODEL: ${LLM_EMBED_MODEL:-}
+      EMBED_DIM: ${EMBED_DIM:-}
+      LLM_EMBED_INPUT_TYPE: ${LLM_EMBED_INPUT_TYPE:-}
+      LINKWARDEN_BASE_URL: ${LINKWARDEN_BASE_URL:-}
+      LINKWARDEN_TOKEN: ${LINKWARDEN_TOKEN:-}
+      LINKWARDEN_COLLECTION_ID: ${LINKWARDEN_COLLECTION_ID:-}
+      MINIFLUX_URL: ${MINIFLUX_URL:-}
+      MINIFLUX_TOKEN: ${MINIFLUX_TOKEN:-}
+      # lets the app create its own Miniflux API key when MINIFLUX_TOKEN is empty
+      MINIFLUX_ADMIN_USER: ${MF_ADMIN_USER:-}
+      MINIFLUX_ADMIN_PASSWORD: ${MF_ADMIN_PASSWORD:-}
+      FEED_SYNC_MIN_LINKS: ${FEED_SYNC_MIN_LINKS:-}
+      FEED_SYNC_PER_CYCLE: ${FEED_SYNC_PER_CYCLE:-}
+      HACKERNEWS_ENABLED: ${HACKERNEWS_ENABLED:-}
+      HACKERNEWS_LIST: ${HACKERNEWS_LIST:-}
+      SEARXNG_URL: ${SEARXNG_URL:-}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      LINK_TARGET: ${LINK_TARGET:-}
+      FEED_SIZE: ${FEED_SIZE:-}
+      POLL_CRON: ${POLL_CRON:-}
+      CYCLE_CRON: ${CYCLE_CRON:-}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+      APP_PASSWORD: ${APP_PASSWORD:-}
+    volumes:
+      - ./.data/discover-app/data:/data
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=5)"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+
+  # RSS reader. Stateless — everything lives in miniflux-db. Reached by
+  # discover-app as http://miniflux:8080 on the compose network; the host port is
+  # only for the web UI (feed management, Settings -> API Keys).
+  miniflux:
+    profiles: [miniflux]
+    image: miniflux/miniflux:2.3.3  # all images are pinned
+    depends_on:
+      miniflux-db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://miniflux:${MF_DB_PASSWORD:-}@miniflux-db/miniflux?sslmode=disable
+      RUN_MIGRATIONS: "1"
+      CREATE_ADMIN: "1"  # only creates the admin if it does not exist yet
+      ADMIN_USERNAME: ${MF_ADMIN_USER:-}
+      ADMIN_PASSWORD: ${MF_ADMIN_PASSWORD:-}
+    ports:
+      - "8011:8080"
+    healthcheck:
+      test: ["CMD", "/usr/bin/miniflux", "-healthcheck", "auto"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Exploring source: private meta-search for per-topic fetches.
+  # Compose-network-only (no published port) — the limiter is disabled in
+  # searxng/settings.yml, which is safe precisely because nothing outside the
+  # stack can reach it. JSON output is enabled there too (off upstream).
+  searxng:
+    profiles: [searxng]
+    image: searxng/searxng:2026.7.26-b060c780d  # all images are pinned
+    environment:
+      # required once the profile is on (SearXNG refuses its placeholder key):
+      # openssl rand -hex 32
+      SEARXNG_SECRET: ${SEARXNG_SECRET:-}
+    volumes:
+      # file-only, read-only: the container may write uwsgi.ini etc. inside
+      # /etc/searxng, which must not land in the repo checkout
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  miniflux-db:
+    profiles: [miniflux]
+    image: postgres:17.10-alpine
+    environment:
+      POSTGRES_USER: miniflux
+      POSTGRES_PASSWORD: ${MF_DB_PASSWORD:-}
+      POSTGRES_DB: miniflux
+    volumes:
+      - ./.data/miniflux-db/pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U miniflux -d miniflux"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # Local AI models (profile "ollama"). Pull the models once after the first
+  # start, e.g.: docker compose exec ollama ollama pull bge-m3
+  # For GPU acceleration add a deploy.resources.reservations.devices block.
+  ollama:
+    profiles: [ollama]
+    image: ollama/ollama:0.34.4
+    volumes:
+      - ./.data/ollama:/root/.ollama
+    restart: unless-stopped
+

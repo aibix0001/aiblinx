@@ -1,0 +1,11 @@
+# Local iteration: build discover-app from source instead of pulling the image
+# CI published. Not loaded automatically — pass it explicitly:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+#
+# Kept out of docker-compose.override.yml on purpose: Compose loads that file
+# implicitly, and it is the conventional place for a host's own untracked
+# tweaks (port remaps and the like).
+services:
+  discover-app:
+    build: ./app
+    image: aiblinx-discover-app:dev

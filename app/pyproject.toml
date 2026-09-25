@@ -1,0 +1,51 @@
+[project]
+name = "discover-app"
+version = "0.1.0"
+description = "aiblinx discover-app — a self-hosted, private Discover feed"
+authors = [
+    { name = "Gerd Feiner" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "apscheduler>=3.11.2",
+    "fastapi>=0.138.0",
+    "feedgen>=1.0.0",
+    "feedparser>=6.0.11",
+    "httpx>=0.28.1",
+    "numpy>=2.4.6",
+    "openai>=2.43.0",
+    "pydantic>=2.13.4",
+    "pydantic-settings>=2.14.2",
+    "scikit-learn>=1.9.0",
+    "sqlite-vec>=0.1.9",
+    "uvicorn[standard]>=0.49.0",
+]
+
+[project.scripts]
+discover-app = "discover_app:main"
+
+[build-system]
+requires = ["uv_build>=0.10.7,<0.11.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.15.18",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "S", "W"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]  # asserts are expected in tests
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
