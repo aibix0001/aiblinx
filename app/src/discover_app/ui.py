@@ -252,6 +252,12 @@ THEME_CSS = """\
   --muted: #B4B7AB; --line: #2A2D25; --chip: #262923; --btn: #262923; --btn-ink: #E4E6DC;
   --on: #F2F2EC; --on-ink: #0E0F0C; --img: #2B2E26;
 }
+/* the wordmark: "aib" (the maker's prefix) + "linx" on the lime highlight */
+.wordmark { font-weight: 750; letter-spacing: -0.02em; white-space: nowrap; }
+.wordmark b {
+  font-weight: inherit; background: #C6F432; color: #0E0F0C;
+  border-radius: 5px; padding: 0 3px; margin-left: 1px;
+}
 """
 
 HEAD_TAGS = """\
@@ -297,8 +303,7 @@ header {
   padding: calc(env(safe-area-inset-top) + 12px) 12px 12px;
 }
 .bar { max-width: 640px; margin: 0 auto; display: flex; align-items: center; gap: 6px; }
-.logo { font-size: 22px; font-weight: 750; letter-spacing: -0.02em; margin-right: auto; }
-.logo span { color: #8DB600; }
+.logo { font-size: 22px; margin-right: auto; }
 .tabs { display: flex; gap: 4px; padding: 3px; border-radius: 999px; background: var(--chip); }
 .tabs button {
   height: 38px; padding: 0 11px; border: 0; border-radius: 999px; font: inherit;
@@ -399,7 +404,7 @@ label.topic {
 <body>
 <header>
   <div class="bar">
-    <div class="logo">aiblinx<span>.</span></div>
+    <div class="logo wordmark" aria-label="aiblinx">aib<b>linx</b></div>
     <div class="tabs" role="tablist">
       <button role="tab" aria-selected="__SEL_CURATED__" data-panel="curated" onclick="tab(this)">\
 For you</button>

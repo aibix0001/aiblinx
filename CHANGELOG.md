@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2
+
+- **New wordmark:** *aib* | *linx* in the app header, the setup and login
+  pages, and a new home-screen icon. (Phones cache the icon: remove aiblinx
+  from the home screen and add it again to see it.)
+
 ## 0.1.1
 
 - **Switch AI presets without losing anything:** when the embedding model

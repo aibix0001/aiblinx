@@ -144,7 +144,7 @@ main {
   padding: calc(env(safe-area-inset-top) + 16px) 12px calc(env(safe-area-inset-bottom) + 40px);
 }
 h1 { margin: 4px 6px 0; font-size: 28px; letter-spacing: -0.02em; }
-h1 span { color: #8DB600; }
+h1 .wordmark b { font-size: 0.92em; }
 h2 { margin: 0; font-size: 19px; }
 p { margin: 0; line-height: 1.5; }
 code { font-size: 0.9em; background: var(--chip); padding: 1px 5px; border-radius: 5px; }
@@ -202,7 +202,7 @@ __THEME__"""
 </head>
 <body>
 <main>
-<h1>aiblinx<span>.</span> setup</h1>
+<h1><span class="wordmark" aria-label="aiblinx">aib<b>linx</b></span> setup</h1>
 <p class="lede">__LEARNED__</p>
 
 <section>
@@ -320,7 +320,7 @@ __THEME__"""
 </head>
 <body>
 <main>
-<h1>aiblinx<span>.</span></h1>
+<h1><span class="wordmark" aria-label="aiblinx">aib<b>linx</b></span></h1>
 <section>
   <form id="login" style="display: flex; flex-direction: column; gap: 12px;">
     <label for="password"><b>Password</b></label>
