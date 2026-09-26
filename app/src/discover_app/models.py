@@ -63,7 +63,7 @@ class RatingResponse(BaseModel):
 
 
 class CaptureResponse(BaseModel):
-    status: Literal["saved", "already_saved"]
+    status: Literal["saved", "already_saved", "promoted", "saved_to_exploring"]
     linkwarden_id: int | None = None
 
 
@@ -79,6 +79,19 @@ class Topic(BaseModel):
 
 class TopicUpdate(BaseModel):
     selected: bool
+
+
+class FeedInfo(BaseModel):
+    """A subscribed feed, from Miniflux or the built-in reader."""
+
+    id: int
+    title: str
+    site: str
+    url: str
+
+
+class FeedAdd(BaseModel):
+    url: str = Field(min_length=1, max_length=2000)
 
 
 # Setup / login. Uploads are read in the browser and posted as

@@ -61,6 +61,19 @@ class LinkwardenClient:
         data = resp.json()
         return data.get("response", data) if isinstance(data, dict) else data
 
+    async def find_or_create_collection(self, name: str) -> int:
+        """Id of the top-level collection called ``name``, created if missing."""
+        resp = await self._client.get("/collections")
+        resp.raise_for_status()
+        data = resp.json()
+        for collection in data.get("response", []) if isinstance(data, dict) else data:
+            if collection.get("name") == name and not collection.get("parentId"):
+                return int(collection["id"])
+        resp = await self._client.post("/collections", json={"name": name})
+        resp.raise_for_status()
+        data = resp.json()
+        return int((data.get("response", data) if isinstance(data, dict) else data)["id"])
+
     async def get_link(self, link_id: int) -> dict[str, Any]:
         resp = await self._client.get(f"/links/{link_id}")
         resp.raise_for_status()

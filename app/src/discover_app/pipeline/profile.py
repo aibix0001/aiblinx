@@ -19,6 +19,7 @@ re-weighting with decay, no retraining).
 from __future__ import annotations
 
 import logging
+import math
 import sqlite3
 from datetime import UTC, datetime
 
@@ -29,6 +30,7 @@ from sklearn.cluster import KMeans
 from ..config import Settings, get_settings
 from ..db import connection
 from ..urls import norm_url
+from .feedback import known_explore_collection
 
 log = logging.getLogger(__name__)
 
@@ -52,13 +54,14 @@ _RATING_BASE: dict[float, float] = {
 _WEIGHT_FLOOR = 0.25
 
 
-def _load_profile_vectors(conn, dim: int) -> np.ndarray:
+def _load_profile_vectors(conn, dim: int, explore_collection: int | None = None) -> np.ndarray:
     """The points the interest clusters are built from, one per page:
     Linkwarden bookmarks (when connected), the local Saved list, pages
     imported on the setup page, and pages the user upvoted (latest vote per
     page). Linkwarden is optional, so an install
     without it builds its profile from saves and upvotes alone. Vectors from a
-    previous embedder (other dimension) are skipped."""
+    previous embedder (other dimension) are skipped. Exploring saves and
+    upvotes, and links in the Exploring collection, are not interests."""
     seen: set[str] = set()
     vectors: list[np.ndarray] = []
 
@@ -70,15 +73,21 @@ def _load_profile_vectors(conn, dim: int) -> np.ndarray:
             seen.add(url_key)
             vectors.append(vec)
 
-    for row in conn.execute("SELECT url, embedding FROM links WHERE embedding IS NOT NULL"):
+    for row in conn.execute(
+        "SELECT url, embedding FROM links WHERE embedding IS NOT NULL "
+        "AND (:explore IS NULL OR collection_id IS NOT :explore)",
+        {"explore": explore_collection},
+    ):
         add(norm_url(row["url"]), row["embedding"])
-    for row in conn.execute("SELECT url_key, embedding FROM saves WHERE embedding IS NOT NULL"):
+    for row in conn.execute(
+        "SELECT url_key, embedding FROM saves WHERE embedding IS NOT NULL AND section = 'curated'"
+    ):
         add(row["url_key"], row["embedding"])
     for row in conn.execute("SELECT url_key, embedding FROM imports WHERE embedding IS NOT NULL"):
         add(row["url_key"], row["embedding"])
     for row in conn.execute(
         "SELECT f.url, f.embedding FROM feedback f WHERE f.embedding IS NOT NULL "
-        "AND f.value = 'up' AND f.id IN ("
+        "AND f.value = 'up' AND f.section = 'curated' AND f.id IN ("
         "  SELECT MAX(id) FROM feedback WHERE axis = 'interest' GROUP BY url)"
     ):
         add(row["url"], row["embedding"])
@@ -104,7 +113,7 @@ def _centroid_weights(
     weights = np.ones(len(centroids), dtype=np.float64)
     rows = conn.execute(
         "SELECT axis, value, embedding, created_at FROM feedback "
-        "WHERE embedding IS NOT NULL AND (axis = 'saved' OR id IN ("
+        "WHERE embedding IS NOT NULL AND section = 'curated' AND (axis = 'saved' OR id IN ("
         "  SELECT MAX(id) FROM feedback WHERE axis = 'interest' GROUP BY url))"
     ).fetchall()
     now = datetime.now(UTC)
@@ -171,17 +180,31 @@ def _centroid_weights(
     return np.maximum(weights, _WEIGHT_FLOOR)
 
 
+# Adaptive cluster count: about sqrt(points / 2), never coarser than 8 nor
+# finer than 32 (726 points → 19 clusters of ~40 pages).
+_MIN_CLUSTERS = 8
+_MAX_CLUSTERS = 32
+
+
+def cluster_count(points: int, fixed: int | None = None) -> int:
+    """How many interest clusters to build from ``points`` profile points."""
+    k = fixed or min(_MAX_CLUSTERS, max(_MIN_CLUSTERS, round(math.sqrt(points / 2))))
+    return max(1, min(k, points))
+
+
 def rebuild_profile(settings: Settings | None = None) -> int:
     """Recompute centroids from bookmarks, saves and upvotes. Returns the
     cluster count (0 = no profile yet: the feed runs on Exploring alone)."""
     settings = settings or get_settings()
     with connection(settings) as conn:
-        vectors = _load_profile_vectors(conn, settings.embed_dim)
+        vectors = _load_profile_vectors(
+            conn, settings.embed_dim, known_explore_collection(conn, settings)
+        )
         if len(vectors) == 0:
             conn.execute("DELETE FROM profile")
             log.warning("rebuild_profile: nothing saved, upvoted or bookmarked yet")
             return 0
-        k = max(1, min(settings.profile_clusters, len(vectors)))
+        k = cluster_count(len(vectors), settings.profile_clusters)
         kmeans = KMeans(n_clusters=k, n_init="auto", random_state=0).fit(vectors)
         normalized = np.vstack(
             [c / (float(np.linalg.norm(c)) or 1.0) for c in kmeans.cluster_centers_]

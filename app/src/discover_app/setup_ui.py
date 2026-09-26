@@ -136,7 +136,7 @@ _BASE_CSS = """
 * { box-sizing: border-box; }
 body {
   margin: 0; background: var(--bg); color: var(--ink);
-  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-family: var(--font-body);
   -webkit-font-smoothing: antialiased; -webkit-text-size-adjust: 100%;
 }
 main {
@@ -166,10 +166,21 @@ textarea {
   width: 100%; min-height: 96px; border-radius: 14px; border: 1px solid var(--line);
   background: var(--bg); color: var(--ink); font: inherit; font-size: 15px; padding: 10px 12px;
 }
-input[type="password"] {
+input[type="password"], input[type="url"] {
   width: 100%; height: 48px; border-radius: 14px; border: 1px solid var(--line);
   background: var(--bg); color: var(--ink); font: inherit; font-size: 16px; padding: 0 12px;
 }
+ul.feeds { list-style: none; margin: 0; padding: 0; }
+ul.feeds li {
+  display: flex; align-items: center; gap: 10px; padding: 10px 0;
+  border-top: 1px solid var(--line);
+}
+ul.feeds li:first-child { border-top: 0; }
+ul.feeds li div { flex: 1; min-width: 0; }
+ul.feeds b { display: block; font-weight: 600; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; }
+ul.feeds span { color: var(--muted); font-size: 14px; }
+ul.feeds button { height: 40px; padding: 0 12px; font-size: 14px; flex-shrink: 0; }
 label.file { position: relative; }
 label.file input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
 label.topic { display: inline-flex; align-items: center; gap: 6px; margin: 4px 14px 4px 0;
@@ -183,7 +194,7 @@ ul.status p { color: var(--muted); font-size: 14px; }
 .state { font-size: 13px; color: var(--muted); }
 .state.on { color: var(--ink); font-weight: 600; }
 a { color: var(--ink); }
-:focus-visible { outline: 2px solid #8DB600; outline-offset: 2px; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 """
 
 _SETUP = (
@@ -220,6 +231,20 @@ __OPML_BUTTON__
   <textarea id="urls" placeholder="https://…"></textarea>
   <button class="btn soft" onclick="pasteUrls()">Add links</button>
   <p class="hint" id="import-status" role="status"></p>
+</section>
+
+<section>
+  <h2>Feeds <span class="hint" id="feed-count"></span></h2>
+  <p>The sites aiblinx reads new stories from. It also adds sites you keep
+  saving from; a site you unsubscribe is never added again automatically.</p>
+  <div class="row">
+    <input type="url" id="feed-url" placeholder="Site or feed address"
+      aria-label="Site or feed address" style="flex: 1; min-width: 0;"
+      onkeydown="if (event.key === 'Enter') addFeed()">
+    <button class="btn soft" id="feed-add" onclick="addFeed()">Add</button>
+  </div>
+  <p class="hint" id="feed-status" role="status"></p>
+  <ul class="feeds" id="feeds"><li><span>Loading…</span></li></ul>
 </section>
 
 <section>
@@ -278,6 +303,58 @@ async function topic(box) {
   } catch (e) { box.checked = !box.checked; }
   finally { box.disabled = false; }
 }
+async function loadFeeds() {
+  const list = document.getElementById('feeds');
+  let feeds;
+  try {
+    const resp = await fetch('/feeds');
+    if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).detail || resp.status);
+    feeds = await resp.json();
+  } catch (e) {
+    list.replaceChildren(); say('feed-status', 'Could not load feeds: ' + e.message); return;
+  }
+  document.getElementById('feed-count').textContent = '· ' + feeds.length;
+  list.replaceChildren(...feeds.map(f => {
+    const li = document.createElement('li');
+    const text = document.createElement('div');
+    const title = document.createElement('b'); title.textContent = f.title;
+    const site = document.createElement('span'); site.textContent = f.site;
+    text.append(title);
+    if (f.site !== f.title) text.append(site);
+    const btn = document.createElement('button');
+    btn.className = 'btn soft'; btn.textContent = 'Unsubscribe';
+    btn.onclick = () => removeFeed(f, btn);
+    li.append(text, btn);
+    return li;
+  }));
+  if (!feeds.length) {
+    const li = document.createElement('li');
+    li.innerHTML = '<span>No feeds yet. Add a site above.</span>';
+    list.append(li);
+  }
+}
+async function removeFeed(feed, btn) {
+  if (!confirm(`Unsubscribe from ${feed.title}?`)) return;
+  btn.disabled = true;
+  const resp = await fetch(`/feeds/${feed.id}`, {method: 'DELETE'});
+  if (resp.ok) { say('feed-status', `Unsubscribed from ${feed.title}.`); loadFeeds(); }
+  else { btn.disabled = false; say('feed-status', 'Could not unsubscribe.'); }
+}
+async function addFeed() {
+  const input = document.getElementById('feed-url');
+  const button = document.getElementById('feed-add');
+  if (!input.value.trim()) return;
+  button.disabled = true; say('feed-status', 'Looking for a feed…');
+  try {
+    const resp = await fetch('/feeds', {method: 'POST',
+      headers: {'Content-Type': 'application/json'}, body: JSON.stringify({url: input.value})});
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data.detail || resp.status);
+    say('feed-status', 'Subscribed to ' + data.url); input.value = ''; loadFeeds();
+  } catch (e) { say('feed-status', 'Could not add: ' + e.message); }
+  finally { button.disabled = false; }
+}
+loadFeeds();
 async function build() {
   const btn = document.getElementById('build');
   btn.disabled = true;

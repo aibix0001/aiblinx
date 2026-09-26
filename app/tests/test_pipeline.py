@@ -1639,7 +1639,7 @@ def test_ui_cards_image_summary_and_restored_state(tmp_path, monkeypatch):
     assert "A page description that is long enough" in page  # thin snippet replaced
     assert "because &amp; why" in page
     card1 = page[page.index('id="c1"') : page.index('id="c2"')]
-    assert "Saved to Linkwarden" in card1 and 'class="vote on"' in card1
+    assert "<span>Saved</span>" in card1 and 'class="vote on"' in card1
     card2 = page[page.index('id="c2"') : page.index('id="c3"')]
     assert "data-down" in card2  # downvoted card stays collapsed after reload
 
@@ -1965,7 +1965,7 @@ def test_ui_link_target_same_tab_by_default(tmp_path, monkeypatch):
     monkeypatch.setattr("discover_app.db.get_settings", lambda: settings)
     monkeypatch.setattr(app_mod, "get_settings", lambda: settings)
     page = TestClient(app_mod.create_app()).get("/ui").text
-    assert 'href="https://ex.com/a" rel="noreferrer">' in page
+    assert 'href="/read/1" rel="noreferrer">' in page
     assert 'target="_blank"' not in page
 
     new_tab = _settings(tmp_path, link_target="new")
@@ -1975,6 +1975,145 @@ def test_ui_link_target_same_tab_by_default(tmp_path, monkeypatch):
 
     with pytest.raises(ValidationError):
         _settings(tmp_path, link_target="popup")
+
+
+# ── Reader view ─────────────────────────────────────────────────
+
+_ARTICLE = (
+    "<html><head><title>T</title></head><body><nav>Home | News</nav><article>"
+    "<h1>An article</h1>"
+    + "".join(
+        f"<p>Paragraph {i} of the story, with <b>bold</b> words and a "
+        f'<a href="https://ex.com/x">link</a> and enough text to count as prose.</p>'
+        for i in range(8)
+    )
+    + "<h2>A section</h2><p>&lt;script&gt;alert(1)&lt;/script&gt; stays text.</p>"
+    '<img src="https://tracker.ex/pixel.gif"><script>alert(2)</script>'
+    "<ul><li>one</li><li>two</li></ul></article><footer>Footer</footer></body></html>"
+)
+
+
+def test_extract_article_is_escaped_and_image_free():
+    from discover_app.reader import extract_article
+
+    body = extract_article(_ARTICLE, "https://ex.com/a", "An article")
+    assert "<p>Paragraph 0 of the story, with <strong>bold</strong> words" in body
+    assert "<h2>A section</h2>" in body
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in body
+    assert "<script" not in body and "alert(2)" not in body
+    assert "<img" not in body and "tracker.ex" not in body and "href" not in body
+    assert "<ul><li>one</li><li>two</li></ul>" in body
+    assert "An article" not in body  # the repeated headline is dropped
+    assert extract_article("<html><body><p>Subscribe to read.</p></body></html>", "u") is None
+    # a page without an article (e.g. a video page): long, but no sentences
+    menu = " ".join(f"Rubrik{i} Untermenü einblenden" for i in range(80))
+    nav = f"<html><body><main><p>{menu}</p></main></body></html>"
+    assert extract_article(nav, "https://ex.de/video-1") is None
+    # charset only in <meta>: the raw bytes are decoded by trafilatura, not as UTF-8
+    latin = (
+        '<html><head><meta charset="iso-8859-1"></head><body><article><p>'
+        + "Grüße aus München, schöne Straße. " * 20
+        + "</p></article></body></html>"
+    ).encode("latin-1")
+    assert "Grüße aus München" in extract_article(latin, "https://ex.de/a")
+
+
+def _reader_app(tmp_path, monkeypatch, url="https://ex.com/a"):
+    from fastapi.testclient import TestClient
+
+    from discover_app import app as app_mod
+
+    settings = _settings(tmp_path)
+    init_db(settings)
+    with connection(settings) as conn:
+        _add_candidate(conn, 1, url, "An article", [1.0, 0, 0, 0])
+    monkeypatch.setattr("discover_app.db.get_settings", lambda: settings)
+    monkeypatch.setattr(app_mod, "get_settings", lambda: settings)
+    return settings, TestClient(app_mod.create_app(), follow_redirects=False)
+
+
+def _counts(settings):
+    with connection(settings) as conn:
+        return {
+            t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]  # noqa: S608
+            for t in ("feedback", "saves", "candidates", "meta")
+        }
+
+
+def test_reader_page_has_actions_and_records_nothing(tmp_path, monkeypatch):
+    from discover_app import app as app_mod
+
+    settings, client = _reader_app(tmp_path, monkeypatch)
+
+    async def fake_fetch(url, timeout_s):
+        assert url == "https://ex.com/a"
+        return _ARTICLE.encode()
+
+    monkeypatch.setattr(app_mod, "fetch_html", fake_fetch)
+    before = _counts(settings)
+    resp = client.get("/read/1")
+    assert resp.status_code == 200
+    assert resp.headers["referrer-policy"] == "no-referrer"
+    assert resp.headers["cache-control"] == "no-store"
+    page = resp.text
+    assert "<h1>An article</h1>" in page and "Paragraph 7 of the story" in page
+    assert '<article class="card" data-id="1">' in page
+    assert 'onclick="save(this)"' in page and "vote(this, 'down')" in page
+    assert 'href="https://ex.com/a" rel="noreferrer">Open the original page' in page
+    assert _counts(settings) == before  # no read event, no cache: no tracking
+
+    client.post("/feed/1/interest", json={"value": "up"})
+    assert 'class="vote on"' in client.get("/read/1").text
+
+
+def test_reader_falls_back_to_the_original(tmp_path, monkeypatch):
+    from discover_app import app as app_mod
+
+    _, client = _reader_app(tmp_path, monkeypatch)
+
+    async def no_page(url, timeout_s):
+        return None
+
+    monkeypatch.setattr(app_mod, "fetch_html", no_page)
+    resp = client.get("/read/1")
+    assert resp.status_code == 302 and resp.headers["location"] == "https://ex.com/a"
+
+    async def teaser(url, timeout_s):
+        return b"<html><body><p>Subscribe to keep reading.</p></body></html>"
+
+    monkeypatch.setattr(app_mod, "fetch_html", teaser)
+    assert client.get("/read/1").headers["location"] == "https://ex.com/a"
+    assert client.get("/read/99").status_code == 404
+
+
+def test_reader_rejects_non_http_urls(tmp_path, monkeypatch):
+    _, client = _reader_app(tmp_path, monkeypatch, url="javascript:alert(1)")
+    assert client.get("/read/1").status_code == 404
+
+
+def test_reader_visits_stay_out_of_the_access_log():
+    import logging
+
+    from discover_app.reader import hide_reads_from_access_log
+
+    hide_reads_from_access_log()
+    hide_reads_from_access_log()  # idempotent
+    access = logging.getLogger("uvicorn.access")
+    assert len(access.filters) == 1
+
+    def record(path):
+        return logging.LogRecord(
+            "uvicorn.access",
+            logging.INFO,
+            "",
+            0,
+            '%s - "%s %s HTTP/%s" %d',
+            ("1.2.3.4:5", "GET", path, "1.1", 200),
+            None,
+        )
+
+    assert not access.filter(record("/read/12"))
+    assert access.filter(record("/ui"))
 
 
 # ── Linkwarden optional ─────────────────────────────────────────
@@ -2116,7 +2255,7 @@ def test_ui_start_state_and_saved_list_without_linkwarden(tmp_path, monkeypatch)
     # Exploring opens first while "For you" is empty
     assert 'aria-selected="true" data-panel="broad"' in page
     assert '<section class="panel" id="curated" hidden>' in page
-    assert "Saved to Linkwarden" not in page and ">Saved<" in page
+    assert ">Saved<" in page
     assert "Saved · 1" in page and ">Exploring story</a>" in page
     assert "Kept on this server" in page
 
@@ -2577,3 +2716,566 @@ async def test_embed_pending_signals_uses_stored_text(tmp_path):
     assert any(t.startswith("Candidate title") for t in seen)
     assert "gone.example/x" in seen  # pruned candidate: falls back to the URL
     assert await embed_pending_signals(settings, _Rec()) == 0  # nothing pending
+
+
+# ── Exploring stays separate from the interest profile ──────────
+
+
+def _serve(conn, cid: int, section: str) -> None:
+    conn.execute(
+        "INSERT INTO feed_items(rank, section, candidate_id, score, reason, cycle_ts) "
+        "VALUES(?, ?, ?, 0.0, '', 't1')",
+        (cid, section, cid),
+    )
+
+
+class _FakeLinkwardenCollections(_FakeLinkwardenWriter):
+    def __init__(self) -> None:
+        super().__init__()
+        self.lookups = 0
+
+    async def find_or_create_collection(self, name):
+        self.lookups += 1
+        assert name == "Exploring"
+        return 99
+
+
+async def test_exploring_save_goes_to_its_own_collection(tmp_path):
+    settings = _settings(tmp_path, linkwarden_collection_id=17)
+    init_db(settings)
+    with connection(settings) as conn:
+        _add_candidate(conn, 1, "https://ex.com/curated", "c", [1.0, 0, 0, 0])
+        _add_candidate(conn, 2, "https://ex.com/explore", "e", [0, 1.0, 0, 0])
+        _add_candidate(conn, 3, "https://ex.com/explore2", "e2", [0, 0, 1.0, 0])
+        _serve(conn, 1, "curated")
+        _serve(conn, 2, "broad")
+        _serve(conn, 3, "broad")
+    fake = _FakeLinkwardenCollections()
+    await capture_candidate(settings, 1, linkwarden=fake)
+    await capture_candidate(settings, 2, linkwarden=fake)
+    await capture_candidate(settings, 3, linkwarden=fake)
+    assert [c["collection_id"] for c in fake.created] == [17, 99, 99]
+    assert fake.lookups == 1  # found/created once, then remembered
+    with connection(settings) as conn:
+        assert dict(conn.execute("SELECT url_key, section FROM saves").fetchall()) == {
+            "ex.com/curated": "curated",
+            "ex.com/explore": "broad",
+            "ex.com/explore2": "broad",
+        }
+        assert {r[0] for r in conn.execute("SELECT section FROM feedback")} == {"curated", "broad"}
+    # a configured id wins over the lookup
+    configured = _settings(tmp_path, linkwarden_explore_collection_id=5)
+    from discover_app.pipeline.feedback import explore_collection
+
+    assert await explore_collection(configured, fake) == 5
+
+
+def test_exploring_feedback_stays_out_of_the_profile(tmp_path):
+    from discover_app.pipeline.profile import _centroid_weights, _load_profile_vectors
+
+    settings = _settings(tmp_path)
+    init_db(settings)
+    with connection(settings) as conn:
+        _add_candidate(conn, 1, "https://ex.com/c-up", "c", [1.0, 0, 0, 0])
+        _add_candidate(conn, 2, "https://ex.com/b-up", "b", [0, 1.0, 0, 0])
+        _add_candidate(conn, 3, "https://ex.com/b-save", "b2", [0, 0, 1.0, 0])
+        _serve(conn, 1, "curated")
+        _serve(conn, 2, "broad")
+        _serve(conn, 3, "broad")
+        blob = sqlite_vec.serialize_float32
+        # a bookmark in the main collection, one in Exploring, one not yet re-polled
+        conn.execute(
+            "INSERT INTO links(id, url, embedding, collection_id) "
+            "VALUES(1, 'https://m.ex/1', ?, 17)",
+            (blob([0, 0, 0, 1.0]),),
+        )
+        conn.execute(
+            "INSERT INTO links(id, url, embedding, collection_id) "
+            "VALUES(2, 'https://x.ex/2', ?, 99)",
+            (blob([0, 1.0, 1.0, 0]),),
+        )
+        conn.execute(
+            "INSERT INTO links(id, url, embedding) VALUES(3, 'https://m.ex/3', ?)",
+            (blob([1.0, 1.0, 0, 0]),),
+        )
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES('linkwarden_explore_collection_id', '99')"
+        )
+    record_feedback(settings, 1, "interest", "up")
+    record_feedback(settings, 2, "interest", "up")
+    with connection(settings) as conn:
+        conn.execute(
+            "INSERT INTO saves(url, url_key, embedding, section) VALUES('https://ex.com/b-save', "
+            "'ex.com/b-save', ?, 'broad')",
+            (blob([0, 0, 1.0, 0]),),
+        )
+        vectors = _load_profile_vectors(conn, 4, 99)
+        kept = {tuple(np.round(v, 3)) for v in vectors}
+        assert kept == {(0, 0, 0, 1.0), (1.0, 1.0, 0, 0), (1.0, 0, 0, 0)}
+        # no Exploring collection yet: every link counts (NULL collection too)
+        assert len(_load_profile_vectors(conn, 4, None)) == 4
+        centroids = np.eye(4, dtype=np.float32)
+        weights = _centroid_weights(conn, centroids, 30.0, 0.0)
+    assert weights[0] > 1.0  # the curated upvote
+    assert weights[1] == 1.0 and weights[2] == 1.0  # Exploring votes/saves: untouched
+
+
+def test_pending_domains_ignore_exploring(tmp_path):
+    settings = _settings(tmp_path, feed_sync_min_links=1)
+    init_db(settings)
+    with connection(settings) as conn:
+        conn.execute("INSERT INTO links(id, url, collection_id) VALUES(1, 'https://keep.de/a', 17)")
+        conn.execute("INSERT INTO links(id, url, collection_id) VALUES(2, 'https://fun.de/a', 99)")
+        conn.execute(
+            "INSERT INTO saves(url, url_key, section) "
+            "VALUES('https://fun2.de/a', 'fun2.de/a', 'broad')"
+        )
+        conn.execute(
+            "INSERT INTO feedback(url, axis, value, section) "
+            "VALUES('fun3.de/a', 'interest', 'up', 'broad')"
+        )
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES('linkwarden_explore_collection_id', '99')"
+        )
+    assert pending_domains(settings) == ["keep.de"]
+
+
+def test_exploring_picks_follow_exploring_taste(tmp_path):
+    import random
+
+    from discover_app.pipeline.broad import pick_broad_items
+
+    settings = _settings(tmp_path, epsilon=0.0)
+    init_db(settings)
+    with connection(settings) as conn:
+        _add_candidate(conn, 1, "https://sx.example/liked", "liked", [0, 1.0, 0, 0])
+        _serve(conn, 1, "broad")
+        # newest first: 12 is unlike the taste, 11 is close to it
+        _add_candidate(conn, 11, "https://sx.example/close", "close", [0, 0.9, 0.1, 0])
+        _add_candidate(conn, 12, "https://sx.example/far", "far", [0, 0, 0, 1.0])
+        conn.execute("UPDATE candidates SET source='searxng', topic='Science'")
+    record_feedback(settings, 1, "interest", "up")
+    with connection(settings) as conn:
+        picks = pick_broad_items(conn, settings, ["Science"], slots=1, rng=random.Random(1))  # noqa: S311
+        assert [p["id"] for p in picks] == [11]
+        # ε = 1: always the newest story, taste ignored
+        explore = _settings(tmp_path, epsilon=1.0)
+        picks = pick_broad_items(conn, explore, ["Science"], slots=1, rng=random.Random(1))  # noqa: S311
+        assert [p["id"] for p in picks] == [12]
+
+
+# ── Promote: an Exploring story becomes a main interest ─────────
+
+
+class _FakeLinkwardenMovable(_FakeLinkwardenCollections):
+    """Keeps the one created link's state so a move can be observed."""
+
+    async def create_link(self, url, name, collection_id, tags=None):
+        await super().create_link(url, name, collection_id, tags)
+        self.link = {
+            "id": 4711,
+            "url": url,
+            "collectionId": collection_id,
+            "collection": {"id": collection_id, "ownerId": 1, "name": "x"},
+            "tags": [],
+        }
+        return {"id": 4711, "url": url}
+
+    async def update_link(self, link):
+        self.link = link
+        return await super().update_link(link)
+
+
+async def test_promote_unsaved_exploring_item_saves_to_main(tmp_path):
+    from discover_app.pipeline.feedback import promote_candidate
+
+    settings = _settings(tmp_path, linkwarden_collection_id=17)
+    init_db(settings)
+    with connection(settings) as conn:
+        _add_candidate(conn, 1, "https://ex.com/e", "e", [0, 1.0, 0, 0])
+        _serve(conn, 1, "broad")
+    fake = _FakeLinkwardenMovable()
+    assert await promote_candidate(settings, 1, linkwarden=fake) == {
+        "status": "promoted",
+        "linkwarden_id": 4711,
+    }
+    assert [c["collection_id"] for c in fake.created] == [17]
+    assert fake.lookups == 0  # the Exploring collection is not needed
+    with connection(settings) as conn:
+        assert conn.execute("SELECT section FROM saves").fetchone()[0] == "curated"
+        assert conn.execute("SELECT section FROM feedback").fetchone()[0] == "curated"
+
+
+async def test_promote_moves_an_exploring_save(tmp_path):
+    from discover_app.pipeline.feedback import promote_candidate
+    from discover_app.pipeline.profile import _load_profile_vectors
+
+    settings = _settings(tmp_path, linkwarden_collection_id=17)
+    init_db(settings)
+    with connection(settings) as conn:
+        _add_candidate(conn, 1, "https://ex.com/e", "e", [0, 1.0, 0, 0])
+        _serve(conn, 1, "broad")
+    fake = _FakeLinkwardenMovable()
+    await capture_candidate(settings, 1, linkwarden=fake)
+    assert fake.link["collectionId"] == 99
+    with connection(settings) as conn:  # the next poll mirrors the link
+        conn.execute(
+            "INSERT INTO links(id, url, embedding, collection_id) "
+            "VALUES(4711, 'https://ex.com/e', ?, 99)",
+            (sqlite_vec.serialize_float32([0, 1.0, 0, 0]),),
+        )
+        assert len(_load_profile_vectors(conn, 4, 99)) == 0  # not an interest yet
+
+    result = await promote_candidate(settings, 1, linkwarden=fake)
+    assert result == {"status": "promoted", "linkwarden_id": 4711}
+    moved = fake.updated[-1]
+    assert moved["collectionId"] == 17 and moved["collection"] == {"id": 17, "ownerId": 1}
+    assert len(fake.created) == 1  # moved, not created again
+    with connection(settings) as conn:
+        assert conn.execute("SELECT section FROM saves").fetchone()[0] == "curated"
+        assert conn.execute("SELECT section FROM feedback").fetchone()[0] == "curated"
+        assert conn.execute("SELECT collection_id FROM links").fetchone()[0] == 17
+        assert len(_load_profile_vectors(conn, 4, 99)) == 1  # now it shapes "For you"
+    await promote_candidate(settings, 1, linkwarden=fake)
+    assert len(fake.updated) == 1  # idempotent: already in the main collection
+
+
+def test_promote_button_only_on_exploring(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from discover_app import app as app_mod
+
+    settings = _settings(tmp_path)
+    init_db(settings)
+    set_topic(settings, "Science", True)
+    with connection(settings) as conn:
+        _add_candidate(conn, 1, "https://ex.com/c", "curated", [1.0, 0, 0, 0])
+        _add_candidate(conn, 2, "https://ex.com/b", "broad", [0, 1.0, 0, 0])
+        conn.execute(
+            "INSERT INTO feed_items(rank, section, candidate_id, score, reason, cycle_ts) "
+            "VALUES(0, 'curated', 1, 0.9, '', 't1'), (0, 'broad', 2, 0.0, '', 't1')"
+        )
+        conn.execute("INSERT INTO meta(key, value) VALUES('last_cycle_ts', 't1')")
+    monkeypatch.setattr("discover_app.db.get_settings", lambda: settings)
+    monkeypatch.setattr(app_mod, "get_settings", lambda: settings)
+    page = TestClient(app_mod.create_app()).get("/ui").text
+    curated = page[page.index('id="c1"') : page.index("</article>", page.index('id="c1"'))]
+    broad = page[page.index('id="c2"') : page.index("</article>", page.index('id="c2"'))]
+    assert "promote(this)" not in curated and "promote(this)" in broad
+    assert 'aria-label="Promote to your main interests"' in broad
+
+
+# ── Reader: video pages play in the reader ──────────────────────
+
+
+def _video_page(ld: str = "", meta: str = "") -> bytes:
+    menu = " ".join(f"Rubrik{i} Untermenü" for i in range(80))  # no prose on the page
+    return (
+        f"<html><head>{meta}<script type='application/ld+json'>{ld}</script></head>"
+        f"<body><main><p>{menu}</p></main></body></html>"
+    ).encode()
+
+
+def test_find_video_sources():
+    from discover_app.reader import find_video
+
+    ld = (
+        '{"@graph": [{"@type": "WebPage"}, {"@type": "VideoObject", '
+        '"contentUrl": "https://cdn.ex/v.webxxl.h264.mp4", '
+        '"thumbnailUrl": ["https://img.ex/p.jpg"], '
+        '"description": "Kurz erklärt", "duration": "PT2M14S", '
+        '"author": {"name": "Oliver Sallet, ARD Berlin, tagesschau, Das Erste"}}]}'
+    )
+    assert find_video(_video_page(ld)) == {
+        "src": "https://cdn.ex/v.webxxl.h264.mp4",
+        "poster": "https://img.ex/p.jpg",
+        "description": "Kurz erklärt",
+        "duration": "2:14",
+        "author": "Oliver Sallet, ARD Berlin",
+    }
+    og = (
+        '<meta property="og:video" content="https://cdn.ex/clip">'
+        '<meta property="og:video:type" content="video/mp4">'
+        '<meta property="og:image" content="https://img.ex/o.jpg">'
+    )
+    assert find_video(_video_page(meta=og))["src"] == "https://cdn.ex/clip"
+    # iframe players and HLS streams are not played in the reader
+    youtube = '{"@type": "VideoObject", "embedUrl": "https://www.youtube.com/embed/x"}'
+    hls = '{"@type": "VideoObject", "contentUrl": "https://cdn.ex/master.m3u8"}'
+    html_player = (
+        '<meta property="og:video" content="https://ex.de/video~player.html">'
+        '<meta property="og:video:type" content="text/html">'
+    )
+    assert find_video(_video_page(youtube)) is None
+    assert find_video(_video_page(hls)) is None
+    assert find_video(_video_page(meta=html_player)) is None
+
+
+def test_reader_plays_video_pages(tmp_path, monkeypatch):
+    from discover_app import app as app_mod
+
+    settings, client = _reader_app(tmp_path, monkeypatch)
+    ld = (
+        '{"@type": "VideoObject", "contentUrl": "https://cdn.ex/v.mp4", '
+        '"thumbnailUrl": "https://img.ex/p.jpg", "description": "An article", "duration": "PT59S"}'
+    )
+
+    async def video_page(url, timeout_s):
+        return _video_page(ld)
+
+    monkeypatch.setattr(app_mod, "fetch_html", video_page)
+    resp = client.get("/read/1")
+    assert resp.status_code == 200
+    page = resp.text
+    assert (
+        '<video class="player" controls preload="none" playsinline '
+        'poster="https://img.ex/p.jpg" src="https://cdn.ex/v.mp4"></video>' in page
+    )
+    assert '<p class="video-info">Video · 0:59 min</p>' in page
+    assert 'class="lead"' not in page  # the description only repeats the headline
+    assert "Rubrik1" not in page  # no navigation text
+
+
+def test_ui_remembers_the_open_tab_in_the_fragment():
+    from discover_app.ui import render_page
+
+    page = render_page([], [], broad=[], saves=[])
+    assert "history.replaceState(null, '', panel === 'curated'" in page
+    assert "['broad', 'saved'].includes(location.hash.slice(1))" in page
+
+
+def test_cluster_count_scales_with_the_profile():
+    from discover_app.pipeline.profile import cluster_count
+
+    assert cluster_count(3) == 3  # never more clusters than points
+    assert cluster_count(40) == 8  # small profiles keep the old 8
+    assert cluster_count(726) == 19
+    assert cluster_count(10_000) == 32
+    assert cluster_count(726, fixed=8) == 8  # PROFILE_CLUSTERS still wins
+
+
+# ── Feed management (setup page) ────────────────────────────────
+
+
+def _mock_http(monkeypatch, handler):
+    real = httpx.AsyncClient
+
+    def factory(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(feeds_mod.httpx, "AsyncClient", factory)
+
+
+async def test_builtin_feeds_add_list_remove(tmp_path, monkeypatch):
+    settings = _settings(tmp_path, miniflux_token="")
+    init_db(settings)
+
+    def handler(request):
+        if request.url.host == "www.site.de" and request.url.path == "/feed.xml":
+            return httpx.Response(200, content=b"<?xml version='1.0'?><rss><channel/></rss>")
+        return httpx.Response(404)
+
+    _mock_http(monkeypatch, handler)
+    assert await feeds_mod.add_feed(settings, "www.site.de/feed.xml") == (
+        "https://www.site.de/feed.xml"
+    )
+    with pytest.raises(LookupError):
+        await feeds_mod.add_feed(settings, "https://nothing.de/")
+    feeds = await feeds_mod.list_feeds(settings)
+    assert [(f["title"], f["url"]) for f in feeds] == [("site.de", "https://www.site.de/feed.xml")]
+
+    await feeds_mod.remove_feed(settings, feeds[0]["id"])
+    assert await feeds_mod.list_feeds(settings) == []
+    with connection(settings) as conn:
+        assert (
+            conn.execute("SELECT status FROM feed_domains WHERE domain = 'site.de'").fetchone()[0]
+            == "unsubscribed"
+        )
+        conn.execute("INSERT INTO saves(url, url_key) VALUES('https://site.de/a', 'site.de/a')")
+    # discovery never re-adds an unsubscribed site
+    assert "site.de" not in pending_domains(_settings(tmp_path, feed_sync_min_links=1))
+    with pytest.raises(LookupError):
+        await feeds_mod.remove_feed(settings, 999)
+
+
+class _FakeMinifluxFeeds:
+    def __init__(self):
+        self.feeds = {
+            7: {
+                "id": 7,
+                "title": "heise",
+                "site_url": "https://www.heise.de/",
+                "feed_url": "https://www.heise.de/rss/heise-atom.xml",
+            }
+        }
+        self.created = []
+
+    async def list_feeds(self):
+        return list(self.feeds.values())
+
+    async def get_feed(self, feed_id):
+        if feed_id not in self.feeds:
+            raise httpx.HTTPStatusError(
+                "404", request=httpx.Request("GET", "http://mf"), response=httpx.Response(404)
+            )
+        return self.feeds[feed_id]
+
+    async def delete_feed(self, feed_id):
+        del self.feeds[feed_id]
+
+    async def discover(self, url):
+        return [{"url": "https://golem.de/rss", "title": "golem", "type": "rss"}]
+
+    async def first_category_id(self):
+        return 1
+
+    async def create_feed(self, feed_url, category_id):
+        self.created.append(feed_url)
+        return 8
+
+    async def aclose(self):
+        pass
+
+
+def test_miniflux_feeds_via_api(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from discover_app import app as app_mod
+
+    settings = _settings(tmp_path, miniflux_token="tok")  # noqa: S106 - dummy
+    init_db(settings)
+    fake = _FakeMinifluxFeeds()
+    monkeypatch.setattr(feeds_mod, "MinifluxClient", lambda s: fake)
+    monkeypatch.setattr("discover_app.db.get_settings", lambda: settings)
+    monkeypatch.setattr(app_mod, "get_settings", lambda: settings)
+    client = TestClient(app_mod.create_app())
+
+    assert client.get("/feeds").json() == [
+        {
+            "id": 7,
+            "title": "heise",
+            "site": "heise.de",
+            "url": "https://www.heise.de/rss/heise-atom.xml",
+        }
+    ]
+    assert client.post("/feeds", json={"url": "golem.de"}).json() == {"url": "https://golem.de/rss"}
+    assert fake.created == ["https://golem.de/rss"]
+    assert client.delete("/feeds/7").status_code == 204
+    assert client.delete("/feeds/7").status_code == 404
+    with connection(settings) as conn:
+        assert dict(conn.execute("SELECT domain, status FROM feed_domains").fetchall()) == {
+            "golem.de": "subscribed",
+            "heise.de": "unsubscribed",
+        }
+
+
+def test_feed_domains_migration_allows_unsubscribed(tmp_path):
+    settings = _settings(tmp_path)
+    with connection(settings) as conn:  # a database from before this change
+        conn.execute(
+            "CREATE TABLE feed_domains (domain TEXT PRIMARY KEY, status TEXT NOT NULL "
+            "CHECK (status IN ('subscribed', 'no_feed', 'failed')), feed_url TEXT, "
+            "detail TEXT, tried_at TEXT NOT NULL DEFAULT (datetime('now')))"
+        )
+        conn.execute("INSERT INTO feed_domains(domain, status) VALUES('a.de', 'no_feed')")
+    init_db(settings)
+    init_db(settings)  # idempotent
+    with connection(settings) as conn:
+        conn.execute("INSERT INTO feed_domains(domain, status) VALUES('b.de', 'unsubscribed')")
+        assert conn.execute("SELECT COUNT(*) FROM feed_domains").fetchone()[0] == 2
+
+
+def test_card_decodes_title_entities_and_drops_a_repeated_summary():
+    from discover_app.ui import render_page, repeats_title
+
+    title = "Bundestag berät erstmals über &#34;Frühstartrente&#34;"
+    item = dict(
+        candidate_id=1,
+        url="https://www.tagesschau.de/x",
+        title=title,
+        snippet='Bundestag berät erstmals über "Frühstartrente"[ mehr ]',
+        description=None,
+        image_url=None,
+        reason="",
+        source="miniflux",
+        published_at=None,
+        saved=False,
+        interest=None,
+    )
+    page = render_page([item], [])
+    assert "über &quot;Frühstartrente&quot;</a>" in page  # decoded, then escaped once
+    assert "&amp;#34;" not in page
+    assert 'class="summary"' not in page
+    assert repeats_title("Bundestag berät erstmals…", title)
+    assert not repeats_title(
+        "Die Koalition will Kindern ab sechs Jahren ein Depot finanzieren.", title
+    )
+
+
+# ── Save to Exploring: a "For you" story kept as a distraction ──
+
+
+async def test_save_to_exploring_files_there_and_counts_as_less(tmp_path):
+    from discover_app.pipeline.feedback import explore_candidate
+
+    settings = _settings(tmp_path, linkwarden_collection_id=17)
+    init_db(settings)
+    with connection(settings) as conn:
+        _add_candidate(conn, 1, "https://ex.com/c", "c", [1.0, 0, 0, 0])
+        _serve(conn, 1, "curated")
+    fake = _FakeLinkwardenMovable()
+    result = await explore_candidate(settings, 1, linkwarden=fake)
+    assert result == {"status": "saved_to_exploring", "linkwarden_id": 4711}
+    assert [c["collection_id"] for c in fake.created] == [99]  # the Exploring collection
+    with connection(settings) as conn:
+        assert conn.execute("SELECT section FROM saves").fetchone()[0] == "broad"
+        rows = conn.execute("SELECT axis, value, section FROM feedback ORDER BY id").fetchall()
+    # the save steers Exploring; the vote lowers "For you"
+    assert [tuple(r) for r in rows] == [
+        ("saved", "explicit", "broad"),
+        ("interest", "down", "curated"),
+    ]
+
+
+async def test_save_to_exploring_moves_a_main_save(tmp_path):
+    from discover_app.pipeline.feedback import explore_candidate
+
+    settings = _settings(tmp_path, linkwarden_collection_id=17)
+    init_db(settings)
+    with connection(settings) as conn:
+        _add_candidate(conn, 1, "https://ex.com/c", "c", [1.0, 0, 0, 0])
+        _serve(conn, 1, "curated")
+    fake = _FakeLinkwardenMovable()
+    await capture_candidate(settings, 1, linkwarden=fake)
+    assert fake.link["collectionId"] == 17
+    await explore_candidate(settings, 1, linkwarden=fake)
+    assert fake.updated[-1]["collectionId"] == 99
+    assert len(fake.created) == 1  # moved, not created again
+    with connection(settings) as conn:
+        assert conn.execute("SELECT section FROM saves").fetchone()[0] == "broad"
+
+
+def test_explore_button_only_on_for_you(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from discover_app import app as app_mod
+
+    settings = _settings(tmp_path)
+    init_db(settings)
+    set_topic(settings, "Science", True)
+    with connection(settings) as conn:
+        _add_candidate(conn, 1, "https://ex.com/c", "curated", [1.0, 0, 0, 0])
+        _add_candidate(conn, 2, "https://ex.com/b", "broad", [0, 1.0, 0, 0])
+        conn.execute(
+            "INSERT INTO feed_items(rank, section, candidate_id, score, reason, cycle_ts) "
+            "VALUES(0, 'curated', 1, 0.9, '', 't1'), (0, 'broad', 2, 0.0, '', 't1')"
+        )
+        conn.execute("INSERT INTO meta(key, value) VALUES('last_cycle_ts', 't1')")
+    monkeypatch.setattr("discover_app.db.get_settings", lambda: settings)
+    monkeypatch.setattr(app_mod, "get_settings", lambda: settings)
+    page = TestClient(app_mod.create_app()).get("/ui").text
+    curated = page[page.index('id="c1"') : page.index("</article>", page.index('id="c1"'))]
+    broad = page[page.index('id="c2"') : page.index("</article>", page.index('id="c2"'))]
+    assert "explore(this)" in curated and "promote(this)" not in curated
+    assert "promote(this)" in broad and "explore(this)" not in broad

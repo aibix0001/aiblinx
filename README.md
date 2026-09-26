@@ -20,15 +20,22 @@ own server, and your reading profile is one SQLite file.
 
 ## What it does
 
-- **Learns from three buttons.** *Save* (to aiblinx, or to Linkwarden when
-  connected), *more like this* and *less like this*. No rating scales; recent
+- **Learns from a few buttons.** *Save* (to aiblinx, or to Linkwarden when
+  connected), *more like this* and *less like this*. No rating scales. Recent
   taps count more, and your profile follows you as your interests change.
+- **Reads without leaving.** A story opens in a clean reader view, and a video
+  plays right there. Nothing about what you open is recorded, and publishers
+  never see where you came from.
+- **Keeps a window open.** An *Exploring* section reserves 30% of the feed for
+  topics outside your profile. What you save or vote there teaches Exploring
+  which distractions you like, without changing your main feed, and Exploring
+  saves get their own Linkwarden collection. *Promote* moves a story into your
+  main interests; the compass sends a main-feed story to Exploring.
 - **Finds your sources itself.** It looks at the sites you keep and subscribes
-  to their feeds, and adds Hacker News. Optional: a
+  to their feeds, and adds Hacker News. The setup page lists every feed, so
+  you can unsubscribe or add a site. Optional: a
   [Miniflux](https://miniflux.app) reader, and [SearXNG](https://docs.searxng.org)
   searches on topics you pick.
-- **Keeps a window open.** An *Exploring* section reserves 30% of the feed for
-  topics outside your profile, so the feed doesn't close in on itself.
 - **Explains itself.** Every card says why it was picked.
 - **Feels like an app.** Mobile-first, light and dark, and *Add to Home Screen*
   opens it full screen. Also available as an Atom feed and a daily digest.

@@ -11,6 +11,10 @@ Three signal kinds land in the ``feedback`` table:
 The candidate's embedding is copied onto the feedback row at write time so the
 signal survives the 14-day candidate prune. URLs are stored normalized
 (``urls.norm_url``) — the same identity used by ranking exclusions.
+
+Every signal also records the section its item was served in. Exploring
+(``broad``) feedback steers only Exploring: it never enters the interest
+profile, and Exploring saves go to their own Linkwarden collection.
 """
 
 from __future__ import annotations
@@ -21,7 +25,7 @@ from datetime import UTC, datetime, timedelta
 
 from ..clients.linkwarden import LinkwardenClient
 from ..config import Settings
-from ..db import connection
+from ..db import connection, get_meta, set_meta
 from ..urls import norm_url
 
 log = logging.getLogger(__name__)
@@ -37,6 +41,46 @@ VALID_VALUES: dict[str, set[str]] = {
 }
 
 VALID_RATINGS: set[float] = {-1.0, -0.5, 0.0, 0.5, 1.0}
+
+EXPLORE_COLLECTION_NAME = "Exploring"
+_EXPLORE_COLLECTION_KEY = "linkwarden_explore_collection_id"
+
+
+def served_section(conn, candidate_id: int) -> str:
+    """'broad' when the item was served under Exploring, else 'curated'."""
+    row = conn.execute(
+        "SELECT 1 FROM feed_items WHERE candidate_id = ? AND section = 'broad' LIMIT 1",
+        (candidate_id,),
+    ).fetchone()
+    return "broad" if row else "curated"
+
+
+def known_explore_collection(conn, settings: Settings) -> int | None:
+    """The Exploring collection's id if configured or already created."""
+    if settings.linkwarden_explore_collection_id is not None:
+        return settings.linkwarden_explore_collection_id
+    stored = get_meta(conn, _EXPLORE_COLLECTION_KEY)
+    return int(stored) if stored else None
+
+
+async def explore_collection(settings: Settings, linkwarden: LinkwardenClient) -> int:
+    """The Exploring collection's id: configured, remembered, or found/created."""
+    with connection(settings) as conn:
+        known = known_explore_collection(conn, settings)
+    if known is not None:
+        return known
+    collection_id = await linkwarden.find_or_create_collection(EXPLORE_COLLECTION_NAME)
+    with connection(settings) as conn:
+        set_meta(conn, _EXPLORE_COLLECTION_KEY, str(collection_id))
+    log.info("Exploring saves go to Linkwarden collection %d", collection_id)
+    return collection_id
+
+
+async def _collection_for(settings: Settings, linkwarden: LinkwardenClient, section: str) -> int:
+    if section == "broad":
+        return await explore_collection(settings, linkwarden)
+    return settings.linkwarden_collection_id
+
 
 # Facet tag names mirrored to Linkwarden (interest:high|low, mood:happy|sad).
 FACET_TAG: dict[tuple[str, str], str] = {
@@ -103,8 +147,16 @@ def record_feedback(settings: Settings, candidate_id: int, axis: str, value: str
             raise LookupError(f"unknown candidate {candidate_id}")
         url_key = norm_url(row["url"])
         conn.execute(
-            "INSERT INTO feedback(candidate_id, url, axis, value, embedding) VALUES(?, ?, ?, ?, ?)",
-            (candidate_id, url_key, axis, value, row["embedding"]),
+            "INSERT INTO feedback(candidate_id, url, axis, value, embedding, section) "
+            "VALUES(?, ?, ?, ?, ?, ?)",
+            (
+                candidate_id,
+                url_key,
+                axis,
+                value,
+                row["embedding"],
+                served_section(conn, candidate_id),
+            ),
         )
     return url_key
 
@@ -126,54 +178,161 @@ async def capture_candidate(
     state written (retry is safe).
     """
     async with _capture_lock:
-        with connection(settings) as conn:
-            row = conn.execute(
-                "SELECT url, title, image_url, embedding FROM candidates WHERE id = ?",
-                (candidate_id,),
-            ).fetchone()
-            if row is None:
-                raise LookupError(f"unknown candidate {candidate_id}")
-            url_key = norm_url(row["url"])
-            already = conn.execute(
-                "SELECT 1 FROM feedback WHERE axis = 'saved' AND url = ?", (url_key,)
-            ).fetchone()
-            bookmarked = already or any(
-                norm_url(link_url) == url_key
-                for (link_url,) in conn.execute("SELECT url FROM links")
-            )
-        if bookmarked:
-            return {"status": "already_saved"}
+        return await _capture(settings, candidate_id, linkwarden, section=None)
 
-        link_id = None
-        if settings.linkwarden_enabled:
-            owns_client = linkwarden is None
-            linkwarden = linkwarden or LinkwardenClient(settings)
-            try:
-                # Feedback given before capture becomes tags at creation time
-                # (tags are applied when the item is saved later).
-                pre_facets = _facet_tag_names(latest_facets(settings, url_key))
-                created = await linkwarden.create_link(
-                    url=row["url"],
-                    name=row["title"] or row["url"],
-                    collection_id=settings.linkwarden_collection_id,
-                    tags=pre_facets,
-                )
-            finally:
-                if owns_client:
-                    await linkwarden.aclose()
-            link_id = created.get("id") if isinstance(created, dict) else None
 
-        with connection(settings) as conn:
-            conn.execute(
-                "INSERT OR IGNORE INTO feedback(candidate_id, url, axis, value, embedding) "
-                "VALUES(?, ?, 'saved', 'explicit', ?)",
-                (candidate_id, url_key, row["embedding"]),
+async def promote_candidate(
+    settings: Settings,
+    candidate_id: int,
+    linkwarden: LinkwardenClient | None = None,
+) -> dict:
+    """Promote: make an Exploring story a main interest. Unsaved, it is saved
+    as ``curated`` into the main collection; already saved to Exploring, it is
+    moved there (Linkwarden link, local save and ``saved`` event). Idempotent.
+    """
+    async with _capture_lock:
+        link_id = await _file_as(settings, candidate_id, "curated", linkwarden)
+    log.info("promote: candidate %d filed under the main interests", candidate_id)
+    return {"status": "promoted", "linkwarden_id": link_id}
+
+
+async def explore_candidate(
+    settings: Settings,
+    candidate_id: int,
+    linkwarden: LinkwardenClient | None = None,
+) -> dict:
+    """Save to Exploring: keep a "For you" story as a distraction. It is saved
+    as ``broad`` into the Exploring collection (moved there if it was saved
+    to the main one) and counts as "less like this" for "For you".
+    """
+    async with _capture_lock:
+        link_id = await _file_as(settings, candidate_id, "broad", linkwarden)
+    record_feedback(settings, candidate_id, "interest", "down")
+    log.info("explore: candidate %d filed under Exploring", candidate_id)
+    return {"status": "saved_to_exploring", "linkwarden_id": link_id}
+
+
+async def _file_as(
+    settings: Settings,
+    candidate_id: int,
+    section: str,
+    linkwarden: LinkwardenClient | None,
+) -> int | None:
+    """Save the candidate as ``section``, or move an existing save there: the
+    Linkwarden link changes collection, and the local save, ``saved`` event
+    and mirrored link follow. Runs under ``_capture_lock``; returns the
+    Linkwarden link id if there is one."""
+    result = await _capture(settings, candidate_id, linkwarden, section=section)
+    if result["status"] == "saved":
+        return result["linkwarden_id"]
+    with connection(settings) as conn:
+        (url,) = conn.execute("SELECT url FROM candidates WHERE id = ?", (candidate_id,)).fetchone()
+        url_key = norm_url(url)
+        save = conn.execute(
+            "SELECT linkwarden_id FROM saves WHERE url_key = ?", (url_key,)
+        ).fetchone()
+        link_ids = {
+            link_id
+            for link_id, link_url in conn.execute("SELECT id, url FROM links")
+            if norm_url(link_url) == url_key
+        }
+    if save and save[0]:
+        link_ids.add(int(save[0]))
+    target = None
+    if settings.linkwarden_enabled and link_ids:
+        owns_client = linkwarden is None
+        linkwarden = linkwarden or LinkwardenClient(settings)
+        try:
+            target = await _collection_for(settings, linkwarden, section)
+            for link_id in sorted(link_ids):
+                link = await linkwarden.get_link(link_id)
+                if link.get("collectionId") != target:
+                    # verified contract: full-object PUT with the new collection
+                    owner = (link.get("collection") or {}).get("ownerId")
+                    link["collection"] = {"id": target, "ownerId": owner}
+                    link["collectionId"] = target
+                    await linkwarden.update_link(link)
+        finally:
+            if owns_client:
+                await linkwarden.aclose()
+    with connection(settings) as conn:
+        conn.execute("UPDATE saves SET section = ? WHERE url_key = ?", (section, url_key))
+        conn.execute(
+            "UPDATE feedback SET section = ? WHERE axis = 'saved' AND url = ?",
+            (section, url_key),
+        )
+        if target is not None:
+            conn.executemany(
+                "UPDATE links SET collection_id = ? WHERE id = ?",
+                [(target, link_id) for link_id in link_ids],
             )
-            conn.execute(
-                "INSERT OR IGNORE INTO saves(url, url_key, title, image_url, embedding, "
-                "linkwarden_id) VALUES(?, ?, ?, ?, ?, ?)",
-                (row["url"], url_key, row["title"], row["image_url"], row["embedding"], link_id),
+    return min(link_ids) if link_ids else None
+
+
+async def _capture(
+    settings: Settings,
+    candidate_id: int,
+    linkwarden: LinkwardenClient | None,
+    section: str | None,
+) -> dict:
+    """capture_candidate's body, run under ``_capture_lock``; ``section``
+    overrides where the item was served (promote saves as ``curated``)."""
+    with connection(settings) as conn:
+        row = conn.execute(
+            "SELECT url, title, image_url, embedding FROM candidates WHERE id = ?",
+            (candidate_id,),
+        ).fetchone()
+        if row is None:
+            raise LookupError(f"unknown candidate {candidate_id}")
+        url_key = norm_url(row["url"])
+        section = section or served_section(conn, candidate_id)
+        already = conn.execute(
+            "SELECT 1 FROM feedback WHERE axis = 'saved' AND url = ?", (url_key,)
+        ).fetchone()
+        bookmarked = already or any(
+            norm_url(link_url) == url_key for (link_url,) in conn.execute("SELECT url FROM links")
+        )
+    if bookmarked:
+        return {"status": "already_saved"}
+
+    link_id = None
+    if settings.linkwarden_enabled:
+        owns_client = linkwarden is None
+        linkwarden = linkwarden or LinkwardenClient(settings)
+        try:
+            # Feedback given before capture becomes tags at creation time
+            # (tags are applied when the item is saved later).
+            pre_facets = _facet_tag_names(latest_facets(settings, url_key))
+            created = await linkwarden.create_link(
+                url=row["url"],
+                name=row["title"] or row["url"],
+                collection_id=await _collection_for(settings, linkwarden, section),
+                tags=pre_facets,
             )
+        finally:
+            if owns_client:
+                await linkwarden.aclose()
+        link_id = created.get("id") if isinstance(created, dict) else None
+
+    with connection(settings) as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO feedback(candidate_id, url, axis, value, embedding, "
+            "section) VALUES(?, ?, 'saved', 'explicit', ?, ?)",
+            (candidate_id, url_key, row["embedding"], section),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO saves(url, url_key, title, image_url, embedding, "
+            "linkwarden_id, section) VALUES(?, ?, ?, ?, ?, ?, ?)",
+            (
+                row["url"],
+                url_key,
+                row["title"],
+                row["image_url"],
+                row["embedding"],
+                link_id,
+                section,
+            ),
+        )
     if settings.linkwarden_enabled:
         log.info("capture: candidate %d saved to Linkwarden as link %s", candidate_id, link_id)
         return {"status": "saved", "linkwarden_id": link_id}
@@ -191,7 +350,7 @@ async def push_local_saves(settings: Settings, linkwarden: LinkwardenClient) -> 
     """
     with connection(settings) as conn:
         pending = conn.execute(
-            "SELECT id, url, url_key, title FROM saves WHERE linkwarden_id IS NULL"
+            "SELECT id, url, url_key, title, section FROM saves WHERE linkwarden_id IS NULL"
         ).fetchall()
         mirrored = {
             norm_url(url): link_id for link_id, url in conn.execute("SELECT id, url FROM links")
@@ -203,7 +362,7 @@ async def push_local_saves(settings: Settings, linkwarden: LinkwardenClient) -> 
             link = await linkwarden.create_link(
                 url=save["url"],
                 name=save["title"] or save["url"],
-                collection_id=settings.linkwarden_collection_id,
+                collection_id=await _collection_for(settings, linkwarden, save["section"]),
                 tags=_facet_tag_names(latest_facets(settings, save["url_key"])),
             )
             link_id = link.get("id") if isinstance(link, dict) else None
@@ -234,7 +393,7 @@ def detect_saved(settings: Settings, new_link_urls: list[str]) -> int:
         # Any served section counts: a save from the broad section is exactly
         # the Exploring bandit's reward signal, not just curated saves.
         served = conn.execute(
-            "SELECT DISTINCT c.id, c.url, c.embedding FROM feed_items f "
+            "SELECT DISTINCT c.id, c.url, c.embedding, f.section FROM feed_items f "
             "JOIN candidates c ON c.id = f.candidate_id"
         ).fetchall()
         recorded = {row[0] for row in conn.execute("SELECT url FROM feedback WHERE axis = 'saved'")}
@@ -242,9 +401,9 @@ def detect_saved(settings: Settings, new_link_urls: list[str]) -> int:
             url_key = norm_url(row["url"])
             if url_key in new_keys and url_key not in recorded:
                 cur = conn.execute(
-                    "INSERT OR IGNORE INTO feedback(candidate_id, url, axis, value, embedding) "
-                    "VALUES(?, ?, 'saved', 'implicit', ?)",
-                    (row["id"], url_key, row["embedding"]),
+                    "INSERT OR IGNORE INTO feedback(candidate_id, url, axis, value, embedding, "
+                    "section) VALUES(?, ?, 'saved', 'implicit', ?, ?)",
+                    (row["id"], url_key, row["embedding"], row["section"]),
                 )
                 recorded.add(url_key)
                 events += cur.rowcount

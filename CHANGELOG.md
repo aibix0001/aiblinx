@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.2.0
+
+- **Read inside aiblinx:** tapping a story opens a clean reader view of the
+  article, in the same tab, so swiping back returns to the feed. Video pages
+  play their video right there. Pages without readable text open the original.
+  Nothing about what you open is recorded, cached or logged, and publishers
+  get no referrer.
+- **Exploring stays separate:** saves and votes on Exploring stories no longer
+  change "For you". They teach Exploring which distractions you like instead,
+  and Exploring saves go to their own Linkwarden collection ("Exploring",
+  created for you, or set `LINKWARDEN_EXPLORE_COLLECTION_ID`).
+- **Move stories between the two:** *Promote* (⌃⌃) on an Exploring story makes
+  it a main interest. The compass on a "For you" story saves it to Exploring
+  and shows less like it in "For you".
+- **Feeds in Setup:** see every feed aiblinx reads, unsubscribe, or add a site.
+  A site you unsubscribe is never added back automatically.
+- **Finer interests:** the number of interest clusters now grows with your
+  profile (8 to 32; `PROFILE_CLUSTERS` still fixes it).
+- **New look:** navy and teal colours, and new home-screen icons. Phones cache
+  the icon: remove aiblinx from the home screen and add it again to see it.
+- Reloading keeps the tab you were on. Headlines no longer show raw `&#34;`
+  codes, and summaries that only repeat the headline are left out.
+
 ## 0.1.2
 
 - **New wordmark:** *aib* | *linx* in the app header, the setup and login

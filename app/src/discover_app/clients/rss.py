@@ -36,7 +36,7 @@ _MAX_FEED_BYTES = 2 * 1024 * 1024
 _ENTRIES_PER_FEED = 20
 
 
-def _looks_like_feed(body: bytes) -> bool:
+def looks_like_feed(body: bytes) -> bool:
     head = body[:1000].lower()
     return b"<rss" in head or b"<feed" in head or b"<rdf:rdf" in head
 
@@ -58,7 +58,7 @@ async def discover_feed(client: httpx.AsyncClient, site_url: str) -> str | None:
         for path in _COMMON_PATHS:
             candidate = urljoin(site_url, path)
             probe = await client.get(candidate)
-            if probe.status_code == 200 and _looks_like_feed(probe.content):
+            if probe.status_code == 200 and looks_like_feed(probe.content):
                 return str(probe.url)
     except httpx.HTTPError as exc:
         log.info("rss: discovery on %s failed: %s", site_url, exc)

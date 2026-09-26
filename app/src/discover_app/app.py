@@ -28,8 +28,10 @@ from .icons import ICONS, MANIFEST
 from .importers import import_bookmarks, import_urls, opml_feed_count, opml_feed_urls
 from .models import (
     CaptureResponse,
+    FeedAdd,
     FeedbackRequest,
     FeedbackResponse,
+    FeedInfo,
     FeedItem,
     FeedResponse,
     HealthResponse,
@@ -45,17 +47,28 @@ from .models import (
 from .pipeline.cycle import run_cycle
 from .pipeline.feedback import (
     capture_candidate,
+    explore_candidate,
     facet_query,
     mirror_facet_tags,
+    promote_candidate,
     record_feedback,
     record_rating,
+    served_section,
 )
+from .pipeline.feeds import add_feed, list_feeds, remove_feed
 from .pipeline.miniflux_key import ensure_miniflux_token, miniflux_configured
 from .pipeline.output import current_items, render_atom, render_markdown
+from .reader import (
+    extract_article,
+    fetch_html,
+    find_video,
+    hide_reads_from_access_log,
+    video_body,
+)
 from .scheduler import build_scheduler
 from .setup_ui import render_login, render_setup
 from .topics import list_topics, set_topic
-from .ui import render_page
+from .ui import render_page, render_reader
 from .urls import norm_url
 
 log = logging.getLogger("discover_app")
@@ -68,6 +81,7 @@ _SAVED_LIST_MAX = 200
 async def lifespan(app: FastAPI):
     settings = get_settings()
     init_db(settings)
+    hide_reads_from_access_log()
     scheduler = build_scheduler(settings)
     scheduler.start()
     app.state.scheduler = scheduler
@@ -172,6 +186,13 @@ def create_app() -> FastAPI:
             saved = {
                 row[0] for row in conn.execute("SELECT url FROM feedback WHERE axis = 'saved'")
             }
+            promoted = {
+                row[0]
+                for row in conn.execute("SELECT url_key FROM saves WHERE section = 'curated'")
+            }
+            explored = {
+                row[0] for row in conn.execute("SELECT url_key FROM saves WHERE section = 'broad'")
+            }
             interest = {
                 row["url"]: row["value"]
                 for row in conn.execute(
@@ -190,6 +211,8 @@ def create_app() -> FastAPI:
             key = norm_url(item["url"] or "")
             item["saved"] = key in saved
             item["interest"] = interest.get(key)
+            item["promoted"] = key in promoted
+            item["explored"] = key in explored
         settings = get_settings()
         return render_page(
             curated,
@@ -343,6 +366,42 @@ def create_app() -> FastAPI:
         )
         return SetupStatus(running=running, has_feed=has_feed, message=message)
 
+    async def _feed_settings():
+        """Settings for feed management: Miniflux (with its API key made on
+        demand) when it is set up, else the built-in reader."""
+        settings = get_settings()
+        if miniflux_configured(settings):
+            settings = await ensure_miniflux_token(settings)
+        return settings
+
+    @app.get("/feeds", response_model=list[FeedInfo])
+    async def feeds_list() -> list[FeedInfo]:
+        try:
+            feeds = await list_feeds(await _feed_settings())
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"Miniflux: {exc}") from exc
+        return [FeedInfo(**f) for f in feeds]
+
+    @app.post("/feeds", status_code=201)
+    async def feeds_add(body: FeedAdd) -> dict:
+        try:
+            feed_url = await add_feed(await _feed_settings(), body.url)
+        except LookupError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"Miniflux: {exc}") from exc
+        return {"url": feed_url}
+
+    @app.delete("/feeds/{feed_id}", status_code=204)
+    async def feeds_remove(feed_id: int) -> Response:
+        try:
+            await remove_feed(await _feed_settings(), feed_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"Miniflux: {exc}") from exc
+        return Response(status_code=204)
+
     @app.get("/topics", response_model=list[Topic])
     def topics_list() -> list[Topic]:
         return [Topic(**t) for t in list_topics(get_settings())]
@@ -386,6 +445,62 @@ def create_app() -> FastAPI:
     # Linkwarden, and the PR-2 HTML page must be able to call them without a
     # token dance. ADMIN_TOKEN stays reserved for credit-spending admin routes.
 
+    @app.get("/read/{candidate_id}", response_class=HTMLResponse, include_in_schema=False)
+    async def read(candidate_id: int) -> Response:
+        """Reader view of one feed item; the original page when there is no
+        article text to show. Records nothing about the visit (no tracking)."""
+        settings = get_settings()
+        with connection() as conn:
+            row = conn.execute(
+                "SELECT id, url, title, image_url, source, published_at FROM candidates "
+                "WHERE id = ?",
+                (candidate_id,),
+            ).fetchone()
+            if row is None or not row["url"].startswith(("http://", "https://")):
+                raise HTTPException(status_code=404, detail="no such item")
+            key = norm_url(row["url"])
+            saved = conn.execute(
+                "SELECT 1 FROM feedback WHERE axis = 'saved' AND url = ?", (key,)
+            ).fetchone()
+            interest = conn.execute(
+                "SELECT value FROM feedback WHERE axis = 'interest' AND url = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (key,),
+            ).fetchone()
+            # the one button that files the story on the other side
+            filed = conn.execute("SELECT section FROM saves WHERE url_key = ?", (key,)).fetchone()
+            if served_section(conn, candidate_id) == "broad":
+                promoted, explored = bool(filed and filed[0] == "curated"), None
+            else:
+                promoted, explored = None, bool(filed and filed[0] == "broad")
+        item = dict(row)
+        page = await fetch_html(item["url"], settings.enrich_timeout_s)
+        body = (
+            await asyncio.to_thread(extract_article, page, item["url"], item["title"])
+            if page
+            else None
+        )
+        if body is None and page:
+            # no article, but maybe a video we can play without its page
+            video = await asyncio.to_thread(find_video, page)
+            if video:
+                body = video_body(video, item["title"])
+                item["image_url"] = None  # the poster is the picture
+        if body is None:
+            return RedirectResponse(item["url"], status_code=302)
+        return HTMLResponse(
+            render_reader(
+                item,
+                body,
+                saved=saved is not None,
+                interest=interest[0] if interest else None,
+                linkwarden=settings.linkwarden_enabled,
+                promoted=promoted,
+                explored=explored,
+            ),
+            headers={"Referrer-Policy": "no-referrer", "Cache-Control": "no-store"},
+        )
+
     @app.post("/feed/{candidate_id}/save", response_model=CaptureResponse)
     async def feed_save(candidate_id: int) -> CaptureResponse:
         """ "+" capture: save this suggestion into Linkwarden (idempotent)."""
@@ -395,6 +510,34 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except httpx.HTTPError as exc:
             # Most common cause: wrong LINKWARDEN_COLLECTION_ID or expired token.
+            raise HTTPException(
+                status_code=502, detail=f"Linkwarden rejected the save: {exc}"
+            ) from exc
+        return CaptureResponse(**result)
+
+    @app.post("/feed/{candidate_id}/promote", response_model=CaptureResponse)
+    async def feed_promote(candidate_id: int) -> CaptureResponse:
+        """Make an Exploring story a main interest: saved into (or moved to)
+        the main collection, where it shapes "For you"."""
+        try:
+            result = await promote_candidate(get_settings(), candidate_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=502, detail=f"Linkwarden rejected the promotion: {exc}"
+            ) from exc
+        return CaptureResponse(**result)
+
+    @app.post("/feed/{candidate_id}/explore", response_model=CaptureResponse)
+    async def feed_explore(candidate_id: int) -> CaptureResponse:
+        """Keep a "For you" story as a distraction: saved into (or moved to)
+        the Exploring collection, and "less like this" for "For you"."""
+        try:
+            result = await explore_candidate(get_settings(), candidate_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except httpx.HTTPError as exc:
             raise HTTPException(
                 status_code=502, detail=f"Linkwarden rejected the save: {exc}"
             ) from exc

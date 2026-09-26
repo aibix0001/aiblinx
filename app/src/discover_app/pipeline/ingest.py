@@ -21,9 +21,12 @@ _BACKFILL_KEY = "linkwarden_backfill_done"
 # link's text often arrives after the first poll). ``url`` is never updated —
 # it is UNIQUE and the row identity for vec bookkeeping.
 _UPSERT_LINK = """
-INSERT INTO links (id, url, name, description, text_content, tags, created_at, updated_at)
-VALUES (:id, :url, :name, :description, :text_content, :tags, :created_at, :updated_at)
+INSERT INTO links (id, url, name, description, text_content, tags, created_at, updated_at,
+                   collection_id)
+VALUES (:id, :url, :name, :description, :text_content, :tags, :created_at, :updated_at,
+        :collection_id)
 ON CONFLICT(id) DO UPDATE SET
+    collection_id = excluded.collection_id,
     name = excluded.name,
     description = excluded.description,
     text_content = excluded.text_content,
@@ -48,6 +51,7 @@ def _link_row(link: dict) -> dict:
         "tags": json.dumps([t.get("name") for t in link.get("tags", [])]),
         "created_at": link.get("createdAt"),
         "updated_at": link.get("updatedAt"),
+        "collection_id": link.get("collectionId"),
     }
 
 

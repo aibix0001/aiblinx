@@ -12,12 +12,21 @@ random selected topic explores instead (ε≈0.2).
 
 Broad items are deliberately NOT LLM-reranked — exploration must not be
 relevance-filtered; the "why" line is just "exploring: <topic>".
+
+Within a topic, Exploring's own feedback steers which story is served: the
+candidate closest to Exploring saves / upvotes and farthest from Exploring
+downvotes wins (``explore_taste``). With probability ε the newest story is
+served regardless, so a liked niche never narrows Exploring into a bubble.
+This taste is separate from the interest profile — Exploring feedback never
+reaches "For you".
 """
 
 from __future__ import annotations
 
 import random
 import sqlite3
+
+import numpy as np
 
 from ..config import Settings
 from ..urls import norm_url
@@ -56,6 +65,41 @@ def arm_stats(conn: sqlite3.Connection) -> dict[str, tuple[int, int]]:
     }
 
 
+# Taste ranking looks at this many of the topic's newest unserved stories.
+_TASTE_WINDOW = 30
+
+
+def _unit(blob: bytes) -> np.ndarray:
+    vec = np.frombuffer(blob, dtype=np.float32)
+    return vec / (float(np.linalg.norm(vec)) or 1.0)
+
+
+def explore_taste(conn: sqlite3.Connection) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """(liked, disliked) unit vectors from Exploring feedback only: saves and
+    latest-``up`` votes are liked, latest-``down`` votes disliked."""
+    liked: list[np.ndarray] = []
+    disliked: list[np.ndarray] = []
+    for row in conn.execute(
+        "SELECT axis, value, embedding FROM feedback "
+        "WHERE section = 'broad' AND embedding IS NOT NULL AND (axis = 'saved' OR id IN ("
+        "  SELECT MAX(id) FROM feedback WHERE axis = 'interest' GROUP BY url))"
+    ):
+        if row["axis"] == "saved" or row["value"] == "up":
+            liked.append(_unit(row["embedding"]))
+        elif row["value"] == "down":
+            disliked.append(_unit(row["embedding"]))
+    return liked, disliked
+
+
+def _taste_score(blob: bytes, liked: list[np.ndarray], disliked: list[np.ndarray]) -> float:
+    """Closest liked minus closest disliked; vectors from another embedder
+    (other dimension) are ignored."""
+    vec = _unit(blob)
+    likes = [float(v @ vec) for v in liked if v.shape == vec.shape]
+    dislikes = [float(v @ vec) for v in disliked if v.shape == vec.shape]
+    return max(likes, default=float("-inf")) - max(dislikes, default=0.0)
+
+
 def choose_arm(
     selected: list[str],
     stats: dict[str, tuple[int, int]],
@@ -91,6 +135,7 @@ def pick_broad_items(
         return []
     rng = rng or random.Random()  # noqa: S311 - bandit exploration, not crypto
     stats = arm_stats(conn)
+    liked, disliked = explore_taste(conn)
     saved_urls = {norm_url(row[0]) for row in conn.execute("SELECT url FROM links")}
     served = {row[0] for row in conn.execute("SELECT DISTINCT candidate_id FROM feed_items")}
     pool: dict[str, list[sqlite3.Row]] = {}
@@ -114,7 +159,14 @@ def pick_broad_items(
         if not candidates_left:
             break
         arm = choose_arm(candidates_left, stats, settings.epsilon, rng)
-        row = next(r for r in pool[arm] if r["id"] not in chosen)
+        options = [r for r in pool[arm] if r["id"] not in chosen]
+        if liked and rng.random() >= settings.epsilon:
+            row = max(
+                options[:_TASTE_WINDOW],
+                key=lambda r: _taste_score(r["embedding"], liked, disliked),
+            )
+        else:
+            row = options[0]  # newest: pure exploration
         chosen.add(row["id"])
         picks.append({"id": row["id"], "topic": row["topic"], "embedding": row["embedding"]})
     return picks

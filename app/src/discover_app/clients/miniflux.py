@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 from typing import Any
 
 import httpx
@@ -38,7 +39,8 @@ class MinifluxClient:
                 {
                     "source": "miniflux",
                     "url": url,
-                    "title": entry.get("title", ""),
+                    # Miniflux keeps entities in titles ("&#34;"): decode once here
+                    "title": html.unescape(entry.get("title") or ""),
                     "snippet": strip_html(content)[:500],
                     "image_url": first_image(content),
                     "published_at": entry.get("published_at"),
@@ -64,6 +66,20 @@ class MinifluxClient:
         )
         resp.raise_for_status()
         return int(resp.json()["feed_id"])
+
+    async def list_feeds(self) -> list[dict[str, Any]]:
+        resp = await self._client.get("/v1/feeds")
+        resp.raise_for_status()
+        return resp.json()
+
+    async def get_feed(self, feed_id: int) -> dict[str, Any]:
+        resp = await self._client.get(f"/v1/feeds/{feed_id}")
+        resp.raise_for_status()
+        return resp.json()
+
+    async def delete_feed(self, feed_id: int) -> None:
+        resp = await self._client.delete(f"/v1/feeds/{feed_id}")
+        resp.raise_for_status()
 
     async def import_opml(self, opml: str) -> None:
         """Subscribe every feed in an OPML document (Miniflux's own importer)."""

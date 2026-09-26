@@ -60,7 +60,9 @@ CREATE TABLE IF NOT EXISTS links (
     updated_at   TEXT,
     embedded     INTEGER NOT NULL DEFAULT 0,
     embedding    BLOB,
-    fetched_at   TEXT NOT NULL DEFAULT (datetime('now'))
+    fetched_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    collection_id INTEGER                       -- Linkwarden collection (Exploring saves
+                                                -- are kept out of the profile by it)
 );
 
 CREATE TABLE IF NOT EXISTS candidates (
@@ -137,7 +139,8 @@ CREATE TABLE IF NOT EXISTS ratings (
 -- runs once per domain instead of every cycle.
 CREATE TABLE IF NOT EXISTS feed_domains (
     domain    TEXT PRIMARY KEY,
-    status    TEXT NOT NULL CHECK (status IN ('subscribed', 'no_feed', 'failed')),
+    status    TEXT NOT NULL
+              CHECK (status IN ('subscribed', 'no_feed', 'failed', 'unsubscribed')),
     feed_url  TEXT,
     detail    TEXT,
     tried_at  TEXT NOT NULL DEFAULT (datetime('now'))
@@ -156,7 +159,8 @@ CREATE TABLE IF NOT EXISTS saves (
     image_url     TEXT,
     embedding     BLOB,
     linkwarden_id INTEGER,
-    created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    section       TEXT NOT NULL DEFAULT 'curated' -- 'broad': Exploring save, own collection
 );
 
 -- Pages imported on the setup page (browser bookmarks export, pasted URLs):
@@ -208,19 +212,34 @@ def init_db(settings: Settings | None = None) -> None:
             # failure must not silently skip the migration
             if "duplicate column" not in str(exc).lower():
                 raise
-        # Migrations for older DBs: candidates.topic (bandit arm) and
-        # the card enrichment columns.
-        for column in (
-            "topic TEXT",
-            "image_url TEXT",
-            "description TEXT",
-            "enriched INTEGER NOT NULL DEFAULT 0",
+        # Migrations for older DBs: candidates.topic (bandit arm), the card
+        # enrichment columns, and the section / collection markers that keep
+        # Exploring feedback out of the main profile.
+        for table, column in (
+            ("candidates", "topic TEXT"),
+            ("candidates", "image_url TEXT"),
+            ("candidates", "description TEXT"),
+            ("candidates", "enriched INTEGER NOT NULL DEFAULT 0"),
+            ("links", "collection_id INTEGER"),
+            ("feedback", "section TEXT NOT NULL DEFAULT 'curated'"),
+            ("saves", "section TEXT NOT NULL DEFAULT 'curated'"),
         ):
             try:
-                conn.execute(f"ALTER TABLE candidates ADD COLUMN {column}")
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column}")
             except sqlite3.OperationalError as exc:
                 if "duplicate column" not in str(exc).lower():
                     raise
+        # feed_domains gained the 'unsubscribed' status (user removed the
+        # feed; discovery must not re-add it). SQLite cannot alter a CHECK,
+        # so an old table is rebuilt once.
+        ddl = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'feed_domains'"
+        ).fetchone()[0]
+        if "unsubscribed" not in ddl:
+            conn.execute("ALTER TABLE feed_domains RENAME TO feed_domains_old")
+            conn.executescript(SCHEMA)  # recreates feed_domains with the new CHECK
+            conn.execute("INSERT INTO feed_domains SELECT * FROM feed_domains_old")
+            conn.execute("DROP TABLE feed_domains_old")
         # Backfill the Saved list from saves recorded before it
         # existed. Those could only happen through Linkwarden, so they are
         # marked as already there (linkwarden_id 0 = "in Linkwarden, id

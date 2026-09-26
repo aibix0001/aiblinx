@@ -66,6 +66,9 @@ class Settings(BaseSettings):
     linkwarden_base_url: str = "http://linkwarden:3000"
     linkwarden_token: str = ""
     linkwarden_collection_id: int = 1  # where saves land; always address by id
+    # Exploring saves land here instead, kept out of the interest profile.
+    # Unset: a collection named "Exploring" is found or created on first use.
+    linkwarden_explore_collection_id: int | None = None
 
     # --- candidate sources ---
     miniflux_url: str = "http://miniflux:8080"
@@ -102,7 +105,9 @@ class Settings(BaseSettings):
 
     # --- ranking ---
     knn_k: int = 50
-    profile_clusters: int = 8
+    # Interest clusters. Unset: scales with the profile (see cluster_count);
+    # a number fixes it.
+    profile_clusters: int | None = Field(default=None, ge=1)
     mmr_lambda: float = Field(default=0.6, ge=0.0, le=1.0)
     feed_size: int = 30
     llm_rerank: bool = True

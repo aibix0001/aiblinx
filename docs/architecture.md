@@ -23,10 +23,23 @@ The interest profile is built from the pages you keep, one point per page:
 - stories you saved in aiblinx
 - stories you upvoted (the latest vote per page counts)
 
-The points are clustered with k-means into up to 8 interests. Each interest's
-weight comes from your taps: a save counts +2, more like this +1, less like
-this −1, and each signal loses half its weight every 30 days. Nothing is
-retrained; the profile is recomputed from the log every cycle.
+The points are clustered with k-means into interests: about √(points / 2)
+clusters, at least 8 and at most 32. Each interest's weight comes from your
+taps: a save counts +2, more like this +1, less like this −1, and each signal
+loses half its weight every 30 days. Nothing is retrained; the profile is
+recomputed from the log every cycle. Votes act on what a story is about, never
+on the site it came from.
+
+**Exploring is kept apart.** Every save and vote records the section its story
+was shown in. Saves and votes on Exploring stories never enter the interest
+profile, the interest weights or feed discovery. Exploring saves go to their
+own Linkwarden collection, and links in that collection are not interests
+either. Instead, Exploring learns from them: within the topic its bandit
+picks, it serves the story closest to what you liked there and furthest from
+what you voted down (20% of the time simply the newest, so it keeps
+exploring). *Promote* files an Exploring story as a main interest; the compass
+on a "For you" story files it under Exploring and counts as less like this
+for "For you". Both move an existing save between the two collections.
 
 ## The daily cycle
 
@@ -54,7 +67,22 @@ step is isolated, so one failing source never costs you the day's feed.
 8. **Publish:** the phone page, an Atom feed and a daily markdown digest.
 
 Card summaries are built from whole sentences of the feed text or the page
-description, never cut mid-word.
+description, never cut mid-word, and are left out when they only repeat the
+headline.
+
+## Reader view
+
+A tapped story opens at `/read/{id}`. The server fetches the page and
+[trafilatura](https://trafilatura.readthedocs.io) extracts the main text,
+which is rebuilt from a short list of allowed tags with every string escaped,
+so no publisher markup, script, link or inline image reaches your browser.
+Text only counts as an article when it has real sentences, so a page of menus
+is not shown. A page without an article but with a directly playable video
+(schema.org `VideoObject` or `og:video`, mp4 or webm) shows that video, which
+loads only when you press play. Anything else redirects to the original.
+
+Opening a story writes nothing to the database, caches nothing and is kept
+out of the access log. The page sends no referrer.
 
 ## Data
 
@@ -83,6 +111,10 @@ app, restore the copy and set the old model again.
 | GET | `/digest` | markdown digest |
 | POST | `/feed/{id}/save` | save a story (and to Linkwarden when connected) |
 | POST | `/feed/{id}/interest` | `{value: up\|down}` |
+| POST | `/feed/{id}/promote` | file an Exploring story as a main interest |
+| POST | `/feed/{id}/explore` | file a "For you" story under Exploring, and less like it |
+| GET | `/read/{id}` | reader view (or a redirect to the original) |
+| GET / POST / DELETE | `/feeds`, `/feeds/{id}` | list, add (`{url}`) and remove subscribed feeds |
 | GET / POST | `/topics`, `/topics/{name}` | Exploring topics |
 | GET / POST | `/login` | optional login |
 | GET | `/healthz` | status and counts |
@@ -105,12 +137,14 @@ values count as unset.
 | `LLM_TIMEOUT_S` / `LLM_MAX_RETRIES` | `180` / `4` | per call; 429/5xx retried with backoff |
 | `LINKWARDEN_BASE_URL` / `LINKWARDEN_TOKEN` | — | optional; empty token = saves stay local |
 | `LINKWARDEN_COLLECTION_ID` | `1` | where saves land (an id, not a name) |
+| `LINKWARDEN_EXPLORE_COLLECTION_ID` | *(empty)* | where Exploring saves land; empty = a collection named "Exploring", created if missing |
 | `MINIFLUX_URL` / `MINIFLUX_TOKEN` | `http://miniflux:8080` / — | optional; without a token the built-in reader is used |
 | `MINIFLUX_ADMIN_USER` / `MINIFLUX_ADMIN_PASSWORD` | — | lets the app create its own Miniflux API key |
 | `SEARXNG_URL` | — | empty = Exploring off |
 | `HACKERNEWS_ENABLED` / `HACKERNEWS_LIST` | `true` / `beststories` | |
 | `FEED_SYNC_MIN_LINKS` / `FEED_SYNC_PER_CYCLE` | `2` / `20` | |
 | `FEED_SIZE` / `BROAD_RATIO` / `EPSILON` | `30` / `0.3` / `0.2` | feed length, Exploring share, bandit exploration |
+| `PROFILE_CLUSTERS` | *(adaptive)* | interest clusters; unset = √(profile points / 2), 8–32; a number fixes it |
 | `RERANK_TOP_N` | `50` | stories sent to the chat model |
 | `FEEDBACK_HALF_LIFE_DAYS` | `30` | decay of taps |
 | `CANDIDATE_MAX_AGE_DAYS` | `14` | freshness window |
