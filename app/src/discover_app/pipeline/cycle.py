@@ -16,6 +16,7 @@ import logging
 from ..clients.llm import LLMClient
 from ..config import Settings, get_settings
 from ..db import connection
+from .articles import prepare_articles
 from .candidates import gather_candidates
 from .embedding import embed_pending_imports, embed_pending_links, embed_pending_signals
 from .enrich import enrich_feed
@@ -109,6 +110,11 @@ async def run_cycle(settings: Settings | None = None) -> dict:
             except Exception:
                 log.exception("run_cycle: feed enrichment failed")
                 errors.append("enrich_feed")
+            try:
+                await prepare_articles(settings, llm)
+            except Exception:
+                log.exception("run_cycle: preparing reader articles failed")
+                errors.append("prepare_articles")
             # Quality signal: suggestions saved back to
             # Linkwarden (explicit captures + poll-detected saves).
             with connection(settings) as conn:

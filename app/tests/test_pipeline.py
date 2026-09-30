@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from datetime import UTC, datetime
 
@@ -2018,6 +2019,89 @@ def test_extract_article_is_escaped_and_image_free():
     assert "Grüße aus München" in extract_article(latin, "https://ex.de/a")
 
 
+def _page_with_pictures(pictures: str) -> str:
+    text = "".join(
+        f"<p>Paragraph {i} of the story, with enough words in it to count as prose.</p>"
+        for i in range(8)
+    )
+    end = "<p>The last words.</p></article></body></html>"
+    return f"<html><body><article><h1>T</h1>{text}{pictures}{end}"
+
+
+def test_extract_article_shows_pictures_with_their_captions():
+    """A picture stands where the text talks about it, its caption
+    under it and nowhere else."""
+    from discover_app.reader import extract_article
+
+    body = extract_article(
+        _page_with_pictures(
+            # a gallery keeps each caption twice; the picture links to its file
+            '<div class="gallery"><div class="item"><a href="/img/island.jpg">'
+            '<img src="/img/island-640.jpg" alt="A &quot;cutout&quot;" width="640" height="331" '
+            'aria-labelledby="c1"></a><div class="lightbox-caption" id="c1">The smaller island.'
+            '<div class="caption-credit">Sam Axon</div></div></div>'
+            '<div class="gallery-caption"><span>The smaller island.</span> <span>Sam Axon</span>'
+            "</div></div>"
+            # lazy loading: the address is in data-src
+            '<figure><img src="data:image/gif;base64,R0lGOD" data-src="https://cdn.ex.com/b.png">'
+            "<figcaption>A chart of <b>speed</b></figcaption></figure>"
+        ),
+        "https://ex.com/a",
+    )
+    assert (
+        '<figure><img src="https://ex.com/img/island-640.jpg" alt="A &quot;cutout&quot;" '
+        'loading="lazy" referrerpolicy="no-referrer" onload="checkFig(this)" '
+        'onerror="dropFig(this)"><figcaption>The smaller island. Sam Axon</figcaption></figure>'
+    ) in body
+    assert body.count("The smaller island.") == 1 and body.count("Sam Axon") == 1
+    assert '<img src="https://cdn.ex.com/b.png"' in body
+    assert "<figcaption>A chart of speed</figcaption>" in body and "data:image" not in body
+    assert "aiblinxfigure" not in body
+    # the pictures stand between the paragraphs they stood between
+    assert body.index("Paragraph 7") < body.index("<figure>") < body.index("The last words.")
+
+
+def test_a_quotes_figcaption_is_text():
+    """A quote's figure names the speaker in its <figcaption>: that stays."""
+    from lxml import html as lxml_html
+
+    from discover_app.reader import _captions
+
+    tree = lxml_html.fromstring(
+        "<html><body><article><figure><blockquote>We said so.</blockquote>"
+        "<figcaption>Ada, the founder</figcaption></figure>"
+        '<figure><img src="/a.jpg"><figcaption>A picture</figcaption></figure>'
+        "</article></body></html>"
+    )
+    assert [el.text for el in _captions(tree)] == ["A picture"]
+
+
+def test_extract_article_leaves_out_pictures_that_are_not_the_articles():
+    from discover_app.reader import extract_article
+
+    body = extract_article(
+        _page_with_pictures(
+            '<img src="/title-640x360.jpg?w=640" alt="The title image" width="640">'
+            '<img src="/avatar.jpg" alt="The author" width="48" height="48">'
+            '<img src="/logo.svg" alt="Logo" width="300">'
+            '<img srcset=" , /x.jpg 2x" alt="A broken srcset" width="300">'
+            '<img src="javascript:alert(1)" alt="Not a picture" width="300">'
+            '<a href="/shop"><img src="/ad.jpg" alt="Buy this" width="300"></a>'
+            '<div class="related"><img src="/other.jpg" alt="Another story" width="300">'
+            '<p><a href="/other-story">Another story</a></p></div>'
+            '<figure><img src="/gone.jpg" width="1" height="1">'
+            "<figcaption>Words about a picture that is not shown.</figcaption></figure>"
+            # text outside a paragraph, behind a picture
+            '<img src="/kept.jpg" alt="Kept" width="300">Loose words after the picture.'
+        ),
+        "https://ex.com/a",
+        image="https://cdn.ex.com/title.jpg?w=1200",
+    )
+    assert body.count("<figure>") == 1 and '<img src="https://ex.com/kept.jpg"' in body
+    assert "Words about a picture" not in body
+    assert "<p>Loose words after the picture.</p>" in body
+
+
 def _reader_app(tmp_path, monkeypatch, url="https://ex.com/a"):
     from fastapi.testclient import TestClient
 
@@ -2064,6 +2148,58 @@ def test_reader_page_has_actions_and_records_nothing(tmp_path, monkeypatch):
 
     client.post("/feed/1/interest", json={"value": "up"})
     assert 'class="vote on"' in client.get("/read/1").text
+
+
+def test_title_images_are_links():
+    """A card's picture opens the reader; the reader's picture opens the original."""
+    from discover_app.ui import _card, render_reader
+
+    item = {
+        "candidate_id": 1,
+        "url": "https://ex.com/a",
+        "title": "An article",
+        "image_url": "https://ex.com/a.jpg",
+    }
+    card = _card(item, new_tab=False)
+    assert '<a class="hero-link" href="/read/1" rel="noreferrer" tabindex="-1"' in card
+    assert 'target="_blank" tabindex="-1"' in _card(item, new_tab=True)
+    assert "hero-link" not in _card({**item, "image_url": None}, new_tab=False)
+
+    page = render_reader({**item, "id": 1}, "<p>Text.</p>", False, None, False)
+    assert '<a class="hero-link" href="https://ex.com/a" rel="noreferrer" tabindex="-1"' in page
+    # a dropped picture takes its link with it
+    assert "(img.closest('.hero-link') || img).remove()" in page
+
+
+def test_theme_button_shows_sun_in_dark_mode():
+    """The toggle holds moon and sun; CSS shows the sun in dark mode."""
+    from discover_app.ui import render_page, render_reader
+
+    reader = render_reader(
+        {"id": 1, "url": "https://ex.com/a", "title": "T"}, "<p>Text.</p>", False, None, False
+    )
+    for page in (render_page([]), reader):
+        assert "__THEMEBTN__" not in page
+        assert page.count('class="icon-btn theme-btn"') == 1
+        assert '<svg class="moon"' in page and '<svg class="sun"' in page
+        assert ':root[data-theme="dark"] .theme-btn .sun { display: block; }' in page
+
+
+def test_reader_font_size_buttons():
+    """A- / A+ step the article size, which is remembered per device."""
+    from discover_app.ui import render_reader
+
+    page = render_reader(
+        {"id": 1, "url": "https://ex.com/a", "title": "T"}, "<p>Text.</p>", False, None, False
+    )
+    assert 'id="smaller" onclick="fontSize(-1)"' in page
+    assert 'id="larger" onclick="fontSize(1)"' in page
+    assert "localStorage.getItem('readerSize')" in page
+    assert "function dropFig(img)" in page and ".article figure img" in page
+    assert "localStorage.setItem('readerSize', size)" in page
+    assert "font-size: var(--reader-size, 19px)" in page
+    # set in <head>, before the article is painted
+    assert page.index("--reader-size', size") < page.index("<body>")
 
 
 def test_reader_falls_back_to_the_original(tmp_path, monkeypatch):
@@ -3279,3 +3415,272 @@ def test_explore_button_only_on_for_you(tmp_path, monkeypatch):
     broad = page[page.index('id="c2"') : page.index("</article>", page.index('id="c2"'))]
     assert "explore(this)" in curated and "promote(this)" not in curated
     assert "promote(this)" in broad and "explore(this)" not in broad
+
+
+# --- reader translations ---
+
+_DE_TEXT = (
+    "Die Regierung hat am Montag über den Haushalt beraten. Das ist nicht das erste Mal, "
+    "und auch die Opposition wird sich mit der Frage befassen."
+)
+_EN_TEXT = (
+    "The government discussed the budget on Monday. This is not the first time, and it "
+    "was clear that the opposition would have to deal with it."
+)
+
+
+def test_detect_lang():
+    from discover_app.pipeline.articles import detect_lang
+
+    assert detect_lang(_DE_TEXT) == "de"
+    assert detect_lang(_EN_TEXT) == "en"
+    assert detect_lang("Le gouvernement a discuté du budget lundi, comme chaque année.") is None
+
+
+class _Translator:
+    """Fake chat model: marks each string as translated and slips in markup
+    the page must never receive."""
+
+    def __init__(self, drop: bool = False) -> None:
+        self.calls = 0
+        self.drop = drop
+
+    async def chat(self, messages, **kwargs) -> str:
+        import json as _json
+
+        self.calls += 1
+        prompt = messages[0]["content"]
+        texts = _json.loads(prompt[prompt.index("\n[") + 1 :])
+        out = [f"DE {t} <script>x</script>" for t in texts]
+        if self.drop:
+            out = out[:-1]
+        return "<think>[not this]</think>" + _json.dumps(out)
+
+
+async def test_translate_article_keeps_structure_and_escapes():
+    from discover_app.pipeline.articles import translate_article
+
+    blocks = [
+        "<p>A <em>fine</em> &amp; short text.</p>",
+        "<h2>Head</h2>",
+        "<ul><li>one</li><li><strong>two</strong></li></ul>",
+        "<pre><code>if (x) { y(); }</code></pre>",
+        '<figure><img src="https://ex.com/{a}.jpg" alt="An alt"><figcaption>A caption</figcaption>'
+        "</figure>",
+        '<figure><img src="https://ex.com/b.jpg" alt=""></figure>',
+    ]
+    llm = _Translator()
+    title, body, calls = await translate_article(llm, "Tom & Jerry", blocks, "en", "de")
+    assert calls == 1
+    # plain text: the reader escapes it, so a stray tag shows as text
+    assert title == "DE Tom & Jerry <script>x</script>"
+    assert "<p>DE A <em>fine</em> &amp; short text. &lt;script&gt;x&lt;/script&gt;</p>" in body
+    assert "<h2>DE Head" in body
+    assert "<ul><li>DE one " in body and "<li>DE <strong>two</strong> " in body
+    assert "<pre><code>if (x) { y(); }</code></pre>" in body  # code is not translated
+    # a picture keeps its address, its caption is translated
+    assert '<figure><img src="https://ex.com/{a}.jpg" alt="An alt"><figcaption>DE A caption' in body
+    assert '<figure><img src="https://ex.com/b.jpg" alt=""></figure>' in body
+    assert "<script>" not in body
+
+
+async def test_translate_article_turns_thinking_off_and_falls_back():
+    """Thinking is switched off and the reply constrained to a JSON array; a
+    provider that rejects the fields is asked again without them."""
+    import httpx
+    from openai import BadRequestError
+
+    from discover_app.pipeline.articles import translate_article
+
+    class _Strict(_Translator):
+        def __init__(self) -> None:
+            super().__init__()
+            self.extra = []
+
+        async def chat(self, messages, **kwargs):
+            self.extra.append(
+                (kwargs.get("extra_body"), kwargs.get("response_format"), kwargs.get("max_tokens"))
+            )
+            if "extra_body" in kwargs:
+                request = httpx.Request("POST", "http://llm/v1/chat/completions")
+                raise BadRequestError(
+                    "unknown field", response=httpx.Response(400, request=request), body=None
+                )
+            return await super().chat(messages, **kwargs)
+
+    llm = _Strict()
+    title, _, calls = await translate_article(llm, "T", ["<p>a</p>"], "en", "de")
+    assert title.startswith("DE T") and calls == 1
+    # title + one paragraph: exactly two strings
+    schema = {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 2}
+    first, second = llm.extra
+    assert first[0] == {"chat_template_kwargs": {"enable_thinking": False}}
+    assert first[1]["type"] == "json_schema" and first[1]["json_schema"]["schema"] == schema
+    assert first[2] == 4096
+    assert second == (None, None, None)  # the fallback drops all three
+
+
+async def test_translate_article_sends_typographic_quotes_as_entities():
+    """No raw ” reaches the model (it took one for a string's end and looped);
+    the reply's entities come back as the characters."""
+    from discover_app.pipeline.articles import translate_article
+
+    class _Seen(_Translator):
+        prompts: list[str] = []
+
+        async def chat(self, messages, **kwargs):
+            self.prompts.append(messages[0]["content"])
+            return await super().chat(messages, **kwargs)
+
+    llm = _Seen()
+    title, body, _ = await translate_article(
+        llm, "Ein „Test“", ["<p>signed “Authored by Claude Code.”</p>"], "en", "de"
+    )
+    sent = llm.prompts[0]
+    assert "\u201d" not in sent and "\u201c" not in sent and "\u201e" not in sent
+    assert "&ldquo;Authored by Claude Code.&rdquo;" in sent and "&bdquo;Test&ldquo;" in sent
+    assert "“Authored by Claude Code.”" in body and title.startswith("DE Ein „Test“")
+
+
+async def test_translate_article_rejects_a_short_reply():
+    from discover_app.pipeline.articles import translate_article
+
+    llm = _Translator(drop=True)
+    with pytest.raises(ValueError):
+        await translate_article(llm, "T", ["<p>a</p>"], "en", "de")
+    assert llm.calls == 2  # asked twice before giving up
+
+
+async def test_translate_article_retries_a_cut_off_reply():
+    """A reply cut off at max_tokens gets one more try."""
+    from discover_app.pipeline.articles import translate_article
+
+    class _CutOnce(_Translator):
+        async def chat(self, messages, **kwargs):
+            reply = await super().chat(messages, **kwargs)
+            return reply[:30] if self.calls == 1 else reply
+
+    llm = _CutOnce()
+    title, _, calls = await translate_article(llm, "T", ["<p>a</p>"], "en", "de")
+    assert title.startswith("DE T") and calls == 2
+
+
+def _served(settings, cid=1, url="https://ex.com/a"):
+    with connection(settings) as conn:
+        _add_candidate(conn, cid, url, "An article", [1.0, 0, 0, 0])
+        conn.execute(
+            "INSERT INTO feed_items(rank, section, candidate_id, score, reason, cycle_ts) "
+            "VALUES(0, 'curated', ?, 0.9, '', 't1')",
+            (cid,),
+        )
+        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES('last_cycle_ts', 't1')")
+
+
+_EN_ARTICLE = (
+    "<html><body><article><h1>An article</h1>"
+    + "".join(f"<p>{_EN_TEXT} Paragraph {i}.</p>" for i in range(4))
+    + "</article></body></html>"
+)
+
+
+async def test_prepare_articles_translates_each_served_item_once(tmp_path, monkeypatch, caplog):
+    from discover_app.pipeline import articles
+
+    settings = _settings(tmp_path)
+    init_db(settings)
+    _served(settings)
+
+    async def fake_fetch(url, timeout_s):
+        return _EN_ARTICLE.encode()
+
+    monkeypatch.setattr(articles, "fetch_html", fake_fetch)
+    llm = _Translator()
+    with caplog.at_level(logging.INFO, logger="discover_app.pipeline.articles"):
+        assert await articles.prepare_articles(settings, llm) == 1
+    line = next(r.getMessage() for r in caplog.records if "item 1 " in r.getMessage())
+    assert "lang=en" in line and "calls=1" in line and "translated=True" in line
+    assert "total=" in line and "ex.com" not in line  # never the URL
+    assert "1 translated" in caplog.records[-1].getMessage()
+    with connection(settings) as conn:
+        row = conn.execute("SELECT * FROM articles WHERE candidate_id = 1").fetchone()
+    assert row["lang"] == "en" and "Paragraph 3." in row["body"]
+    assert row["title_tr"].startswith("DE An article") and "<p>DE " in row["body_tr"]
+    assert await articles.prepare_articles(settings, llm) == 0  # tried once
+    assert await articles.prepare_articles(_settings(tmp_path, reader_translate=False), llm) == 0
+
+
+async def test_prepare_articles_keeps_the_original_when_translation_fails(tmp_path, monkeypatch):
+    from discover_app.pipeline import articles
+
+    settings = _settings(tmp_path)
+    init_db(settings)
+    _served(settings)
+
+    async def fake_fetch(url, timeout_s):
+        return _EN_ARTICLE.encode()
+
+    monkeypatch.setattr(articles, "fetch_html", fake_fetch)
+    await articles.prepare_articles(settings, _Translator(drop=True))
+    with connection(settings) as conn:
+        row = conn.execute("SELECT lang, body, body_tr FROM articles").fetchone()
+    assert row["lang"] == "en" and row["body"] and row["body_tr"] is None
+
+
+def test_reader_serves_the_prepared_article_with_a_language_toggle(tmp_path, monkeypatch):
+    from discover_app import app as app_mod
+
+    settings, client = _reader_app(tmp_path, monkeypatch)
+
+    async def no_fetch(url, timeout_s):
+        raise AssertionError("a prepared article is not fetched again")
+
+    monkeypatch.setattr(app_mod, "fetch_html", no_fetch)
+    with connection(settings) as conn:
+        conn.execute(
+            "INSERT INTO articles(candidate_id, lang, body, title_tr, body_tr) "
+            "VALUES(1, 'en', '<p>English text.</p>', 'Ein Artikel', '<p>Deutscher Text.</p>')"
+        )
+    page = client.get("/read/1").text
+    assert '<h1 lang="en" data-lang="en">An article</h1>' in page
+    assert '<h1 lang="de" data-lang="de" hidden>Ein Artikel</h1>' in page
+    assert '<div class="article" lang="en" data-lang="en">\n<p>English text.</p>' in page
+    assert '<div class="article" lang="de" data-lang="de" hidden>\n<p>Deutscher Text.</p>' in page
+    assert 'onclick="switchLang(this)" aria-label="Read in German">DE</button>' in page
+    assert (
+        "localStorage" not in page.split("function switchLang", 1)[1].split("function back", 1)[0]
+    )
+
+    with connection(settings) as conn:
+        conn.execute("UPDATE articles SET body_tr = NULL")
+    page = client.get("/read/1").text
+    assert "<h1>An article</h1>" in page and "<p>English text.</p>" in page
+    assert "switchLang(this)" not in page
+
+
+def test_feed_page_stays_fresh_on_the_home_screen(tmp_path, monkeypatch):
+    """/ui is never cached and knows its cycle; /feed/version tells a resumed
+    page whether a newer feed exists; standalone mode gets pull to refresh."""
+    from fastapi.testclient import TestClient
+
+    from discover_app import app as app_mod
+
+    settings = _settings(tmp_path)
+    init_db(settings)
+    with connection(settings) as conn:
+        conn.execute("INSERT INTO meta(key, value) VALUES('last_cycle_ts', 't1')")
+    monkeypatch.setattr("discover_app.db.get_settings", lambda: settings)
+    monkeypatch.setattr(app_mod, "get_settings", lambda: settings)
+    client = TestClient(app_mod.create_app())
+
+    resp = client.get("/ui")
+    assert resp.headers["cache-control"] == "no-store"
+    assert 'const CYCLE = "t1";' in resp.text
+    assert "fetch('/feed/version'" in resp.text and "location.reload()" in resp.text
+    assert "navigator.standalone" in resp.text and 'id="ptr"' in resp.text
+
+    version = client.get("/feed/version")
+    assert version.json() == {"cycle": "t1"}
+    assert version.headers["cache-control"] == "no-store"
+    with connection(settings) as conn:
+        conn.execute("UPDATE meta SET value = 't2' WHERE key = 'last_cycle_ts'")
+    assert client.get("/feed/version").json() == {"cycle": "t2"}

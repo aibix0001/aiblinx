@@ -23,9 +23,10 @@ own server, and your reading profile is one SQLite file.
 - **Learns from a few buttons.** *Save* (to aiblinx, or to Linkwarden when
   connected), *more like this* and *less like this*. No rating scales. Recent
   taps count more, and your profile follows you as your interests change.
-- **Reads without leaving.** A story opens in a clean reader view, and a video
-  plays right there. Nothing about what you open is recorded, and publishers
-  never see where you came from.
+- **Reads without leaving.** A story opens in a clean reader view with its
+  pictures, and a video plays right there. German and English stories are
+  translated in advance, so one tap switches the language. Nothing about what
+  you open is recorded, and publishers never see where you came from.
 - **Keeps a window open.** An *Exploring* section reserves 30% of the feed for
   topics outside your profile. What you save or vote there teaches Exploring
   which distractions you like, without changing your main feed, and Exploring
@@ -38,7 +39,8 @@ own server, and your reading profile is one SQLite file.
   searches on topics you pick.
 - **Explains itself.** Every card says why it was picked.
 - **Feels like an app.** Mobile-first, light and dark, and *Add to Home Screen*
-  opens it full screen. Also available as an Atom feed and a daily digest.
+  opens it full screen, with pull to refresh. Also available as an Atom feed
+  and a daily digest.
 
 ## Quick start (about 5 minutes)
 

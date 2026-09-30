@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.3.0
+
+- **Read in German or English:** each morning aiblinx prepares the day's
+  stories in advance and translates them between German and English with your
+  chat model. The reader opens a story in its own language, and a DE / EN
+  button swaps in the translation. A prepared story is not fetched from the
+  publisher again when you open it. `READER_TRANSLATE=false` turns translation
+  off (it costs tokens on a paid API).
+- **Pictures in the reader:** the article's pictures appear where they stand in
+  the text, with their captions. Logos, teasers and tracking pixels are left
+  out.
+- **Bigger or smaller text:** A− / A+ in the reader, remembered per device.
+  Title images are clickable: on a card they open the reader, in the reader
+  they open the original page.
+- **Home-screen app stays current:** the app added to the home screen now
+  loads the newest feed when you return to it, and pulling down at the top
+  reloads it.
+- The theme button shows the sun in dark mode. The log has one line per
+  prepared story with its translation time, and `scripts/bench_translate.py`
+  compares chat models on the same stories.
+
 ## 0.2.0
 
 - **Read inside aiblinx:** tapping a story opens a clean reader view of the

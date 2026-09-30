@@ -75,14 +75,26 @@ headline.
 A tapped story opens at `/read/{id}`. The server fetches the page and
 [trafilatura](https://trafilatura.readthedocs.io) extracts the main text,
 which is rebuilt from a short list of allowed tags with every string escaped,
-so no publisher markup, script, link or inline image reaches your browser.
+so no publisher markup, script or link reaches your browser. The article's
+pictures are shown where they stand in the text, with their captions. Like the
+title image, they load from the publisher without a referrer. Logos, teasers
+for other stories and tracking pixels are left out.
 Text only counts as an article when it has real sentences, so a page of menus
 is not shown. A page without an article but with a directly playable video
 (schema.org `VideoObject` or `og:video`, mp4 or webm) shows that video, which
 loads only when you press play. Anything else redirects to the original.
 
-Opening a story writes nothing to the database, caches nothing and is kept
-out of the access log. The page sends no referrer.
+Each daily cycle prepares the served stories in advance: the text is
+extracted the same way and, with a chat model configured, translated between
+German and English (`READER_TRANSLATE`, on by default). A prepared story opens
+in the language it was published in, with a DE / EN button that swaps in the
+translation. The toggle is not remembered; the A− / A+ text size is, per
+device, in the browser. Stories are prepared whether or not you read them, so
+the stored text says nothing about what you opened.
+
+Opening a story writes nothing to the database and is kept out of the access
+log; a prepared story is not fetched from the publisher again. The page sends
+no referrer.
 
 ## Data
 
@@ -114,6 +126,7 @@ app, restore the copy and set the old model again.
 | POST | `/feed/{id}/promote` | file an Exploring story as a main interest |
 | POST | `/feed/{id}/explore` | file a "For you" story under Exploring, and less like it |
 | GET | `/read/{id}` | reader view (or a redirect to the original) |
+| GET | `/feed/version` | the current cycle, so an open feed page reloads when a newer one exists |
 | GET / POST / DELETE | `/feeds`, `/feeds/{id}` | list, add (`{url}`) and remove subscribed feeds |
 | GET / POST | `/topics`, `/topics/{name}` | Exploring topics |
 | GET / POST | `/login` | optional login |
@@ -151,6 +164,7 @@ values count as unset.
 | `AD_FILTER_PATTERNS` | `anzeige:`, `advertorial`, `sponsored` | title substrings dropped |
 | `POLL_CRON` / `CYCLE_CRON` | `7-59/15 * * * *` / `0 6 * * *` | UTC |
 | `LINK_TARGET` | `same` | `new` opens articles in a new tab |
+| `READER_TRANSLATE` | `true` | translate prepared stories between German and English with the chat model |
 | `APP_PASSWORD` | — | optional login |
 | `ADMIN_TOKEN` | — | protects `POST /admin/run-cycle` |
 | `PUBLIC_BASE_URL` | `http://localhost:8000` | used in the Atom feed |

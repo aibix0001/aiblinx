@@ -177,7 +177,7 @@ def create_app() -> FastAPI:
         return FeedResponse(count=len(items), items=items)
 
     @app.get("/ui", response_class=HTMLResponse)
-    def ui_page() -> str:
+    def ui_page() -> HTMLResponse:
         """Server-rendered mobile-first feed: title-image cards with save and
         up/down, restored from the feedback log, plus the topic picker."""
         with connection() as conn:
@@ -207,6 +207,7 @@ def create_app() -> FastAPI:
                 )
             ]
             has_profile = conn.execute("SELECT COUNT(*) FROM profile").fetchone()[0] > 0
+            cycle = get_meta(conn, "last_cycle_ts") or ""
         for item in curated + broad:
             key = norm_url(item["url"] or "")
             item["saved"] = key in saved
@@ -214,7 +215,7 @@ def create_app() -> FastAPI:
             item["promoted"] = key in promoted
             item["explored"] = key in explored
         settings = get_settings()
-        return render_page(
+        page = render_page(
             curated,
             list_topics(settings),
             broad=broad,
@@ -222,7 +223,17 @@ def create_app() -> FastAPI:
             saves=saves,
             linkwarden=settings.linkwarden_enabled,
             has_profile=has_profile,
+            cycle=cycle,
         )
+        # always fresh: a home-screen app would otherwise keep yesterday's feed
+        return HTMLResponse(page, headers={"Cache-Control": "no-store"})
+
+    @app.get("/feed/version", include_in_schema=False)
+    def feed_version() -> JSONResponse:
+        """The current cycle, for an open feed page to tell whether it is stale."""
+        with connection() as conn:
+            cycle = get_meta(conn, "last_cycle_ts") or ""
+        return JSONResponse({"cycle": cycle}, headers={"Cache-Control": "no-store"})
 
     app.middleware("http")(require_login)
 
@@ -473,13 +484,31 @@ def create_app() -> FastAPI:
                 promoted, explored = bool(filed and filed[0] == "curated"), None
             else:
                 promoted, explored = None, bool(filed and filed[0] == "broad")
+            prepared = conn.execute(
+                "SELECT lang, body, title_tr, body_tr FROM articles WHERE candidate_id = ?",
+                (candidate_id,),
+            ).fetchone()
         item = dict(row)
-        page = await fetch_html(item["url"], settings.enrich_timeout_s)
-        body = (
-            await asyncio.to_thread(extract_article, page, item["url"], item["title"])
-            if page
-            else None
-        )
+        translation = None
+        page = body = None
+        if prepared and prepared["body"]:
+            # prepared at cycle time: no fetch from the publisher now
+            body = prepared["body"]
+            if prepared["body_tr"]:
+                translation = {
+                    "lang": prepared["lang"],
+                    "title": prepared["title_tr"],
+                    "body": prepared["body_tr"],
+                }
+        else:
+            page = await fetch_html(item["url"], settings.enrich_timeout_s)
+            body = (
+                await asyncio.to_thread(
+                    extract_article, page, item["url"], item["title"], item["image_url"]
+                )
+                if page
+                else None
+            )
         if body is None and page:
             # no article, but maybe a video we can play without its page
             video = await asyncio.to_thread(find_video, page)
@@ -497,6 +526,7 @@ def create_app() -> FastAPI:
                 linkwarden=settings.linkwarden_enabled,
                 promoted=promoted,
                 explored=explored,
+                translation=translation,
             ),
             headers={"Referrer-Policy": "no-referrer", "Cache-Control": "no-store"},
         )

@@ -186,6 +186,17 @@ CREATE TABLE IF NOT EXISTS feeds (
     added_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Reader text of each served item, prepared at cycle time for every item
+-- whether or not it is read (so it is no reading log), with a translation
+-- into the other of German / English.
+CREATE TABLE IF NOT EXISTS articles (
+    candidate_id INTEGER PRIMARY KEY,
+    lang     TEXT,                              -- "de" | "en" | NULL (other language)
+    body     TEXT,                              -- safe reader HTML; NULL = no prose found
+    title_tr TEXT,                              -- plain text
+    body_tr  TEXT                               -- safe reader HTML; NULL = not translated
+);
+
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT

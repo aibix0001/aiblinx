@@ -102,6 +102,9 @@ class Settings(BaseSettings):
     # og:image and description
     enrich_concurrency: int = Field(default=5, ge=1)
     enrich_timeout_s: float = Field(default=8.0, gt=0.0)
+    # Reader: each served article is extracted at cycle time and translated
+    # between German and English by the chat model (costs tokens on paid APIs)
+    reader_translate: bool = True
 
     # --- ranking ---
     knn_k: int = 50
@@ -168,6 +171,11 @@ class Settings(BaseSettings):
         if self.embed_max_chars > self.embed_max_batch_chars:
             raise ValueError("embed_max_batch_chars must be at least embed_max_chars")
         return self
+
+    @property
+    def translate_enabled(self) -> bool:
+        """Reader translations need the chat model."""
+        return self.reader_translate and bool(self.llm_chat_model)
 
     @property
     def linkwarden_enabled(self) -> bool:

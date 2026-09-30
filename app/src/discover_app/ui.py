@@ -15,6 +15,7 @@ dropped client-side and the card simply goes without.
 from __future__ import annotations
 
 import html
+import json
 from datetime import UTC, datetime
 from urllib.parse import urlsplit
 
@@ -169,6 +170,12 @@ def _card(item: dict, new_tab: bool, explore: bool = False) -> str:
         if image
         else ""
     )
+    if figure and url != "#":
+        # the picture opens the reader too; one link per card for screen readers
+        figure = (
+            f'<a class="hero-link" href="{html.escape(url, quote=True)}" {link_attrs} '
+            f'tabindex="-1" aria-hidden="true">{figure}</a>'
+        )
     saved = bool(item.get("saved"))
     interest = item.get("interest")
     return f"""\
@@ -220,6 +227,7 @@ def render_page(
     saves: list[dict] | None = None,
     linkwarden: bool = False,
     has_profile: bool = True,
+    cycle: str = "",
 ) -> str:
     """items/broad: current-cycle rows (candidate_id, url, title, snippet,
     description, image_url, reason, source, published_at) plus the viewer's
@@ -284,10 +292,13 @@ def render_page(
         else '<p class="empty">Nothing saved yet. Tap Save on a story to keep it here.</p>'
     )
     return (
-        _PAGE.replace("__HEAD__", HEAD_TAGS)
+        # a JS string literal; entities mean nothing inside <script>
+        _PAGE.replace("__CYCLE__", json.dumps(cycle).replace("</", "<\\/"))
+        .replace("__HEAD__", HEAD_TAGS)
         .replace("__THEME__", THEME_CSS)
         .replace("__CARD__", CARD_CSS)
         .replace("__ACTIONS__", ACTIONS_JS)
+        .replace("__THEMEBTN__", THEME_BUTTON)
         .replace("__SEL_CURATED__", "false" if start_broad else "true")
         .replace("__SEL_BROAD__", "true" if start_broad else "false")
         .replace("__HID_CURATED__", " hidden" if start_broad else "")
@@ -316,6 +327,7 @@ def render_reader(
     linkwarden: bool,
     promoted: bool | None = None,
     explored: bool | None = None,
+    translation: dict | None = None,
 ) -> str:
     """The reader page: an article's extracted text, then save / more / less.
 
@@ -324,29 +336,61 @@ def render_reader(
     promoted: None for "For you" items; for Exploring items whether the story
     is already a main interest (adds the Promote button).
     explored: None for Exploring items; for "For you" items whether the story
-    is already saved to Exploring (adds the Save to Exploring button)."""
+    is already saved to Exploring (adds the Save to Exploring button).
+    translation: {"lang", "title", "body"} with ``lang`` the article's own
+    language ("de" / "en"): both versions go into the page and a DE / EN
+    toggle swaps them. The article always opens in its own language."""
     url = _http(item.get("url")) or "#"
     image = _http(item.get("image_url"))
     figure = (
+        f'<a class="hero-link" href="{html.escape(url, quote=True)}" rel="noreferrer" '
+        'tabindex="-1" aria-hidden="true">'
         f'<img class="hero" src="{html.escape(image, quote=True)}" alt="" '
-        'referrerpolicy="no-referrer" onload="checkImg(this)" onerror="dropImg(this)">'
-        if image
+        'referrerpolicy="no-referrer" onload="checkImg(this)" onerror="dropImg(this)"></a>'
+        if image and url != "#"
         else ""
     )
     title = html.escape(_plain(item.get("title")) or item.get("url") or "")
+    headline, article, lang_button = (
+        f"<h1>{title}</h1>",
+        f'<div class="article">\n{body}\n</div>',
+        "",
+    )
+    if translation:
+        src = translation["lang"]
+        dst = "en" if src == "de" else "de"
+        headline = (
+            f'<h1 lang="{src}" data-lang="{src}">{title}</h1>'
+            f'<h1 lang="{dst}" data-lang="{dst}" hidden>{html.escape(translation["title"])}</h1>'
+        )
+        article = (
+            f'<div class="article" lang="{src}" data-lang="{src}">\n{body}\n</div>\n'
+            f'<div class="article" lang="{dst}" data-lang="{dst}" hidden>\n'
+            f"{translation['body']}\n</div>"
+        )
+        lang_button = (
+            f'<button class="icon-btn size" onclick="switchLang(this)" '
+            f'aria-label="{_READ_IN[dst]}">{dst.upper()}</button>'
+        )
     return (
         _READER.replace("__HEAD__", HEAD_TAGS)
         .replace("__THEME__", THEME_CSS)
         .replace("__CARD__", CARD_CSS)
         .replace("__ACTIONS__", ACTIONS_JS)
+        .replace("__THEMEBTN__", THEME_BUTTON)
         .replace("__ID__", str(int(item["id"])))
         .replace("__ACTIONBAR__", _actions(saved, interest, promoted, explored))
         .replace("__URL__", html.escape(url, quote=True))
         .replace("__META__", _meta(item))
         .replace("__FIGURE__", figure)
+        .replace("__LANGBTN__", lang_button)
+        .replace("__HEADLINE__", headline)
         .replace("__TITLE__", title)
-        .replace("__BODY__", body)  # last: article text is never scanned for placeholders
+        .replace("__BODY__", article)  # last: article text is never scanned for placeholders
     )
+
+
+_READ_IN = {"de": "Read in German", "en": "Read in English"}
 
 
 # Shared by every page: theme tokens (light by default, dark by system setting
@@ -410,6 +454,7 @@ body {
 .card[data-down] .gone {
   display: block; padding: 14px 18px; font-size: 15px; color: var(--muted);
 }
+.hero-link { display: block; }
 .hero {
   display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: cover; background: var(--img);
 }
@@ -438,6 +483,18 @@ h2 a { color: inherit; text-decoration: none; }
 .actions .save.on { background: var(--save-on); color: var(--save-on-ink); }
 .actions .vote.on { background: var(--on); color: var(--on-ink); }
 .actions button:disabled { opacity: 0.6; }
+.theme-btn .sun { display: none; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .theme-btn .moon { display: none; }
+  :root:not([data-theme="light"]) .theme-btn .sun { display: block; }
+}
+:root[data-theme="dark"] .theme-btn .moon { display: none; }
+:root[data-theme="dark"] .theme-btn .sun { display: block; }
+#ptr {
+  position: fixed; left: 50%; top: calc(env(safe-area-inset-top) + 8px); z-index: 3;
+  transform: translate(-50%, -60px); opacity: 0; padding: 8px 14px; border-radius: 999px;
+  background: var(--on); color: var(--on-ink); font-size: 14px; pointer-events: none;
+}
 #toast {
   position: fixed; left: 50%; bottom: calc(env(safe-area-inset-bottom) + 20px);
   transform: translateX(-50%); padding: 12px 18px; border-radius: 14px;
@@ -446,6 +503,19 @@ h2 a { color: inherit; text-decoration: none; }
 }
 #toast.show { opacity: 1; }
 """
+
+# The light/dark toggle for the feed and reader headers. It holds both icons;
+# CARD_CSS shows the mode it switches to (moon in light, sun in dark).
+THEME_BUTTON = """\
+<button class="icon-btn theme-btn" onclick="toggleTheme()" \
+aria-label="Switch light or dark mode">\
+<svg class="moon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" \
+stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">\
+<path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z"/></svg>\
+<svg class="sun" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" \
+stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">\
+<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4\
+M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></button>"""
 
 ACTIONS_JS = """\
 function toast(msg) {
@@ -541,10 +611,10 @@ if (['broad', 'saved'].includes(location.hash.slice(1))) {
   document.documentElement.dataset.tab = location.hash.slice(1);
 }
 // in <head>: a cached image can fire onload/onerror before the body script runs
-function dropImg(img) { img.remove(); }
+function dropImg(img) { (img.closest('.hero-link') || img).remove(); }
 function checkImg(img) {
   // logos and banners are not title pictures
-  if (img.naturalWidth < 200 || img.naturalWidth / img.naturalHeight > 3) img.remove();
+  if (img.naturalWidth < 200 || img.naturalWidth / img.naturalHeight > 3) dropImg(img);
 }
 </script>
 <style>
@@ -634,10 +704,7 @@ Exploring</button>
 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" \
 stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">\
 <path d="M6 3h12a1 1 0 0 1 1 1v17l-7-4-7 4V4a1 1 0 0 1 1-1z"/></svg></button>
-    <button class="icon-btn" onclick="toggleTheme()" aria-label="Switch light or dark mode">\
-<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" \
-stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">\
-<path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z"/></svg></button>
+    __THEMEBTN__
   </div>
 </header>
 <main>
@@ -659,8 +726,48 @@ __SAVED__
 </section>
 </main>
 <div id="toast" role="status" aria-live="polite"></div>
+<div id="ptr" aria-hidden="true">Pull to refresh</div>
 <script>
-__ACTIONS__function tab(btn, restoring) {
+__ACTIONS__// The home-screen app resumes this page instead of loading it again, so it
+// checks for a newer daily feed whenever it comes back, and reloads only
+// then (a reload keeps the tab: it is in the fragment).
+const CYCLE = __CYCLE__;
+async function checkFresh() {
+  try {
+    const resp = await fetch('/feed/version', {cache: 'no-store'});
+    if (resp.ok && (await resp.json()).cycle !== CYCLE) location.reload();
+  } catch (e) {}
+}
+addEventListener('pageshow', e => { if (e.persisted) checkFresh(); });
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') checkFresh();
+});
+// Pull to refresh: standalone web apps on iOS have none of their own.
+if (navigator.standalone || matchMedia('(display-mode: standalone)').matches) {
+  const ptr = document.getElementById('ptr');
+  const PULL = 80;
+  let startY = null, pulled = 0;
+  addEventListener('touchstart', e => {
+    startY = scrollY <= 0 ? e.touches[0].clientY : null;
+  }, {passive: true});
+  addEventListener('touchmove', e => {
+    if (startY === null) return;
+    pulled = Math.max(0, e.touches[0].clientY - startY);
+    ptr.textContent = pulled > PULL ? 'Release to refresh' : 'Pull to refresh';
+    ptr.style.transform = `translate(-50%, ${Math.min(pulled, PULL * 1.5) - 60}px)`;
+    ptr.style.opacity = Math.min(1, pulled / PULL);
+  }, {passive: true});
+  addEventListener('touchend', () => {
+    if (startY !== null && pulled > PULL) {
+      ptr.textContent = 'Refreshing…';
+      location.reload();
+      return;
+    }
+    startY = null; pulled = 0;
+    ptr.style.transform = ''; ptr.style.opacity = '';
+  });
+}
+function tab(btn, restoring) {
   document.querySelectorAll('[data-panel]').forEach(b => {
     const on = b === btn;
     b.setAttribute('aria-selected', on);
@@ -702,9 +809,39 @@ _READER = """\
 __HEAD__
 <title>__TITLE__ · aiblinx</title>
 <script>
-function dropImg(img) { img.remove(); }
+function dropImg(img) { (img.closest('.hero-link') || img).remove(); }
 function checkImg(img) {
-  if (img.naturalWidth < 200 || img.naturalWidth / img.naturalHeight > 3) img.remove();
+  if (img.naturalWidth < 200 || img.naturalWidth / img.naturalHeight > 3) dropImg(img);
+}
+// a picture in the text goes with its caption when it fails to load or is
+// an icon
+function dropFig(img) { img.closest('figure').remove(); }
+function checkFig(img) { if (img.naturalWidth < 200) dropFig(img); }
+// the article text size (A- / A+) is a per-device preference, applied before
+// first paint so the text never jumps
+const SIZES = [15, 17, 19, 21, 23, 25, 27];
+let size = 19;
+try { const s = +localStorage.getItem('readerSize'); if (SIZES.includes(s)) size = s; }
+catch (e) {}
+document.documentElement.style.setProperty('--reader-size', size + 'px');
+function fontSize(step) {
+  size = SIZES[Math.min(SIZES.length - 1, Math.max(0, SIZES.indexOf(size) + step))];
+  document.documentElement.style.setProperty('--reader-size', size + 'px');
+  try { localStorage.setItem('readerSize', size); } catch (e) {}
+  sizeButtons();
+}
+function sizeButtons() {
+  document.getElementById('smaller').disabled = size === SIZES[0];
+  document.getElementById('larger').disabled = size === SIZES[SIZES.length - 1];
+}
+// DE / EN: swap the article and its translation in place; nothing is saved,
+// every article opens in its own language
+function switchLang(btn) {
+  const show = btn.textContent.toLowerCase();
+  document.querySelectorAll('[data-lang]').forEach(el => { el.hidden = el.dataset.lang !== show; });
+  const next = show === 'de' ? 'en' : 'de';
+  btn.textContent = next.toUpperCase();
+  btn.setAttribute('aria-label', next === 'de' ? 'Read in German' : 'Read in English');
 }
 function back() {
   // back to the feed in history (keeps its scroll position); /ui if opened directly
@@ -718,7 +855,7 @@ __CARD__header {
   -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px);
   padding: calc(env(safe-area-inset-top) + 12px) 12px 12px;
 }
-.bar { max-width: 640px; margin: 0 auto; display: flex; align-items: center; gap: 10px; }
+.bar { max-width: 640px; margin: 0 auto; display: flex; align-items: center; gap: 6px; }
 .logo { font-size: 22px; margin-right: auto; }
 .icon-btn {
   width: 42px; height: 42px; flex-shrink: 0; border: 0; border-radius: 999px;
@@ -732,18 +869,32 @@ main {
 .hero { border-radius: 18px; margin: 16px 0 2px; }
 h1 { margin: 12px 0 0; font-size: 30px; line-height: 1.15; font-weight: 720;
   letter-spacing: -0.015em; }
-.article { margin-top: 16px; font-size: 19px; line-height: 1.62; overflow-wrap: break-word; }
+.icon-btn:disabled { opacity: 0.4; cursor: default; }
+.icon-btn.size { width: 38px; font: 700 15px var(--font-head); }
+.icon-btn.size.up { font-size: 19px; }
+.article {
+  margin-top: 16px; font-size: var(--reader-size, 19px); line-height: 1.62;
+  overflow-wrap: break-word;
+}
 .article p, .article ul, .article ol, .article blockquote, .article pre { margin: 0 0 1em; }
-.article h2 { font-size: 23px; margin: 1.4em 0 0.5em; }
-.article h3 { font-size: 20px; margin: 1.3em 0 0.4em; }
+.article h2 { font-size: 1.21em; margin: 1.4em 0 0.5em; }
+.article h3 { font-size: 1.05em; margin: 1.3em 0 0.4em; }
+.article figure { margin: 1.4em 0; }
+.article figure img {
+  display: block; max-width: 100%; height: auto; margin: 0 auto; border-radius: 12px;
+  background: var(--img);
+}
+.article figcaption {
+  margin-top: 0.5em; font-size: 0.79em; line-height: 1.45; color: var(--muted);
+}
 .article blockquote { padding-left: 16px; border-left: 3px solid var(--line); color: var(--muted); }
 .article pre {
   padding: 12px 14px; border-radius: 12px; background: var(--chip); overflow-x: auto;
-  font-size: 15px; line-height: 1.45;
+  font-size: 0.79em; line-height: 1.45;
 }
 main > .meta .chip { background: var(--card); }  /* on the page, not a card */
-.article .lead { font-size: 20px; line-height: 1.5; }
-.article .video-info { margin: -4px 0 0; font-size: 15px; color: var(--muted); }
+.article .lead { font-size: 1.05em; line-height: 1.5; }
+.article .video-info { margin: -4px 0 0; font-size: 0.79em; color: var(--muted); }
 .article .player {
   display: block; width: 100%; aspect-ratio: 16 / 9; border-radius: 18px; background: #000;
   margin: 0 0 12px;
@@ -761,19 +912,19 @@ main > .meta .chip { background: var(--card); }  /* on the page, not a card */
 stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">\
 <path d="M15 5l-7 7 7 7"/></svg></button>
     <div class="logo wordmark" aria-label="aiblinx">aib<b>linx</b></div>
-    <button class="icon-btn" onclick="toggleTheme()" aria-label="Switch light or dark mode">\
-<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" \
-stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">\
-<path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z"/></svg></button>
+    <button class="icon-btn size" id="smaller" onclick="fontSize(-1)" \
+aria-label="Smaller text">A−</button>
+    <button class="icon-btn size up" id="larger" onclick="fontSize(1)" \
+aria-label="Larger text">A+</button>
+    __LANGBTN__
+    __THEMEBTN__
   </div>
 </header>
 <main>
 <div class="meta">__META__</div>
-<h1>__TITLE__</h1>
+__HEADLINE__
 __FIGURE__
-<div class="article">
 __BODY__
-</div>
 <div class="end">
   <article class="card" data-id="__ID__">
     <div class="gone">Less like this, noted.</div>
@@ -784,7 +935,8 @@ __BODY__
 </main>
 <div id="toast" role="status" aria-live="polite"></div>
 <script>
-__ACTIONS__</script>
+__ACTIONS__sizeButtons();
+</script>
 </body>
 </html>
 """
