@@ -91,5 +91,34 @@ class LinkwardenClient:
         data = resp.json()
         return data.get("response", data) if isinstance(data, dict) else data
 
+    async def upload_pdf(self, link_id: int, data: bytes, filename: str) -> None:
+        """Put ``data`` into the link's PDF slot (``format=2``). A link has one
+        PDF: this replaces the page PDF Linkwarden made, and the preservation
+        worker leaves an uploaded one alone."""
+        resp = await self._client.post(
+            f"/archives/{int(link_id)}",
+            params={"format": 2},
+            files={"file": (filename, data, "application/pdf")},
+            timeout=60.0,
+        )
+        resp.raise_for_status()
+
+    async def upload_preview(self, link_id: int, data: bytes) -> None:
+        """Set the link's preview picture from a JPEG (``preview=true``);
+        Linkwarden scales it down itself."""
+        resp = await self._client.post(
+            f"/archives/{int(link_id)}",
+            params={"format": 1, "preview": "true"},
+            files={"file": ("preview.jpg", data, "image/jpeg")},
+            timeout=60.0,
+        )
+        resp.raise_for_status()
+
+    async def download_archive(self, link_id: int, fmt: int) -> bytes:
+        """One preserved file of the link (0 PNG / 1 JPEG screenshot, 2 PDF)."""
+        resp = await self._client.get(f"/archives/{int(link_id)}", params={"format": fmt})
+        resp.raise_for_status()
+        return resp.content
+
     async def aclose(self) -> None:
         await self._client.aclose()

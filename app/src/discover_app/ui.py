@@ -328,6 +328,7 @@ def render_reader(
     promoted: bool | None = None,
     explored: bool | None = None,
     translation: dict | None = None,
+    chat: bool = False,
 ) -> str:
     """The reader page: an article's extracted text, then save / more / less.
 
@@ -339,7 +340,9 @@ def render_reader(
     is already saved to Exploring (adds the Save to Exploring button).
     translation: {"lang", "title", "body"} with ``lang`` the article's own
     language ("de" / "en"): both versions go into the page and a DE / EN
-    toggle swaps them. The article always opens in its own language."""
+    toggle swaps them. The article always opens in its own language.
+    chat: whether the chat about the story sits under the text; with
+    ``linkwarden`` a discussion goes to the saved link as a PDF."""
     url = _http(item.get("url")) or "#"
     image = _http(item.get("image_url"))
     figure = (
@@ -386,11 +389,50 @@ def render_reader(
         .replace("__LANGBTN__", lang_button)
         .replace("__HEADLINE__", headline)
         .replace("__TITLE__", title)
+        .replace("__CHAT__", _chat(linkwarden) if chat else "")
+        .replace("__CHATJS__", CHAT_JS if chat else "")
         .replace("__BODY__", article)  # last: article text is never scanned for placeholders
     )
 
 
 _READ_IN = {"de": "Read in German", "en": "Read in English"}
+
+_ICON_SEND = (
+    '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+    'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+    '<path d="M5 12h14M13 6l6 6-6 6"/></svg>'
+)
+
+
+def _chat(linkwarden: bool) -> str:
+    """The chat under the article. The conversation stays in the page: with
+    Linkwarden, Save attaches it to the link as a PDF; without, it is gone
+    when the page closes."""
+    note = (
+        "The conversation stays on this page. Save attaches it to the Linkwarden "
+        "link as a PDF, in place of the page PDF."
+        if linkwarden
+        else "The conversation stays on this page and is gone when you leave it."
+    )
+    attach = (
+        '\n  <button class="attach" id="attach" hidden onclick="attach(this)">'
+        "Attach this discussion to Linkwarden</button>"
+        if linkwarden
+        else ""
+    )
+    return f"""\
+<section class="chat" id="chat" data-linkwarden="{"1" if linkwarden else ""}">
+  <h2>Talk about this story</h2>
+  <div class="turns" id="turns" aria-live="polite"></div>
+  <form class="ask" onsubmit="ask(event)">
+    <textarea id="question" rows="2" maxlength="4000" required
+      placeholder="Ask about this story" aria-label="Your question"
+      onkeydown="askKey(event)"></textarea>
+    <button type="submit" id="send" aria-label="Send"
+      onmousedown="event.preventDefault()">{_ICON_SEND}</button>
+  </form>{attach}
+  <p class="chat-note">{note}</p>
+</section>"""
 
 
 # Shared by every page: theme tokens (light by default, dark by system setting
@@ -546,9 +588,12 @@ async function save(btn) {
   const card = btn.closest('.card');
   btn.disabled = true;
   try {
-    await post(card.dataset.id, 'save');
+    // the reader chat's discussion goes along, as a PDF for Linkwarden
+    const body = typeof saveBody === 'function' ? saveBody() : undefined;
+    const result = await post(card.dataset.id, 'save', body);
     btn.classList.add('on'); btn.setAttribute('aria-pressed', 'true');
     btn.querySelector('span').textContent = btn.dataset.done;
+    if (typeof saved === 'function') saved(result);
   } catch (e) { toast('Could not save: ' + e.message); }
   finally { btn.disabled = false; }
 }
@@ -562,6 +607,7 @@ async function promote(btn) {
     const save = card.querySelector('.save');
     save.classList.add('on'); save.setAttribute('aria-pressed', 'true');
     save.querySelector('span').textContent = save.dataset.done;
+    if (typeof saved === 'function') saved({});
     toast('Now one of your main interests');
   } catch (e) { toast('Could not promote: ' + e.message); }
   finally { btn.disabled = false; }
@@ -576,6 +622,7 @@ async function explore(btn) {
     const save = card.querySelector('.save');
     save.classList.add('on'); save.setAttribute('aria-pressed', 'true');
     save.querySelector('span').textContent = save.dataset.done;
+    if (typeof saved === 'function') saved({});
     toast('Saved to Exploring, less like this here');
   } catch (e) { toast('Could not save to Exploring: ' + e.message); }
   finally { btn.disabled = false; }
@@ -592,6 +639,150 @@ async function vote(btn, value) {
     }
   } catch (e) { toast('Could not record: ' + e.message); }
   finally { btn.disabled = false; }
+}
+"""
+
+
+# The reader chat. The conversation lives in ``turns`` only; each question
+# sends it whole and the answer streams back as server-sent events. Model
+# text is escaped before the little Markdown it may use (paragraphs, lists,
+# bold, http/https links) becomes markup.
+CHAT_JS = r"""
+const turns = [];
+let attachedTurns = 0;
+const chatId = document.querySelector('.end .card').dataset.id;
+const chatLinkwarden = document.getElementById('chat').dataset.linkwarden === '1';
+function esc(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+function inline(s) {
+  return esc(s)
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+      '<a href="$2" rel="noreferrer" target="_blank">$1</a>')
+    .replace(/(^|[\s(])(https?:\/\/[^\s<)]*[^\s<).,;:!?])/g,
+      '$1<a href="$2" rel="noreferrer" target="_blank">$2</a>');
+}
+function fmt(text) {
+  return text.trim().split(/\n{2,}/).map(block => {
+    const lines = block.split('\n');
+    if (lines.every(l => /^\s*([-*]|\d+\.)\s+/.test(l))) {
+      const tag = /^\s*\d+\./.test(lines[0]) ? 'ol' : 'ul';
+      return `<${tag}>` + lines.map(l =>
+        '<li>' + inline(l.replace(/^\s*([-*]|\d+\.)\s+/, '')) + '</li>').join('') + `</${tag}>`;
+    }
+    return '<p>' + lines.map(l => inline(l.replace(/^#{1,6}\s+/, ''))).join('<br>') + '</p>';
+  }).join('');
+}
+function addTurn(cls) {
+  const el = document.createElement('div');
+  el.className = 'turn ' + cls;
+  document.getElementById('turns').append(el);
+  return el;
+}
+function showSearch(el, search) {
+  let box = el.querySelector('.searches');
+  if (!box) {
+    box = document.createElement('div'); box.className = 'searches';
+    el.prepend(box);
+  }
+  const row = document.createElement('div');
+  row.textContent = 'Searched: ' + search.query;
+  for (const r of search.results) {
+    const a = document.createElement('a');
+    a.href = r.url; a.rel = 'noreferrer'; a.target = '_blank';
+    a.textContent = r.title || r.url;
+    row.append(a);
+  }
+  box.append(row);
+}
+function chatLang() {
+  const shown = document.querySelector('.article[data-lang]:not([hidden])');
+  return shown ? shown.dataset.lang : null;
+}
+function isSaved() { return document.querySelector('.end .save').classList.contains('on'); }
+function updateAttach() {
+  const btn = document.getElementById('attach');
+  if (btn) btn.hidden = !(isSaved() && turns.length > attachedTurns);
+}
+// Save sends the discussion along; after it, only a changed one is offered again
+function saveBody() { return chatLinkwarden && turns.length ? {discussion: turns} : undefined; }
+function saved(result) {
+  if (result.attached === true) {
+    attachedTurns = turns.length; toast('Saved, with the discussion as PDF');
+  } else if (result.attached === false) {
+    toast('Saved, but the discussion could not be attached');
+  }
+  updateAttach();
+}
+async function attach(btn) {
+  btn.disabled = true;
+  try {
+    const result = await post(chatId, 'save', {discussion: turns});
+    if (result.attached) {
+      attachedTurns = turns.length; toast('Discussion attached to Linkwarden');
+    } else toast('Could not attach the discussion');
+  } catch (e) { toast('Could not attach: ' + e.message); }
+  finally { btn.disabled = false; updateAttach(); }
+}
+function askKey(ev) {
+  // Enter sends on a keyboard; on a phone it is a new line
+  const keyboard = matchMedia('(pointer: fine)').matches;
+  if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing && keyboard) {
+    ev.preventDefault(); ev.target.form.requestSubmit();
+  }
+}
+async function ask(ev) {
+  ev.preventDefault();
+  const box = document.getElementById('question'), send = document.getElementById('send');
+  const question = box.value.trim();
+  if (!question || send.disabled) return;
+  send.disabled = true;
+  // the question field keeps the focus, so a phone keeps its keyboard open
+  box.focus({preventScroll: true});
+  const mine = addTurn('user'); mine.textContent = question;
+  box.value = '';
+  const bot = addTurn('bot'), text = document.createElement('div');
+  text.className = 'text'; text.innerHTML = '<p class="wait">Thinking…</p>'; bot.append(text);
+  const answer = {role: 'assistant', content: '', searches: []};
+  const history = turns.map(t => ({role: t.role, content: t.content}));
+  history.push({role: 'user', content: question});
+  let failed = false;
+  try {
+    const resp = await fetch(`/read/${chatId}/chat`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({messages: history, lang: chatLang()})});
+    if (!resp.ok || !resp.body) throw new Error(resp.status);
+    const reader = resp.body.getReader(), decoder = new TextDecoder();
+    let buffer = '';
+    for (;;) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, {stream: true});
+      let cut;
+      while ((cut = buffer.indexOf('\n\n')) >= 0) {
+        const line = buffer.slice(0, cut); buffer = buffer.slice(cut + 2);
+        if (!line.startsWith('data: ')) continue;
+        const event = JSON.parse(line.slice(6));
+        if (event.type === 'text') {
+          answer.content += event.text; text.innerHTML = fmt(answer.content);
+        } else if (event.type === 'search') {
+          answer.searches.push({query: event.query, results: event.results});
+          showSearch(bot, event);
+          if (!answer.content) text.innerHTML = '<p class="wait">Reading the results…</p>';
+        } else if (event.type === 'error') { failed = true; }
+      }
+    }
+  } catch (e) { failed = true; }
+  if (failed || !answer.content.trim()) {
+    text.innerHTML = '<p class="failed">No answer came back. Ask again?</p>';
+    box.value = question;
+  } else {
+    turns.push({role: 'user', content: question}, answer);
+    updateAttach();
+  }
+  send.disabled = false;
 }
 """
 
@@ -899,6 +1090,42 @@ main > .meta .chip { background: var(--card); }  /* on the page, not a card */
   display: block; width: 100%; aspect-ratio: 16 / 9; border-radius: 18px; background: #000;
   margin: 0 0 12px;
 }
+.chat {
+  margin-top: 28px; padding: 16px; border-radius: 24px; background: var(--card);
+  display: flex; flex-direction: column; gap: 12px;
+}
+.chat h2 { margin: 0; font-size: 19px; }
+.turns { display: flex; flex-direction: column; gap: 10px; }
+.turns:empty { display: none; }
+/* the chat follows the article's A- / A+ size */
+.turn { font-size: var(--reader-size, 19px); line-height: 1.55; overflow-wrap: break-word; }
+.turn p, .turn ul, .turn ol { margin: 0 0 0.6em; }
+.turn > :last-child, .turn .text > :last-child { margin-bottom: 0; }
+.turn.user {
+  align-self: flex-end; max-width: 88%; padding: 10px 14px; border-radius: 18px;
+  background: var(--chip); white-space: pre-wrap;
+}
+.turn.bot a { color: var(--accent); }
+.turn.bot .wait, .turn.bot .failed { color: var(--muted); }
+.searches { margin: 0 0 8px; font-size: 0.72em; color: var(--muted); }
+.searches div { margin-bottom: 4px; }
+.searches a { color: var(--muted); display: block; white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis; }
+.ask { display: flex; gap: 8px; align-items: flex-end; }
+.ask textarea {
+  flex: 1; min-height: 48px; max-height: 40vh; resize: vertical; padding: 12px 14px;
+  border: 1px solid var(--line); border-radius: 16px; background: var(--bg); color: var(--ink);
+  /* iOS zooms into a field with text under 16 px */
+  font: inherit; font-size: max(16px, var(--reader-size, 19px)); line-height: 1.4;
+}
+.ask button, .chat .attach {
+  height: 48px; border: 0; border-radius: 16px; background: var(--btn); color: var(--btn-ink);
+  cursor: pointer; font: inherit; font-size: 15px;
+}
+.ask button { width: 56px; flex-shrink: 0; display: grid; place-items: center; }
+.ask button:disabled, .chat .attach:disabled { opacity: 0.6; }
+.chat .attach { background: var(--save-on); color: var(--save-on-ink); padding: 0 16px; }
+.chat-note { margin: 0; font-size: 13px; color: var(--muted); }
 .end { margin-top: 28px; display: flex; flex-direction: column; gap: 14px; }
 .end .card .actions { padding: 12px; }
 .original { color: var(--muted); font-size: 15px; margin: 0 6px; }
@@ -925,6 +1152,7 @@ aria-label="Larger text">A+</button>
 __HEADLINE__
 __FIGURE__
 __BODY__
+__CHAT__
 <div class="end">
   <article class="card" data-id="__ID__">
     <div class="gone">Less like this, noted.</div>
@@ -936,6 +1164,7 @@ __BODY__
 <div id="toast" role="status" aria-live="polite"></div>
 <script>
 __ACTIONS__sizeButtons();
+__CHATJS__
 </script>
 </body>
 </html>

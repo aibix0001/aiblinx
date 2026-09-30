@@ -8,9 +8,14 @@ ENV PYTHONUNBUFFERED=1 \
 COPY --from=ghcr.io/astral-sh/uv:0.10.7 /uv /usr/local/bin/uv
 
 # Unprivileged runtime user. The entrypoint drops privileges with setpriv (from
-# util-linux, already in the base image) — no apt / gosu needed.
+# util-linux, already in the base image) — no gosu needed.
 RUN groupadd --gid 10001 app \
  && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /app --shell /usr/sbin/nologin app
+
+# DejaVu Sans for the reader chat's PDFs (umlauts, quotes, symbols)
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends fonts-dejavu-core \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 

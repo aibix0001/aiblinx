@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.4.0
+
+- **Talk about a story:** the reader has a chat under the article. The model
+  knows the whole article, as you read it and in the language on screen, plus
+  the card summary and why the story was picked. With SearXNG set up, it
+  searches the web when the story doesn't have the answer, and shows its
+  searches with the result links. Answers stream in as they are written.
+  Nothing about the conversation is stored or logged; it lives in the page.
+- **Keep the discussion:** with Linkwarden connected, Save attaches the
+  conversation to the link as a PDF: the story, the summary, why it was
+  picked, and every question and answer with its searches. It takes the
+  place of the page PDF Linkwarden makes; the page stays preserved as a
+  screenshot and a single-file HTML copy, and the link keeps its preview
+  picture. A story saved earlier gets "Attach this discussion".
+- The chat text follows the reader's A− / A+ size, and on a phone the
+  keyboard stays open after sending.
+- `READER_CHAT=false` turns the chat off. `READER_TRANSLATE` now also works
+  when set in `.env` with Docker Compose; before, Compose did not pass it on.
+
 ## 0.3.0
 
 - **Read in German or English:** each morning aiblinx prepares the day's

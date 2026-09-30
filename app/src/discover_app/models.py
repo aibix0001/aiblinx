@@ -65,6 +65,8 @@ class RatingResponse(BaseModel):
 class CaptureResponse(BaseModel):
     status: Literal["saved", "already_saved", "promoted", "saved_to_exploring"]
     linkwarden_id: int | None = None
+    # a discussion sent with the save: whether it reached the Linkwarden link
+    attached: bool | None = None
 
 
 class RunCycleResponse(BaseModel):

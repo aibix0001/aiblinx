@@ -105,6 +105,9 @@ class Settings(BaseSettings):
     # Reader: each served article is extracted at cycle time and translated
     # between German and English by the chat model (costs tokens on paid APIs)
     reader_translate: bool = True
+    # Reader chat: talk about the story under its text, with web search when
+    # SearXNG is set up; the discussion goes to Linkwarden as a PDF on save
+    reader_chat: bool = True
 
     # --- ranking ---
     knn_k: int = 50
@@ -176,6 +179,11 @@ class Settings(BaseSettings):
     def translate_enabled(self) -> bool:
         """Reader translations need the chat model."""
         return self.reader_translate and bool(self.llm_chat_model)
+
+    @property
+    def chat_enabled(self) -> bool:
+        """The reader chat needs the chat model."""
+        return self.reader_chat and bool(self.llm_chat_model)
 
     @property
     def linkwarden_enabled(self) -> bool:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import secrets
 from contextlib import asynccontextmanager
@@ -16,11 +17,23 @@ from fastapi.responses import (
     PlainTextResponse,
     RedirectResponse,
     Response,
+    StreamingResponse,
 )
 
 from .auth import feed_token, password_ok, require_login, set_session
+from .chat import (
+    Chat,
+    ChatRequest,
+    SaveRequest,
+    article_text,
+    attach_discussion,
+    story,
+    system_prompt,
+)
+from .clients.llm import LLMClient
 from .clients.miniflux import MinifluxClient
 from .clients.rss import subscribe
+from .clients.searxng import SearxngClient
 from .config import get_settings
 from .db import connection, get_meta, init_db
 from .html_text import card_summary, strip_html
@@ -527,15 +540,56 @@ def create_app() -> FastAPI:
                 promoted=promoted,
                 explored=explored,
                 translation=translation,
+                chat=settings.chat_enabled,
             ),
             headers={"Referrer-Policy": "no-referrer", "Cache-Control": "no-store"},
         )
 
-    @app.post("/feed/{candidate_id}/save", response_model=CaptureResponse)
-    async def feed_save(candidate_id: int) -> CaptureResponse:
-        """ "+" capture: save this suggestion into Linkwarden (idempotent)."""
+    @app.post("/read/{candidate_id}/chat", include_in_schema=False)
+    async def read_chat(candidate_id: int, body: ChatRequest) -> StreamingResponse:
+        """One chat message about the story: the answer streamed as
+        server-sent events. Nothing is stored or logged about the talk."""
+        settings = get_settings()
+        if not settings.chat_enabled:
+            raise HTTPException(status_code=404, detail="the reader chat is off")
+        if body.messages[-1].role != "user":
+            raise HTTPException(status_code=422, detail="the last message must be the user's")
         try:
-            result = await capture_candidate(get_settings(), candidate_id)
+            item = story(settings, candidate_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail="no such item") from exc
+        text = await article_text(settings, item, body.lang)
+        searxng = SearxngClient(settings) if settings.searxng_url else None
+        system = system_prompt(item, text, search=searxng is not None)
+
+        async def events():
+            llm = LLMClient(settings)  # its own client: never queued behind the cycle
+            try:
+                async for event in Chat(llm, searxng, system, body.messages).run():
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            except Exception as exc:  # noqa: BLE001 - the page shows it; never the text
+                log.warning("reader chat: the model call failed: %s", type(exc).__name__)
+                yield 'data: {"type": "error"}\n\n'
+            finally:
+                await llm.aclose()
+                if searxng is not None:
+                    await searxng.aclose()
+            yield 'data: {"type": "done"}\n\n'
+
+        return StreamingResponse(
+            events(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+        )
+
+    @app.post("/feed/{candidate_id}/save", response_model=CaptureResponse)
+    async def feed_save(candidate_id: int, body: SaveRequest | None = None) -> CaptureResponse:
+        """ "+" capture: save this suggestion into Linkwarden (idempotent).
+        A discussion from the reader chat goes to the link as a PDF, also
+        when the story was saved before."""
+        settings = get_settings()
+        try:
+            result = await capture_candidate(settings, candidate_id)
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except httpx.HTTPError as exc:
@@ -543,6 +597,10 @@ def create_app() -> FastAPI:
             raise HTTPException(
                 status_code=502, detail=f"Linkwarden rejected the save: {exc}"
             ) from exc
+        if body and body.discussion and settings.linkwarden_enabled:
+            result["attached"] = await attach_discussion(
+                settings, candidate_id, body.discussion, link_id=result.get("linkwarden_id")
+            )
         return CaptureResponse(**result)
 
     @app.post("/feed/{candidate_id}/promote", response_model=CaptureResponse)

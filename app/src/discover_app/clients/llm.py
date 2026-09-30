@@ -14,7 +14,7 @@ client falls back to ``LLM_BASE_URL``.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
 import httpx
@@ -94,6 +94,36 @@ class LLMClient:
                 **kwargs,
             )
         return resp.choices[0].message.content or ""
+
+    async def chat_stream(
+        self, messages: list[dict[str, Any]], **kwargs: object
+    ) -> AsyncIterator[tuple[str, Any]]:
+        """Stream a reply: yields ``("text", piece)`` as it arrives, then
+        ``("tool_calls", [{"id", "name", "arguments"}])`` when the model asks
+        for tools. An error from the endpoint is raised before anything is
+        yielded."""
+        async with self._sem:
+            stream = await self._chat_client.chat.completions.create(
+                model=self.settings.llm_chat_model,
+                messages=messages,  # type: ignore[arg-type]
+                stream=True,
+                **kwargs,
+            )
+            calls: dict[int, dict[str, str]] = {}
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    yield "text", delta.content
+                for part in delta.tool_calls or []:
+                    call = calls.setdefault(part.index, {"id": "", "name": "", "arguments": ""})
+                    call["id"] = part.id or call["id"]
+                    if part.function:
+                        call["name"] += part.function.name or ""
+                        call["arguments"] += part.function.arguments or ""
+            if calls:
+                yield "tool_calls", [calls[i] for i in sorted(calls)]
 
     async def aclose(self) -> None:
         await self._chat_client.close()

@@ -96,6 +96,38 @@ Opening a story writes nothing to the database and is kept out of the access
 log; a prepared story is not fetched from the publisher again. The page sends
 no referrer.
 
+### Talking about a story
+
+With a chat model configured (`READER_CHAT`, on by default), the reader has a
+chat under the article. Each question sends the whole conversation to
+`POST /read/{id}/chat`, and the answer streams back as server-sent events. The
+server writes the model's context itself: the article as the reader shows it
+(in the language on screen), the card summary and the line on why the story
+was picked. The page can only send your questions and the earlier answers.
+
+With SearXNG set up, the model has one tool, `web_search`. It gets the top five
+results (title, address, snippet) and may search up to three times per
+question; the page shows each search with its result links. Nothing fetches
+the result pages. Without SearXNG, or when the model endpoint does not support
+tools, the chat answers from the story alone.
+
+The conversation lives in the page and nothing about it is stored or logged:
+closing the page ends it. When Linkwarden is connected, **Save** sends the
+conversation along. aiblinx renders one PDF (the story, the summary, the
+why-line, then the conversation with its searches) and uploads it into the
+Linkwarden link's PDF slot. A link has one PDF, so this one replaces the page
+PDF Linkwarden would make; the page stays preserved as a screenshot, a
+single-file HTML copy and readable text. The upload clears the link's preview
+picture, so aiblinx sets it again the way Linkwarden picks one: the story's
+title image, else Linkwarden's own screenshot of the page once it exists
+(within two minutes). For a story saved earlier, **Attach this discussion** sends
+the PDF again and replaces the previous one. If the upload fails, the save
+still counts and the page says so. Without Linkwarden there is nowhere to
+attach it, and the conversation is gone when you leave.
+
+The chat keeps the model's reasoning on and its own sampling settings, with a
+presence penalty against loops and no cap on the reply length.
+
 ## Data
 
 One SQLite file in `DATA_DIR`: bookmarks, imports, saves, candidate stories and
@@ -121,11 +153,12 @@ app, restore the copy and set the old model again.
 | GET | `/feed` | the current feed as JSON |
 | GET | `/feed.atom` | Atom feed (with `APP_PASSWORD`: `?token=` from `/setup`) |
 | GET | `/digest` | markdown digest |
-| POST | `/feed/{id}/save` | save a story (and to Linkwarden when connected) |
+| POST | `/feed/{id}/save` | save a story (and to Linkwarden when connected); optional `{discussion}` attaches a chat as PDF |
 | POST | `/feed/{id}/interest` | `{value: up\|down}` |
 | POST | `/feed/{id}/promote` | file an Exploring story as a main interest |
 | POST | `/feed/{id}/explore` | file a "For you" story under Exploring, and less like it |
 | GET | `/read/{id}` | reader view (or a redirect to the original) |
+| POST | `/read/{id}/chat` | `{messages, lang}`: one chat answer about the story, as server-sent events |
 | GET | `/feed/version` | the current cycle, so an open feed page reloads when a newer one exists |
 | GET / POST / DELETE | `/feeds`, `/feeds/{id}` | list, add (`{url}`) and remove subscribed feeds |
 | GET / POST | `/topics`, `/topics/{name}` | Exploring topics |
@@ -165,6 +198,7 @@ values count as unset.
 | `POLL_CRON` / `CYCLE_CRON` | `7-59/15 * * * *` / `0 6 * * *` | UTC |
 | `LINK_TARGET` | `same` | `new` opens articles in a new tab |
 | `READER_TRANSLATE` | `true` | translate prepared stories between German and English with the chat model |
+| `READER_CHAT` | `true` | chat about a story in the reader; web search with `SEARXNG_URL`; the chat goes to Linkwarden as PDF on save |
 | `APP_PASSWORD` | — | optional login |
 | `ADMIN_TOKEN` | — | protects `POST /admin/run-cycle` |
 | `PUBLIC_BASE_URL` | `http://localhost:8000` | used in the Atom feed |

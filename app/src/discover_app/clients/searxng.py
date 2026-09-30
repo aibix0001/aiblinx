@@ -1,4 +1,5 @@
-"""SearXNG client — per-topic candidate fetches for the Exploring section.
+"""SearXNG client — per-topic candidate fetches for the Exploring section, and
+the reader chat's web search.
 
 One `GET /search?q=<topic>&categories=news&time_range=week&format=json` per
 selected topic per cycle. JSON output must be enabled in the instance's
@@ -67,6 +68,29 @@ class SearxngClient:
                         "topic": topic,
                     }
                 )
+        return out
+
+    async def search(self, query: str, n: int = 5) -> list[dict[str, str]]:
+        """A general web search for the reader chat: the top ``n`` results
+        as title, URL and snippet. Raises on a failed request. A POST form,
+        so the query stays out of the request line that httpx logs."""
+        resp = await self._client.post(
+            "/search", data={"q": query, "categories": "general", "format": "json"}
+        )
+        resp.raise_for_status()
+        out = []
+        for result in resp.json().get("results", []):
+            url = _http(result.get("url"))
+            if url:
+                out.append(
+                    {
+                        "title": strip_html(result.get("title"))[:200],
+                        "url": url,
+                        "snippet": strip_html(result.get("content"))[:400],
+                    }
+                )
+            if len(out) == n:
+                break
         return out
 
     async def aclose(self) -> None:
