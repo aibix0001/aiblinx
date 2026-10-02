@@ -405,14 +405,13 @@ _ICON_SEND = (
 
 
 def _chat(linkwarden: bool) -> str:
-    """The chat under the article. The conversation stays in the page: with
-    Linkwarden, Save attaches it to the link as a PDF; without, it is gone
-    when the page closes."""
+    """The chat under the article. The conversation stays on the device for
+    30 days; with Linkwarden, Save also attaches it to the link as a PDF."""
     note = (
-        "The conversation stays on this page. Save attaches it to the Linkwarden "
-        "link as a PDF, in place of the page PDF."
+        "The conversation stays on this device for 30 days. Save attaches it to the "
+        "Linkwarden link as a PDF, in place of the page PDF."
         if linkwarden
-        else "The conversation stays on this page and is gone when you leave it."
+        else "The conversation stays on this device for 30 days."
     )
     attach = (
         '\n  <button class="attach" id="attach" hidden onclick="attach(this)">'
@@ -643,8 +642,11 @@ async function vote(btn, value) {
 """
 
 
-# The reader chat. The conversation lives in ``turns`` only; each question
-# sends it whole and the answer streams back as server-sent events. Model
+# The reader chat. The conversation lives in ``turns``, kept on the device
+# (localStorage, per story, for CHAT_DAYS); each question sends it whole and
+# the answer streams back as server-sent events. The server writes the
+# answer as a job that outlives the page: an answer still pending when the
+# page went away is fetched again by its job id when the story opens. Model
 # text is escaped before the little Markdown it may use (paragraphs, lists,
 # bold, http/https links) becomes markup.
 CHAT_JS = r"""
@@ -652,6 +654,34 @@ const turns = [];
 let attachedTurns = 0;
 const chatId = document.querySelector('.end .card').dataset.id;
 const chatLinkwarden = document.getElementById('chat').dataset.linkwarden === '1';
+const CHAT_KEY = 'chat:' + chatId, CHAT_DAYS = 30, CHAT_KEEP = 50;
+let pending = null;  // {question, job}: the answer the server is writing
+function store() {
+  try {
+    if (turns.length || pending) {
+      localStorage.setItem(CHAT_KEY,
+        JSON.stringify({turns, attachedTurns, pending, at: Date.now()}));
+    } else localStorage.removeItem(CHAT_KEY);
+  } catch (e) {}
+}
+// discussions older than CHAT_DAYS go, and all but the newest CHAT_KEEP
+function pruneChats() {
+  try {
+    const chats = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (!key.startsWith('chat:')) continue;
+      let at = 0;
+      try { at = JSON.parse(localStorage.getItem(key)).at || 0; } catch (e) {}
+      chats.push([at, key]);
+    }
+    chats.sort((a, b) => b[0] - a[0]);
+    const old = Date.now() - CHAT_DAYS * 864e5;
+    chats.forEach(([at, key], i) => {
+      if (i >= CHAT_KEEP || at < old) localStorage.removeItem(key);
+    });
+  } catch (e) {}
+}
 function esc(s) {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
@@ -710,7 +740,7 @@ function updateAttach() {
 function saveBody() { return chatLinkwarden && turns.length ? {discussion: turns} : undefined; }
 function saved(result) {
   if (result.attached === true) {
-    attachedTurns = turns.length; toast('Saved, with the discussion as PDF');
+    attachedTurns = turns.length; store(); toast('Saved, with the discussion as PDF');
   } else if (result.attached === false) {
     toast('Saved, but the discussion could not be attached');
   }
@@ -721,7 +751,7 @@ async function attach(btn) {
   try {
     const result = await post(chatId, 'save', {discussion: turns});
     if (result.attached) {
-      attachedTurns = turns.length; toast('Discussion attached to Linkwarden');
+      attachedTurns = turns.length; store(); toast('Discussion attached to Linkwarden');
     } else toast('Could not attach the discussion');
   } catch (e) { toast('Could not attach: ' + e.message); }
   finally { btn.disabled = false; updateAttach(); }
@@ -738,52 +768,102 @@ async function ask(ev) {
   const box = document.getElementById('question'), send = document.getElementById('send');
   const question = box.value.trim();
   if (!question || send.disabled) return;
-  send.disabled = true;
   // the question field keeps the focus, so a phone keeps its keyboard open
   box.focus({preventScroll: true});
   const mine = addTurn('user'); mine.textContent = question;
   box.value = '';
-  const bot = addTurn('bot'), text = document.createElement('div');
-  text.className = 'text'; text.innerHTML = '<p class="wait">Thinking…</p>'; bot.append(text);
-  const answer = {role: 'assistant', content: '', searches: []};
   const history = turns.map(t => ({role: t.role, content: t.content}));
   history.push({role: 'user', content: question});
-  let failed = false;
+  pending = {question, job: null}; store();
+  await answer(fetch(`/read/${chatId}/chat`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({messages: history, lang: chatLang()})}));
+}
+function follow() { return fetch(`/read/${chatId}/chat/${pending.job}`, {cache: 'no-store'}); }
+// One answer, from the POST that asks or the GET that fetches it again.
+// When only the line breaks, the server goes on writing: follow it once
+// more, and if that fails too keep it pending for the next visit.
+async function answer(request, retry = true) {
+  const box = document.getElementById('question'), send = document.getElementById('send');
+  send.disabled = true;
+  const bot = addTurn('bot'), text = document.createElement('div');
+  text.className = 'text'; text.innerHTML = '<p class="wait">Thinking…</p>'; bot.append(text);
+  const reply = {role: 'assistant', content: '', searches: []};
+  let failed = false, done = false, gone = false;
   try {
-    const resp = await fetch(`/read/${chatId}/chat`, {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({messages: history, lang: chatLang()})});
+    const resp = await request;
+    gone = resp.status === 404;
     if (!resp.ok || !resp.body) throw new Error(resp.status);
     const reader = resp.body.getReader(), decoder = new TextDecoder();
     let buffer = '';
     for (;;) {
-      const {value, done} = await reader.read();
-      if (done) break;
+      const {value, done: end} = await reader.read();
+      if (end) break;
       buffer += decoder.decode(value, {stream: true});
       let cut;
       while ((cut = buffer.indexOf('\n\n')) >= 0) {
         const line = buffer.slice(0, cut); buffer = buffer.slice(cut + 2);
         if (!line.startsWith('data: ')) continue;
         const event = JSON.parse(line.slice(6));
-        if (event.type === 'text') {
-          answer.content += event.text; text.innerHTML = fmt(answer.content);
+        if (event.type === 'job') {
+          pending.job = event.id; store();
+        } else if (event.type === 'text') {
+          reply.content += event.text; text.innerHTML = fmt(reply.content);
         } else if (event.type === 'search') {
-          answer.searches.push({query: event.query, results: event.results});
+          reply.searches.push({query: event.query, results: event.results});
           showSearch(bot, event);
-          if (!answer.content) text.innerHTML = '<p class="wait">Reading the results…</p>';
+          if (!reply.content) text.innerHTML = '<p class="wait">Reading the results…</p>';
         } else if (event.type === 'error') { failed = true; }
+        else if (event.type === 'done') { done = true; }
       }
     }
-  } catch (e) { failed = true; }
-  if (failed || !answer.content.trim()) {
-    text.innerHTML = '<p class="failed">No answer came back. Ask again?</p>';
-    box.value = question;
-  } else {
-    turns.push({role: 'user', content: question}, answer);
-    updateAttach();
+  } catch (e) {}
+  if (!done && !gone && pending.job && retry) {
+    bot.remove();
+    return answer(follow(), false);
   }
+  const question = pending.question;
+  if (done && !failed && reply.content.trim()) {
+    turns.push({role: 'user', content: question}, reply);
+    pending = null;
+    updateAttach();
+  } else {
+    text.innerHTML = '<p class="failed">No answer came back. Ask again?</p>';
+    if (!box.value) box.value = question;
+    if (done || gone || !pending.job) pending = null;
+  }
+  store();
   send.disabled = false;
 }
+// the discussion kept on this device, and an answer still pending
+function restoreChat() {
+  pruneChats();
+  let kept = null;
+  try { kept = JSON.parse(localStorage.getItem(CHAT_KEY)); } catch (e) {}
+  if (!kept) return;
+  attachedTurns = kept.attachedTurns || 0;
+  for (const turn of kept.turns || []) {
+    turns.push(turn);
+    const el = addTurn(turn.role === 'user' ? 'user' : 'bot');
+    if (turn.role === 'user') { el.textContent = turn.content; continue; }
+    const text = document.createElement('div');
+    text.className = 'text'; text.innerHTML = fmt(turn.content); el.append(text);
+    for (const search of turn.searches || []) showSearch(el, search);
+  }
+  updateAttach();
+  pending = kept.pending || null;
+  if (pending && pending.job) {
+    addTurn('user').textContent = pending.question;
+    answer(follow());
+  } else if (pending) {
+    // asked, but the page went before the server took it on
+    document.getElementById('question').value = pending.question;
+    pending = null; store();
+  }
+}
+restoreChat();
+// a page brought back from the back/forward cache has a stale chat
+addEventListener('pageshow', e => { if (e.persisted && pending) location.reload(); });
 """
 
 

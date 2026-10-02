@@ -3758,10 +3758,15 @@ def _chat_app(tmp_path, monkeypatch, llm, search=None, **overrides):
     return settings, TestClient(app_mod.create_app(), follow_redirects=False)
 
 
-def _events(resp) -> list[dict]:
+def _all_events(resp) -> list[dict]:
     import json
 
     return [json.loads(line[6:]) for line in resp.text.split("\n\n") if line.startswith("data: ")]
+
+
+def _events(resp) -> list[dict]:
+    """The answer's events, without the job id a POST starts with."""
+    return [e for e in _all_events(resp) if e["type"] != "job"]
 
 
 def test_reader_chat_streams_with_search_and_stores_nothing(tmp_path, monkeypatch):
@@ -3794,6 +3799,68 @@ def test_reader_chat_streams_with_search_and_stores_nothing(tmp_path, monkeypatc
     # the search result went back to the model as a tool message
     assert llm.calls[1]["messages"][-1]["role"] == "tool"
     assert _counts(settings) == before
+
+
+def test_reader_chat_answer_can_be_fetched_again(tmp_path, monkeypatch):
+    llm = _ChatLLM([[("text", "Four "), ("text", "astronauts.")]])
+    _, client = _chat_app(tmp_path, monkeypatch, llm)
+    first = _all_events(
+        client.post("/read/1/chat", json={"messages": [{"role": "user", "content": "Who?"}]})
+    )
+    assert first[0]["type"] == "job"
+    job = first[0]["id"]
+    again = client.get(f"/read/1/chat/{job}")
+    assert again.status_code == 200
+    assert _all_events(again) == first[1:]
+    assert len(llm.calls) == 1  # replayed, not asked again
+    # a job belongs to its story, and unknown ones are gone
+    assert client.get(f"/read/2/chat/{job}").status_code == 404
+    assert client.get("/read/1/chat/nope").status_code == 404
+
+
+async def test_chat_job_finishes_without_a_listener():
+    import asyncio
+
+    from discover_app.chat import ChatJob
+
+    gate = asyncio.Event()
+
+    async def answer():
+        yield {"type": "text", "text": "Four "}
+        await gate.wait()
+        yield {"type": "text", "text": "astronauts."}
+        yield {"type": "done"}
+
+    job = ChatJob(1)
+    task = asyncio.create_task(job.run(answer()))
+    follower = job.follow()
+    assert await anext(follower) == {"type": "text", "text": "Four "}
+    await follower.aclose()  # the page went away mid-answer
+    gate.set()
+    await task
+    assert [e async for e in job.follow()] == [
+        {"type": "text", "text": "Four "},
+        {"type": "text", "text": "astronauts."},
+        {"type": "done"},
+    ]
+
+
+async def test_chat_jobs_expire_an_hour_after_the_end(monkeypatch):
+    import asyncio
+
+    from discover_app import chat
+
+    async def answer():
+        yield {"type": "done"}
+
+    job_id, job = chat.start_job(1, answer())
+    while job.finished_at is None:
+        await asyncio.sleep(0)
+    assert chat.find_job(1, job_id) is job
+    now = job.finished_at + chat.JOB_TTL_S + 1
+    monkeypatch.setattr(chat.time, "monotonic", lambda: now)
+    assert chat.find_job(1, job_id) is None
+    assert job_id not in chat._jobs
 
 
 def test_reader_chat_context_in_the_original_language(tmp_path, monkeypatch):
@@ -3888,7 +3955,7 @@ def test_reader_page_without_chat_or_linkwarden(tmp_path, monkeypatch):
     assert 'id="chat"' not in off and "const turns" not in off
     local = render_reader(item, "<p>Text.</p>", False, None, False, chat=True)
     assert 'data-linkwarden=""' in local and 'id="attach"' not in local
-    assert "gone when you leave it" in local
+    assert "stays on this device for 30 days." in local
 
 
 class _AttachLinkwarden(_FakeLinkwardenWriter):
@@ -4046,6 +4113,20 @@ def test_reader_chat_follows_text_size_and_keeps_the_keyboard():
     assert "font-size: max(16px, var(--reader-size, 19px));" in page
     assert 'id="send" aria-label="Send"\n      onmousedown="event.preventDefault()"' in page
     assert "box.focus({preventScroll: true});" in page
+
+
+def test_reader_chat_is_kept_on_the_device_and_resumed():
+    """The page keeps the discussion per story in localStorage and fetches
+    an answer still pending by its job id when the story opens again."""
+    from discover_app.ui import render_reader
+
+    page = render_reader(
+        {"id": 1, "url": "https://ex.com/a", "title": "T"}, "<p>x</p>", False, None, True, chat=True
+    )
+    assert "const CHAT_KEY = 'chat:' + chatId, CHAT_DAYS = 30, CHAT_KEEP = 50;" in page
+    assert "fetch(`/read/${chatId}/chat/${pending.job}`" in page
+    assert "pending.job = event.id; store();" in page
+    assert "restoreChat();" in page
 
 
 class _PreviewLinkwarden:

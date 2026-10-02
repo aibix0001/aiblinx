@@ -1,9 +1,11 @@
 """Reader chat: talk about the story under its text.
 
-The conversation lives in the reader page. Every message sends the whole
-history, the server adds the context and streams the answer back, and nothing
-is stored: a discussion reaches the server's storage only as the PDF that
-Save attaches to the Linkwarden link.
+The conversation lives in the reader page, which keeps it on the device.
+Every message sends the whole history, the server adds the context and
+writes the answer as a background job the page follows: a page that goes
+away mid-answer fetches it again when it comes back. The answer is held in
+memory only, for an hour after it is done; a discussion reaches the server's
+storage only as the PDF that Save attaches to the Linkwarden link.
 
 The context is built here from the database, never taken from the page: the
 whole article as the reader shows it (in the language on screen), the card
@@ -20,6 +22,8 @@ import io
 import json
 import logging
 import re
+import secrets
+import time
 from collections.abc import AsyncIterator
 from typing import Any, Literal
 
@@ -323,6 +327,65 @@ class Chat:
             "query": query,
             "results": [{"title": r["title"], "url": r["url"]} for r in results],
         }
+
+
+class ChatJob:
+    """One answer the server writes whether or not a page is listening: its
+    events so far, kept in memory until ``JOB_TTL_S`` after the end, so a
+    page that went away can fetch the answer again."""
+
+    def __init__(self, candidate_id: int) -> None:
+        self.candidate_id = candidate_id
+        self.events: list[dict] = []
+        self.finished_at: float | None = None
+        self._changed = asyncio.Event()
+
+    async def run(self, events: AsyncIterator[dict]) -> None:
+        try:
+            async for event in events:
+                self.events.append(event)
+                self._changed.set()
+        finally:
+            self.finished_at = time.monotonic()
+            self._changed.set()
+
+    async def follow(self) -> AsyncIterator[dict]:
+        """Every event from the first, then the new ones until the end."""
+        sent = 0
+        while True:
+            while sent < len(self.events):
+                yield self.events[sent]
+                sent += 1
+            if self.finished_at is not None:
+                return
+            self._changed.clear()
+            await self._changed.wait()
+
+
+JOB_TTL_S = 3600.0
+_jobs: dict[str, ChatJob] = {}
+
+
+def _prune_jobs() -> None:
+    cutoff = time.monotonic() - JOB_TTL_S
+    for job_id, job in list(_jobs.items()):
+        if job.finished_at is not None and job.finished_at < cutoff:
+            del _jobs[job_id]
+
+
+def start_job(candidate_id: int, events: AsyncIterator[dict]) -> tuple[str, ChatJob]:
+    """Write the answer in the background; the id lets a page follow it."""
+    _prune_jobs()
+    job_id = secrets.token_urlsafe(16)
+    job = _jobs[job_id] = ChatJob(candidate_id)
+    _in_background(job.run(events))
+    return job_id, job
+
+
+def find_job(candidate_id: int, job_id: str) -> ChatJob | None:
+    _prune_jobs()
+    job = _jobs.get(job_id)
+    return job if job is not None and job.candidate_id == candidate_id else None
 
 
 def _link_id(settings: Settings, url: str) -> int | None:

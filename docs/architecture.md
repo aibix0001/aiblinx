@@ -111,8 +111,15 @@ question; the page shows each search with its result links. Nothing fetches
 the result pages. Without SearXNG, or when the model endpoint does not support
 tools, the chat answers from the story alone.
 
-The conversation lives in the page and nothing about it is stored or logged:
-closing the page ends it. When Linkwarden is connected, **Save** sends the
+The server writes each answer as a background job, so it finishes even when
+you leave the page mid-answer. The stream's first event is the job id; the
+page keeps it, and `GET /read/{id}/chat/{job}` replays the answer from its
+first event. A job lives in the server's memory only, until an hour after the
+answer is done, and nothing about the conversation is logged or written to
+the database. The page keeps the conversation on the device (`localStorage`,
+key `chat:<story id>`) for 30 days and at most 50 stories, so you can come
+back to a story later, see the answer that came in meanwhile and go on
+talking. When Linkwarden is connected, **Save** sends the
 conversation along. aiblinx renders one PDF (the story, the summary, the
 why-line, then the conversation with its searches) and uploads it into the
 Linkwarden link's PDF slot. A link has one PDF, so this one replaces the page
@@ -123,7 +130,7 @@ title image, else Linkwarden's own screenshot of the page once it exists
 (within two minutes). For a story saved earlier, **Attach this discussion** sends
 the PDF again and replaces the previous one. If the upload fails, the save
 still counts and the page says so. Without Linkwarden there is nowhere to
-attach it, and the conversation is gone when you leave.
+attach it, and the conversation stays only on the device.
 
 The chat keeps the model's reasoning on and its own sampling settings, with a
 presence penalty against loops and no cap on the reply length.
@@ -158,7 +165,8 @@ app, restore the copy and set the old model again.
 | POST | `/feed/{id}/promote` | file an Exploring story as a main interest |
 | POST | `/feed/{id}/explore` | file a "For you" story under Exploring, and less like it |
 | GET | `/read/{id}` | reader view (or a redirect to the original) |
-| POST | `/read/{id}/chat` | `{messages, lang}`: one chat answer about the story, as server-sent events |
+| POST | `/read/{id}/chat` | `{messages, lang}`: one chat answer about the story, as server-sent events; the first event is the job id |
+| GET | `/read/{id}/chat/{job}` | the same answer again from its first event, until an hour after it is done |
 | GET | `/feed/version` | the current cycle, so an open feed page reloads when a newer one exists |
 | GET / POST / DELETE | `/feeds`, `/feeds/{id}` | list, add (`{url}`) and remove subscribed feeds |
 | GET / POST | `/topics`, `/topics/{name}` | Exploring topics |

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.0
+
+- **Leave the chat and come back:** an answer keeps being written when you
+  leave the reader for another story, and the discussion stays on your device
+  for 30 days. Open the story again to see the answer and go on talking. The
+  server holds an answer in memory only, for an hour after it is done.
+
 ## 0.4.0
 
 - **Talk about a story:** the reader has a chat under the article. The model

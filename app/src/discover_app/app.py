@@ -23,10 +23,13 @@ from fastapi.responses import (
 from .auth import feed_token, password_ok, require_login, set_session
 from .chat import (
     Chat,
+    ChatJob,
     ChatRequest,
     SaveRequest,
     article_text,
     attach_discussion,
+    find_job,
+    start_job,
     story,
     system_prompt,
 )
@@ -545,10 +548,25 @@ def create_app() -> FastAPI:
             headers={"Referrer-Policy": "no-referrer", "Cache-Control": "no-store"},
         )
 
+    def _follow(job: ChatJob, job_id: str | None = None) -> StreamingResponse:
+        async def events():
+            if job_id is not None:
+                yield f'data: {{"type": "job", "id": "{job_id}"}}\n\n'
+            async for event in job.follow():
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+        return StreamingResponse(
+            events(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+        )
+
     @app.post("/read/{candidate_id}/chat", include_in_schema=False)
     async def read_chat(candidate_id: int, body: ChatRequest) -> StreamingResponse:
         """One chat message about the story: the answer streamed as
-        server-sent events. Nothing is stored or logged about the talk."""
+        server-sent events, the first one the job id to follow it again
+        with. The server finishes the answer when the page goes away; it is
+        held in memory only, and nothing is logged about the talk."""
         settings = get_settings()
         if not settings.chat_enabled:
             raise HTTPException(status_code=404, detail="the reader chat is off")
@@ -558,29 +576,35 @@ def create_app() -> FastAPI:
             item = story(settings, candidate_id)
         except LookupError as exc:
             raise HTTPException(status_code=404, detail="no such item") from exc
-        text = await article_text(settings, item, body.lang)
-        searxng = SearxngClient(settings) if settings.searxng_url else None
-        system = system_prompt(item, text, search=searxng is not None)
 
-        async def events():
+        async def answer():
             llm = LLMClient(settings)  # its own client: never queued behind the cycle
+            searxng = SearxngClient(settings) if settings.searxng_url else None
             try:
+                text = await article_text(settings, item, body.lang)
+                system = system_prompt(item, text, search=searxng is not None)
                 async for event in Chat(llm, searxng, system, body.messages).run():
-                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                    yield event
             except Exception as exc:  # noqa: BLE001 - the page shows it; never the text
                 log.warning("reader chat: the model call failed: %s", type(exc).__name__)
-                yield 'data: {"type": "error"}\n\n'
+                yield {"type": "error"}
             finally:
                 await llm.aclose()
                 if searxng is not None:
                     await searxng.aclose()
-            yield 'data: {"type": "done"}\n\n'
+            yield {"type": "done"}
 
-        return StreamingResponse(
-            events(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
-        )
+        job_id, job = start_job(candidate_id, answer())
+        return _follow(job, job_id)
+
+    @app.get("/read/{candidate_id}/chat/{job_id}", include_in_schema=False)
+    async def read_chat_job(candidate_id: int, job_id: str) -> StreamingResponse:
+        """An answer again, from its first event: for a page that went away
+        while the server was writing it. Gone an hour after it was done."""
+        job = find_job(candidate_id, job_id) if get_settings().chat_enabled else None
+        if job is None:
+            raise HTTPException(status_code=404, detail="no such answer")
+        return _follow(job)
 
     @app.post("/feed/{candidate_id}/save", response_model=CaptureResponse)
     async def feed_save(candidate_id: int, body: SaveRequest | None = None) -> CaptureResponse:
