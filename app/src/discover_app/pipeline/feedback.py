@@ -27,6 +27,7 @@ from ..clients.linkwarden import LinkwardenClient
 from ..config import Settings
 from ..db import connection, get_meta, set_meta
 from ..urls import norm_url
+from .holds import release_hold
 
 log = logging.getLogger(__name__)
 
@@ -178,7 +179,9 @@ async def capture_candidate(
     state written (retry is safe).
     """
     async with _capture_lock:
-        return await _capture(settings, candidate_id, linkwarden, section=None)
+        result = await _capture(settings, candidate_id, linkwarden, section=None)
+    release_hold(settings, candidate_id)  # saved now: no longer held for later
+    return result
 
 
 async def promote_candidate(
@@ -192,6 +195,7 @@ async def promote_candidate(
     """
     async with _capture_lock:
         link_id = await _file_as(settings, candidate_id, "curated", linkwarden)
+    release_hold(settings, candidate_id)
     log.info("promote: candidate %d filed under the main interests", candidate_id)
     return {"status": "promoted", "linkwarden_id": link_id}
 
@@ -207,6 +211,7 @@ async def explore_candidate(
     """
     async with _capture_lock:
         link_id = await _file_as(settings, candidate_id, "broad", linkwarden)
+    release_hold(settings, candidate_id)
     record_feedback(settings, candidate_id, "interest", "down")
     log.info("explore: candidate %d filed under Exploring", candidate_id)
     return {"status": "saved_to_exploring", "linkwarden_id": link_id}

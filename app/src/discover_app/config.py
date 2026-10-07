@@ -110,15 +110,32 @@ class Settings(BaseSettings):
     reader_chat: bool = True
 
     # --- ranking ---
-    knn_k: int = 50
+    # Nearest stories per interest centroid. Most of them were served in an
+    # earlier cycle and are excluded, so this must be well above RERANK_TOP_N
+    # / centroids or the shortlist starves (50 left 46 unserved stories).
+    knn_k: int = 200
     # Interest clusters. Unset: scales with the profile (see cluster_count);
     # a number fixes it.
     profile_clusters: int | None = Field(default=None, ge=1)
     mmr_lambda: float = Field(default=0.6, ge=0.0, le=1.0)
     feed_size: int = 30
     llm_rerank: bool = True
-    rerank_top_n: int = Field(default=50, ge=1)  # top ~50 by similarity go to the LLM
+    # Shortlist: the top N by similarity go to the LLM (in chunks of 50). Keep
+    # it well above the curated slots, or the ranking has nothing to choose.
+    rerank_top_n: int = Field(default=150, ge=1)
+    # Floors: a thin day gives a shorter "For you", never filler. A story must
+    # be at least this cosine-close to some interest centroid (raw, before
+    # centroid weights). Embedder-dependent like min_assign_sim, so off (0) by
+    # default: with snowflake-arctic-embed2, 90% of saved stories score 0.38+;
+    # qwen3-embedding-0.6b cosines run higher (feedback median 0.65).
+    min_similarity: float = Field(default=0.0, ge=0.0, le=1.0)
+    # ...and the chat model must score its fit with the user's interests at
+    # least this high (0..1); stories it never scored are kept.
+    min_relevance: float = Field(default=0.3, ge=0.0, le=1.0)
     candidate_max_age_days: int = Field(default=14, ge=1)  # prune + freshness window
+    # "Save for later": a held story stays in the Bookmarks tab this long,
+    # counted from the hold; its candidate is kept from the prune meanwhile.
+    hold_days: int = Field(default=14, ge=1)
     # Exponential age-decay half-life for feedback signals in the centroid
     # weight recompute (online re-weighting with decay, no retraining).
     feedback_half_life_days: float = Field(default=30.0, gt=0.0)

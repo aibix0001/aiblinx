@@ -25,7 +25,7 @@ The interest profile is built from the pages you keep, one point per page:
 
 The points are clustered with k-means into interests: about √(points / 2)
 clusters, at least 8 and at most 32. Each interest's weight comes from your
-taps: a save counts +2, more like this +1, less like this −1, and each signal
+taps: a save counts +1, more like this +1, less like this −1, and each signal
 loses half its weight every 30 days. Nothing is retrained; the profile is
 recomputed from the log every cycle. Votes act on what a story is about, never
 on the site it came from.
@@ -56,9 +56,12 @@ step is isolated, so one failing source never costs you the day's feed.
    picked, SearXNG. Drop duplicates, advertorials and stories older than 14
    days, then embed the new ones.
 4. **Profile:** rebuild the interest clusters and their weights.
-5. **Rank:** shortlist stories close to your interests. The chat model, if
-   configured, re-reads the top 50 and writes one line on why each fits.
-   Maximal Marginal Relevance then thins out near-duplicates.
+5. **Rank:** shortlist stories close to your interests, minus stories closer
+   to one you voted down than to anything you keep. The chat model, if
+   configured, re-reads the top 150 against your interests (shown to it as
+   titles of pages you keep) and writes one line on why each fits. Stories it
+   scores as unrelated are dropped: a thin day gives a shorter feed, not
+   filler. Maximal Marginal Relevance then thins out near-duplicates.
 6. **Explore:** fill 30% of the slots from your chosen topics, picked by an
    epsilon-greedy bandit (20% exploration) that learns from what you save
    there. Without a profile yet, Exploring gets every slot.
@@ -199,9 +202,12 @@ values count as unset.
 | `FEED_SYNC_MIN_LINKS` / `FEED_SYNC_PER_CYCLE` | `2` / `20` | |
 | `FEED_SIZE` / `BROAD_RATIO` / `EPSILON` | `30` / `0.3` / `0.2` | feed length, Exploring share, bandit exploration |
 | `PROFILE_CLUSTERS` | *(adaptive)* | interest clusters; unset = √(profile points / 2), 8–32; a number fixes it |
-| `RERANK_TOP_N` | `50` | stories sent to the chat model |
+| `RERANK_TOP_N` | `150` | stories sent to the chat model, 50 per prompt |
+| `MIN_SIMILARITY` | `0` (off) | similarity to your interests a story needs; depends on the embedding model |
+| `MIN_RELEVANCE` | `0.3` | chat model score a story needs; below it the slot stays empty |
 | `FEEDBACK_HALF_LIFE_DAYS` | `30` | decay of taps |
 | `CANDIDATE_MAX_AGE_DAYS` | `14` | freshness window |
+| `HOLD_DAYS` | `14` | days a story saved for later stays in the Bookmarks tab |
 | `AD_FILTER_PATTERNS` | `anzeige:`, `advertorial`, `sponsored` | title substrings dropped |
 | `POLL_CRON` / `CYCLE_CRON` | `7-59/15 * * * *` / `0 6 * * *` | UTC |
 | `LINK_TARGET` | `same` | `new` opens articles in a new tab |

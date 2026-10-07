@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.6.0
+
+- **Save for later:** a paper button on every card and in the reader keeps
+  a story in the new Bookmarks tab for 14 days, without teaching your feed
+  anything and without adding it to Linkwarden. From the tab, Save it for
+  good or Remove it. Unread holds go after 14 days (`HOLD_DAYS`).
+- **Icon tabs and buttons:** the tabs are a heart (For you), a globe
+  (Exploring) and a sheet of paper (Bookmarks). Card actions are five equal
+  icon buttons: Save, Save to Exploring or Promote, Save for later, up, down.
+- **Saves weigh less:** a save now counts +1 for its interest, the same as
+  ↑, instead of +2.
+- **Fade time you can set:** `FEEDBACK_HALF_LIFE_DAYS` (how fast saves and
+  votes fade, default 30 days) and `HOLD_DAYS` now reach the app when set in
+  `.env`; before, Compose dropped them.
+- **"For you" knows what you like:** the ranking model now sees your
+  interests (titles of the pages you keep) and your latest ↓, and stories it
+  scores below `MIN_RELEVANCE` (0.3) are left out: a thin day gives a shorter
+  feed, not filler. A story closer to one you voted down than to anything you
+  keep is dropped.
+- **Cleaner interests:** bookmarks are embedded from their own text, so a
+  site's error, login or cookie page no longer becomes an interest that
+  matches everything.
+
 ## 0.5.0
 
 - **Leave the chat and come back:** an answer keeps being written when you

@@ -163,6 +163,14 @@ CREATE TABLE IF NOT EXISTS saves (
     section       TEXT NOT NULL DEFAULT 'curated' -- 'broad': Exploring save, own collection
 );
 
+-- "Save for later": stories the owner holds to read later. A hold is no
+-- signal: profile, ranking and Linkwarden never read this table. It keeps
+-- its candidate (and reader text) from the prune until it expires.
+CREATE TABLE IF NOT EXISTS holds (
+    candidate_id INTEGER PRIMARY KEY REFERENCES candidates(id),
+    held_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- Pages imported on the setup page (browser bookmarks export, pasted URLs):
 -- profile points like bookmarks, for installs without Linkwarden. They are
 -- not saves, so they are neither listed in Saved nor pushed to Linkwarden.

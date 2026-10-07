@@ -30,16 +30,17 @@ from sklearn.cluster import KMeans
 from ..config import Settings, get_settings
 from ..db import connection
 from ..urls import norm_url
+from .embedding import link_texts
 from .feedback import known_explore_collection
 
 log = logging.getLogger(__name__)
 
-# Signal strength per event kind. A save is the strongest positive (the
-# save-back is the core signal); thumbs adjust more gently; mood is a filter
-# facet, never a relevance signal, and is excluded in the SQL below.
-# Ratings follow the same scale: +1.0 ≈ save (2.0), +0.5 ≈ up (1.0),
-# 0.0 is neutral (no contribution), -0.5 ≈ down (-1.0), -1.0 is strongly negative (-2.0).
-_SAVED_BASE = 2.0
+# Signal strength per event kind. A save counts the same as an upvote (+1,
+# owner's call 2026-10-07: +2 pulled "For you" too hard toward each save);
+# mood is a filter facet, never a relevance signal, and is excluded in the
+# SQL below. Legacy ratings (no longer in the UI) keep their own scale:
+# +1.0 → 2.0, +0.5 → 1.0, 0.0 → none, -0.5 → -1.0, -1.0 → -2.0.
+_SAVED_BASE = 1.0
 _INTEREST_BASE = {"up": 1.0, "down": -1.0}
 _RATING_BASE: dict[float, float] = {
     1.0: 2.0,
@@ -54,46 +55,65 @@ _RATING_BASE: dict[float, float] = {
 _WEIGHT_FLOOR = 0.25
 
 
-def _load_profile_vectors(conn, dim: int, explore_collection: int | None = None) -> np.ndarray:
-    """The points the interest clusters are built from, one per page:
+def load_kept_pages(
+    conn, dim: int, explore_collection: int | None = None
+) -> tuple[list[str], np.ndarray]:
+    """The pages the user keeps, one per page, as ``(titles, vectors)``:
     Linkwarden bookmarks (when connected), the local Saved list, pages
     imported on the setup page, and pages the user upvoted (latest vote per
-    page). Linkwarden is optional, so an install
-    without it builds its profile from saves and upvotes alone. Vectors from a
-    previous embedder (other dimension) are skipped. Exploring saves and
-    upvotes, and links in the Exploring collection, are not interests."""
+    page). Linkwarden is optional, so an install without it builds its
+    profile from saves and upvotes alone. Vectors from a previous embedder
+    (other dimension) are skipped. Exploring saves and upvotes, and links in
+    the Exploring collection, are not interests. A page without a title is
+    named by its URL."""
     seen: set[str] = set()
+    titles: list[str] = []
     vectors: list[np.ndarray] = []
 
-    def add(url_key: str, blob: bytes | None) -> None:
+    def add(url_key: str, title: str | None, blob: bytes | None) -> None:
         if not blob or url_key in seen:
             return
         vec = np.frombuffer(blob, dtype=np.float32)
         if vec.shape[0] == dim:
             seen.add(url_key)
+            titles.append(title or url_key)
             vectors.append(vec)
 
+    # A link is named by the text it was embedded from, which leaves out
+    # site-wide names such as "Golem.de: IT-News für Profis".
+    links = conn.execute(
+        "SELECT id, url, name, description, text_content, embedding, collection_id FROM links"
+    ).fetchall()
+    own_text = link_texts(links)[0]
+    for row in links:
+        if row["embedding"] is not None and (
+            explore_collection is None or row["collection_id"] != explore_collection
+        ):
+            add(norm_url(row["url"]), own_text[row["id"]], row["embedding"])
     for row in conn.execute(
-        "SELECT url, embedding FROM links WHERE embedding IS NOT NULL "
-        "AND (:explore IS NULL OR collection_id IS NOT :explore)",
-        {"explore": explore_collection},
+        "SELECT url_key, title, embedding FROM saves "
+        "WHERE embedding IS NOT NULL AND section = 'curated'"
     ):
-        add(norm_url(row["url"]), row["embedding"])
+        add(row["url_key"], row["title"], row["embedding"])
     for row in conn.execute(
-        "SELECT url_key, embedding FROM saves WHERE embedding IS NOT NULL AND section = 'curated'"
+        "SELECT url_key, title, embedding FROM imports WHERE embedding IS NOT NULL"
     ):
-        add(row["url_key"], row["embedding"])
-    for row in conn.execute("SELECT url_key, embedding FROM imports WHERE embedding IS NOT NULL"):
-        add(row["url_key"], row["embedding"])
+        add(row["url_key"], row["title"], row["embedding"])
     for row in conn.execute(
-        "SELECT f.url, f.embedding FROM feedback f WHERE f.embedding IS NOT NULL "
+        "SELECT f.url, c.title, f.embedding FROM feedback f "
+        "LEFT JOIN candidates c ON c.id = f.candidate_id WHERE f.embedding IS NOT NULL "
         "AND f.value = 'up' AND f.section = 'curated' AND f.id IN ("
         "  SELECT MAX(id) FROM feedback WHERE axis = 'interest' GROUP BY url)"
     ):
-        add(row["url"], row["embedding"])
+        add(row["url"], row["title"], row["embedding"])
     if not vectors:
-        return np.empty((0, dim), dtype=np.float32)
-    return np.vstack(vectors)
+        return [], np.empty((0, dim), dtype=np.float32)
+    return titles, np.vstack(vectors)
+
+
+def _load_profile_vectors(conn, dim: int, explore_collection: int | None = None) -> np.ndarray:
+    """The points the interest clusters are built from: the kept pages."""
+    return load_kept_pages(conn, dim, explore_collection)[1]
 
 
 def _centroid_weights(

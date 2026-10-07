@@ -20,6 +20,7 @@ from ..config import Settings, get_settings
 from ..db import connection
 from ..topics import selected_topics
 from .embedding import embed_pending_candidates
+from .holds import gc_holds
 
 log = logging.getLogger(__name__)
 
@@ -32,14 +33,17 @@ def prune_candidates(settings: Settings) -> int:
         "%Y-%m-%d %H:%M:%S"
     )
     with connection(settings) as conn:
+        gc_holds(conn, settings)
         # Never prune what the currently published cycle is serving — the live
-        # feed must stay intact even if the next build_feed produces nothing.
+        # feed must stay intact even if the next build_feed produces nothing —
+        # nor a story held for later.
         ids = [
             row[0]
             for row in conn.execute(
                 "SELECT id FROM candidates WHERE fetched_at < ? AND id NOT IN ("
                 "  SELECT candidate_id FROM feed_items WHERE cycle_ts = "
-                "    (SELECT value FROM meta WHERE key = 'last_cycle_ts'))",
+                "    (SELECT value FROM meta WHERE key = 'last_cycle_ts')) "
+                "AND id NOT IN (SELECT candidate_id FROM holds)",
                 (cutoff,),
             )
         ]

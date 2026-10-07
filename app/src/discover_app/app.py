@@ -72,6 +72,7 @@ from .pipeline.feedback import (
     served_section,
 )
 from .pipeline.feeds import add_feed, list_feeds, remove_feed
+from .pipeline.holds import held_ids, hold_candidate, list_holds, release_hold
 from .pipeline.miniflux_key import ensure_miniflux_token, miniflux_configured
 from .pipeline.output import current_items, render_atom, render_markdown
 from .reader import (
@@ -224,19 +225,23 @@ def create_app() -> FastAPI:
             ]
             has_profile = conn.execute("SELECT COUNT(*) FROM profile").fetchone()[0] > 0
             cycle = get_meta(conn, "last_cycle_ts") or ""
+            settings = get_settings()
+            held = held_ids(conn, settings)
+            holds = list_holds(conn, settings)
         for item in curated + broad:
+            item["held"] = item["candidate_id"] in held
             key = norm_url(item["url"] or "")
             item["saved"] = key in saved
             item["interest"] = interest.get(key)
             item["promoted"] = key in promoted
             item["explored"] = key in explored
-        settings = get_settings()
         page = render_page(
             curated,
             list_topics(settings),
             broad=broad,
             new_tab=settings.link_target == "new",
             saves=saves,
+            holds=holds,
             linkwarden=settings.linkwarden_enabled,
             has_profile=has_profile,
             cycle=cycle,
@@ -500,6 +505,7 @@ def create_app() -> FastAPI:
                 promoted, explored = bool(filed and filed[0] == "curated"), None
             else:
                 promoted, explored = None, bool(filed and filed[0] == "broad")
+            held = candidate_id in held_ids(conn, settings)
             prepared = conn.execute(
                 "SELECT lang, body, title_tr, body_tr FROM articles WHERE candidate_id = ?",
                 (candidate_id,),
@@ -542,6 +548,7 @@ def create_app() -> FastAPI:
                 linkwarden=settings.linkwarden_enabled,
                 promoted=promoted,
                 explored=explored,
+                held=held,
                 translation=translation,
                 chat=settings.chat_enabled,
             ),
@@ -654,6 +661,22 @@ def create_app() -> FastAPI:
                 status_code=502, detail=f"Linkwarden rejected the save: {exc}"
             ) from exc
         return CaptureResponse(**result)
+
+    @app.post("/feed/{candidate_id}/hold")
+    def feed_hold(candidate_id: int) -> dict:
+        """Save for later: keep the story in the Bookmarks tab for
+        ``hold_days``. No signal and no Linkwarden (idempotent)."""
+        try:
+            status = hold_candidate(get_settings(), candidate_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"status": status, "candidate_id": candidate_id}
+
+    @app.delete("/feed/{candidate_id}/hold")
+    def feed_release(candidate_id: int) -> dict:
+        """Remove a story from the Bookmarks tab (idempotent)."""
+        release_hold(get_settings(), candidate_id)
+        return {"status": "released", "candidate_id": candidate_id}
 
     @app.post("/feed/{candidate_id}/interest", response_model=FeedbackResponse)
     async def feed_interest(candidate_id: int, body: FeedbackRequest) -> FeedbackResponse:

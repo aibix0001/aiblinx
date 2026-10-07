@@ -84,7 +84,7 @@ class _FakeRerankLLM:
     def __init__(self, response: str) -> None:
         self.response = response
 
-    async def chat(self, messages, temperature: float = 0.0) -> str:
+    async def chat(self, messages, temperature: float = 0.0, **kwargs) -> str:
         return self.response
 
     async def aclose(self) -> None:
@@ -556,8 +556,8 @@ def test_reweight_saved_signal_boosts_nearest_centroid(tmp_path):
     with connection(settings2) as conn:
         rows = conn.execute("SELECT weight, vector FROM profile ORDER BY weight DESC").fetchall()
     assert rows[0]["weight"] > rows[1]["weight"]  # cluster A got the signal
-    # pin the calculus: base 1.0 + saved 2.0 + up 1.0, fresh events (decay ~ 1)
-    assert abs(rows[0]["weight"] - 4.0) < 0.01
+    # pin the calculus: base 1.0 + saved 1.0 + up 1.0, fresh events (decay ~ 1)
+    assert abs(rows[0]["weight"] - 3.0) < 0.01
     assert rows[1]["weight"] == 1.0  # untouched cluster keeps base weight
     # the boosted centroid is the one pointing at cluster A's region
     top_vec = np.frombuffer(rows[0]["vector"], dtype=np.float32)
@@ -1640,7 +1640,7 @@ def test_ui_cards_image_summary_and_restored_state(tmp_path, monkeypatch):
     assert "A page description that is long enough" in page  # thin snippet replaced
     assert "because &amp; why" in page
     card1 = page[page.index('id="c1"') : page.index('id="c2"')]
-    assert "<span>Saved</span>" in card1 and 'class="vote on"' in card1
+    assert 'aria-label="Saved"' in card1 and 'class="vote on"' in card1
     card2 = page[page.index('id="c2"') : page.index('id="c3"')]
     assert "data-down" in card2  # downvoted card stays collapsed after reload
 
@@ -2391,7 +2391,7 @@ def test_ui_start_state_and_saved_list_without_linkwarden(tmp_path, monkeypatch)
     # Exploring opens first while "For you" is empty
     assert 'aria-selected="true" data-panel="broad"' in page
     assert '<section class="panel" id="curated" hidden>' in page
-    assert ">Saved<" in page
+    assert 'aria-label="Saved"' in page
     assert "Saved · 1" in page and ">Exploring story</a>" in page
     assert "Kept on this server" in page
 
@@ -3177,7 +3177,7 @@ def test_ui_remembers_the_open_tab_in_the_fragment():
 
     page = render_page([], [], broad=[], saves=[])
     assert "history.replaceState(null, '', panel === 'curated'" in page
-    assert "['broad', 'saved'].includes(location.hash.slice(1))" in page
+    assert "['broad', 'held', 'saved'].includes(location.hash.slice(1))" in page
 
 
 def test_cluster_count_scales_with_the_profile():
@@ -4204,3 +4204,311 @@ def test_jpeg_rejects_what_is_not_a_picture():
     from discover_app.chat import _jpeg
 
     assert _jpeg(b"<html>not a picture</html>") is None
+
+
+class _RecordingRerankLLM(_FakeRerankLLM):
+    """Records each re-rank prompt; replies from a list, one per call (an
+    Exception entry is raised instead)."""
+
+    def __init__(self, replies: list) -> None:
+        super().__init__("")
+        self.replies = replies
+        self.prompts: list[str] = []
+
+    async def chat(self, messages, temperature: float = 0.0, **kwargs) -> str:
+        self.prompts.append(messages[0]["content"])
+        reply = self.replies[min(len(self.prompts), len(self.replies)) - 1]
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+
+def _add_downvote(conn: sqlite3.Connection, url_key: str, vec: list[float]) -> None:
+    conn.execute(
+        "INSERT INTO feedback(candidate_id, url, axis, value, embedding, section) "
+        "VALUES(NULL, ?, 'interest', 'down', ?, 'curated')",
+        (url_key, sqlite_vec.serialize_float32(vec)),
+    )
+
+
+async def test_rerank_prompt_shows_kept_and_rejected_titles(tmp_path):
+    settings = _settings(tmp_path)
+    init_db(settings)
+    with connection(settings) as conn:
+        _add_centroid(conn, [1.0, 0, 0, 0])
+        _add_link_vec(conn, 1, "https://kept.example/k8s", [1.0, 0, 0, 0])
+        conn.execute("UPDATE links SET name = 'Kubernetes operators in depth' WHERE id = 1")
+        _add_downvote(conn, "news.example/bundestag", [0, 0, 1.0, 0])
+        _add_candidate(conn, 1, "https://hn.example/a", "Operator patterns", [0.9, 0.1, 0, 0])
+    llm = _RecordingRerankLLM(['[{"i": 0, "score": 0.9, "why": "k8s"}]'])
+    assert await build_feed(settings, llm) == 1
+    (prompt,) = llm.prompts
+    assert "Kubernetes operators in depth" in prompt  # the interest, by a kept page
+    assert "news.example/bundestag" in prompt  # rejected story, by URL without a title
+    assert "0. Operator patterns" in prompt
+
+
+async def test_rerank_chunks_the_shortlist_and_survives_a_failed_chunk(tmp_path):
+    settings = _settings(tmp_path, knn_k=200, rerank_top_n=120, feed_size=200)
+    init_db(settings)
+    with connection(settings) as conn:
+        _add_centroid(conn, [1.0, 0, 0, 0])
+        for i in range(120):
+            _add_candidate(
+                conn, i + 1, f"https://hn.example/{i}", f"story {i}", [1.0, i / 200, 0, 0]
+            )
+    low = "[" + ",".join(f'{{"i": {i}, "score": 0.1}}' for i in range(50)) + "]"
+    llm = _RecordingRerankLLM([low, RuntimeError("endpoint down"), low])
+    wrote = await build_feed(settings, llm)
+    assert len(llm.prompts) == 3  # 50 + 50 + 20
+    # chunks 1 and 3 scored everything below MIN_RELEVANCE; the failed chunk
+    # keeps its 50 stories on similarity
+    assert wrote == 50
+
+
+async def test_min_relevance_drops_low_scores_but_keeps_unscored(tmp_path):
+    settings = _settings(tmp_path)
+    init_db(settings)
+    with connection(settings) as conn:
+        _add_centroid(conn, [1.0, 0, 0, 0])
+        _add_candidate(conn, 1, "https://hn.example/a", "fits", [1.0, 0, 0, 0])
+        _add_candidate(conn, 2, "https://hn.example/b", "general news", [0.9, 0.1, 0, 0])
+        _add_candidate(conn, 3, "https://hn.example/c", "not scored", [0.8, 0.2, 0, 0])
+    llm = _RecordingRerankLLM(['[{"i": 0, "score": 0.9}, {"i": 1, "score": 0.15}]'])
+    assert await build_feed(settings, llm) == 2
+    with connection(settings) as conn:
+        ids = {r[0] for r in conn.execute("SELECT candidate_id FROM feed_items")}
+    assert ids == {1, 3}
+
+
+async def test_min_similarity_floor_leaves_slots_empty(tmp_path):
+    settings = _settings(tmp_path, min_similarity=0.5)
+    init_db(settings)
+    with connection(settings) as conn:
+        _add_centroid(conn, [1.0, 0, 0, 0])
+        _add_candidate(conn, 1, "https://hn.example/a", "close", [1.0, 0, 0, 0])
+        _add_candidate(conn, 2, "https://hn.example/b", "far", [0.3, 0.954, 0, 0])
+    assert await build_feed(settings, _FakeRerankLLM("garbage")) == 1
+    with connection(settings) as conn:
+        ids = [r[0] for r in conn.execute("SELECT candidate_id FROM feed_items")]
+    assert ids == [1]
+
+
+async def test_story_nearer_a_downvote_than_any_kept_page_is_dropped(tmp_path):
+    settings = _settings(tmp_path)
+    init_db(settings)
+    with connection(settings) as conn:
+        _add_centroid(conn, [1.0, 0, 0, 0])
+        _add_link_vec(conn, 1, "https://kept.example/a", [1.0, 0, 0, 0])
+        _add_downvote(conn, "news.example/politics", [0.6, 0.8, 0, 0])
+        _add_candidate(conn, 1, "https://hn.example/a", "like a kept page", [0.95, 0.31, 0, 0])
+        _add_candidate(conn, 2, "https://hn.example/b", "like the downvote", [0.62, 0.78, 0, 0])
+    assert await build_feed(settings, _FakeRerankLLM("garbage")) == 1
+    with connection(settings) as conn:
+        ids = [r[0] for r in conn.execute("SELECT candidate_id FROM feed_items")]
+    assert ids == [1]
+
+
+async def test_rerank_turns_thinking_off_and_retries_without_it(tmp_path):
+    from openai import BadRequestError
+
+    settings = _settings(tmp_path)
+    init_db(settings)
+    with connection(settings) as conn:
+        _add_centroid(conn, [1.0, 0, 0, 0])
+        _add_candidate(conn, 1, "https://hn.example/a", "fits", [1.0, 0, 0, 0])
+
+    class _Strict(_RecordingRerankLLM):
+        async def chat(self, messages, temperature: float = 0.0, **kwargs) -> str:
+            if "extra_body" in kwargs:
+                assert kwargs["extra_body"]["chat_template_kwargs"] == {"enable_thinking": False}
+                request = httpx.Request("POST", "http://llm/v1/chat/completions")
+                raise BadRequestError(
+                    "unknown field", response=httpx.Response(400, request=request), body=None
+                )
+            return await super().chat(messages, temperature)
+
+    llm = _Strict(['<think>hm</think>[{"i": 0, "score": 0.9, "why": "fits"}]'])
+    assert await build_feed(settings, llm) == 1
+    with connection(settings) as conn:
+        reason = conn.execute("SELECT reason FROM feed_items").fetchone()[0]
+    assert reason == "fits"  # scored by the retry, reasoning stripped
+
+
+class _RecordingEmbedLLM(_FakeEmbedLLM):
+    def __init__(self) -> None:
+        super().__init__()
+        self.texts: list[str] = []
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        self.texts.extend(texts)
+        return await super().embed(texts)
+
+
+_SITE_WALL = "Cookies zustimmen Besuchen Sie die Seite wie gewohnt mit Werbung und Tracking. " * 8
+_LINK_ARTICLE = "Kubernetes operators reconcile desired state with a control loop. " * 10
+
+
+def _add_link_text(conn, link_id: int, url: str, name: str | None, text: str | None, desc=None):
+    conn.execute(
+        "INSERT INTO links(id, url, name, description, text_content) VALUES(?, ?, ?, ?, ?)",
+        (link_id, url, name, desc, text),
+    )
+
+
+async def test_links_embed_from_their_own_text_not_a_sites_wall(tmp_path):
+    from discover_app.pipeline.embedding import embed_pending_links
+
+    settings = _settings(tmp_path)
+    init_db(settings)
+    with connection(settings) as conn:
+        for i, slug in enumerate(["rust-compiler-gets-faster", "linux-kernel-drops-old-cpus", "x"]):
+            _add_link_text(
+                conn, i + 1, f"https://golem.example/news/{slug}-2511-1.html", "Golem", _SITE_WALL
+            )
+        _add_link_text(conn, 10, "https://blog.example/k8s", "Operators", _LINK_ARTICLE)
+        _add_link_text(
+            conn,
+            11,
+            "https://cnbc.example/2026/01/28/tesla-ends-model-s.html",
+            "Tesla ends Model S",
+            "Access Denied. You don't have permission.",
+        )
+        _add_link_text(
+            conn,
+            12,
+            "https://x.example/someone/status/2044051379916882067",
+            None,
+            "Something went wrong, but don't fret.",
+        )
+    llm = _RecordingEmbedLLM()
+    assert await embed_pending_links(settings, llm) == 4
+    joined = "\n".join(llm.texts)
+    assert "Cookies zustimmen" not in joined and "Golem" not in joined  # shared by 3: the site's
+    assert "rust compiler gets faster" in joined  # the URL slug names the topic instead
+    assert "Access Denied" not in joined  # too short to be an article
+    assert "Tesla ends Model S tesla ends model" in joined
+    assert any(t.startswith("Operators Kubernetes operators") for t in llm.texts)
+    with connection(settings) as conn:
+        rows = dict(conn.execute("SELECT id, embedding IS NOT NULL FROM links").fetchall())
+        vec_ids = {r[0] for r in conn.execute("SELECT rowid FROM vec_links")}
+    # the slug "x" page and the bare status URL have no words of their own
+    assert rows == {1: 1, 2: 1, 3: 0, 10: 1, 11: 1, 12: 0}
+    assert vec_ids == {1, 2, 10, 11}
+
+
+async def test_links_are_embedded_again_when_a_wall_appears(tmp_path):
+    from discover_app.pipeline.embedding import embed_pending_links
+
+    settings = _settings(tmp_path)
+    init_db(settings)
+    with connection(settings) as conn:
+        _add_link_text(conn, 1, "https://golem.example/news/rust-compiler", "Golem", _SITE_WALL)
+        _add_link_text(conn, 2, "https://golem.example/news/linux-kernel", "Golem", _SITE_WALL)
+    llm = _RecordingEmbedLLM()
+    await embed_pending_links(settings, llm)
+    assert all("Cookies zustimmen" in t for t in llm.texts)  # two pages: not yet a pattern
+    assert await embed_pending_links(settings, llm) == 0  # nothing changed, nothing to do
+    with connection(settings) as conn:
+        _add_link_text(
+            conn, 3, "https://golem.example/news/open-source-office", "Golem", _SITE_WALL
+        )
+    llm = _RecordingEmbedLLM()
+    assert await embed_pending_links(settings, llm) == 3  # the third copy re-embeds all
+    assert not any("Cookies" in t for t in llm.texts)
+
+
+# ── Save for later (holds) ──────────────────────────────────────
+
+
+def _held_client(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from discover_app import app as app_mod
+
+    settings = _no_linkwarden(tmp_path)
+    init_db(settings)
+    with connection(settings) as conn:
+        _add_candidate(conn, 1, "https://ex.com/a", "Held story", [1.0, 0, 0, 0])
+        _add_candidate(conn, 2, "https://ex.com/b", "Other story", [0, 1.0, 0, 0])
+        conn.execute(
+            "INSERT INTO feed_items(rank, section, candidate_id, score, reason, cycle_ts) "
+            "VALUES(0, 'curated', 1, 0.9, '', 't1'), (1, 'curated', 2, 0.5, '', 't1')"
+        )
+        conn.execute("INSERT INTO meta(key, value) VALUES('last_cycle_ts', 't1')")
+    monkeypatch.setattr(app_mod, "get_settings", lambda: settings)
+    monkeypatch.setattr("discover_app.db.get_settings", lambda: settings)
+    return settings, TestClient(app_mod.create_app())
+
+
+def test_hold_is_no_signal_and_shows_in_the_bookmarks_tab(tmp_path, monkeypatch):
+    from discover_app.ui import render_reader
+
+    settings, client = _held_client(tmp_path, monkeypatch)
+    assert client.post("/feed/1/hold").json()["status"] == "held"
+    assert client.post("/feed/1/hold").json()["status"] == "held"  # idempotent
+    assert client.post("/feed/99/hold").status_code == 404
+    with connection(settings) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM holds").fetchone()[0] == 1
+        for table in ("feedback", "ratings", "saves"):
+            assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0  # noqa: S608
+
+    page = client.get("/ui").text
+    assert 'data-panel="held"' in page and 'aria-label="Bookmarks"' in page
+    assert "Bookmarks · 1" in page and 'id="h1"' in page and "14 days left" in page
+    card1 = page[page.index('id="c1"') : page.index('id="c2"')]
+    assert 'class="vote hold on"' in card1 and 'aria-label="Saved for later"' in card1
+    card2 = page[page.index('id="c2"') :]
+    assert 'class="vote hold"' in card2
+    reader = render_reader(
+        {"id": 1, "url": "https://ex.com/a", "title": "Held story"},
+        "<p>text</p>",
+        saved=False,
+        interest=None,
+        linkwarden=False,
+        explored=False,
+        held=True,
+    )
+    assert 'class="vote hold on"' in reader
+
+    assert client.delete("/feed/1/hold").json()["status"] == "released"
+    assert client.delete("/feed/1/hold").json()["status"] == "released"  # idempotent
+    assert "Bookmarks · 0" in client.get("/ui").text
+
+
+def test_save_releases_a_hold_and_a_saved_story_is_not_held(tmp_path, monkeypatch):
+    settings, client = _held_client(tmp_path, monkeypatch)
+    client.post("/feed/1/hold")
+    assert client.post("/feed/1/save").json()["status"] == "saved"
+    with connection(settings) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM holds").fetchone()[0] == 0
+    assert client.post("/feed/1/hold").json()["status"] == "already_saved"
+    with connection(settings) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM holds").fetchone()[0] == 0
+
+
+def test_prune_keeps_held_candidates_until_the_hold_expires(tmp_path):
+    from discover_app.pipeline.holds import hold_candidate, list_holds
+
+    settings = _settings(tmp_path)
+    init_db(settings)
+    with connection(settings) as conn:
+        _add_candidate(conn, 1, "https://ex.com/old", "old held", [1.0, 0, 0, 0])
+        _add_candidate(conn, 2, "https://ex.com/old2", "old unheld", [0, 1.0, 0, 0])
+        conn.execute("UPDATE candidates SET fetched_at = '2000-01-01 00:00:00'")
+    hold_candidate(settings, 1)
+    assert prune_candidates(settings) == 1  # only the unheld one goes
+    with connection(settings) as conn:
+        assert [r[0] for r in conn.execute("SELECT id FROM candidates")] == [1]
+        conn.execute("UPDATE holds SET held_at = datetime('now', '-13 days', '-1 hours')")
+        assert list_holds(conn, settings)[0]["days_left"] == 1  # the last day
+        conn.execute("UPDATE holds SET held_at = datetime('now', '-15 days')")
+        assert list_holds(conn, settings) == []  # expired holds leave the tab at once
+    hold_candidate(settings, 1)  # holding again restarts an expired hold
+    with connection(settings) as conn:
+        assert list_holds(conn, settings)[0]["days_left"] == 14
+        conn.execute("UPDATE holds SET held_at = datetime('now', '-15 days')")
+    assert prune_candidates(settings) == 1  # GC drops the hold, then the candidate goes
+    with connection(settings) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM holds").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM candidates").fetchone()[0] == 0

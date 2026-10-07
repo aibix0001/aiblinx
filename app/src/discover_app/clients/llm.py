@@ -73,7 +73,8 @@ class LLMClient:
                 # { "data": [{ "embedding": [...] }] }.  Fall back to a raw
                 # HTTP call and unwrap the extra nesting layer.
                 embed_url = str(self._embed_client.base_url) + "/embeddings"
-                async with httpx.AsyncClient() as http:
+                # httpx defaults to a 5 s timeout: a 25-page batch outlasts it
+                async with httpx.AsyncClient(timeout=self.settings.llm_timeout_s) as http:
                     raw = await http.post(
                         embed_url,
                         json={
