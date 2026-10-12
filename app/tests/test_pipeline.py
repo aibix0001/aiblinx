@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 import sqlite3
 from datetime import UTC, datetime
 
@@ -11,6 +13,7 @@ import numpy as np
 import pytest
 import sqlite_vec
 
+from discover_app.article import is_article as _is_article
 from discover_app.auth import feed_token
 from discover_app.config import Settings
 from discover_app.db import connection, get_meta, init_db
@@ -76,6 +79,25 @@ def _add_centroid(conn: sqlite3.Connection, vec: list[float]) -> None:
         "INSERT INTO profile(kind, vector) VALUES('centroid', ?)",
         (sqlite_vec.serialize_float32(vec),),
     )
+
+
+@pytest.fixture(autouse=True)
+def _pages_readable(monkeypatch):
+    """Feed builds check each story's page; tests never fetch one, and every
+    page counts as readable unless a test says otherwise."""
+    from discover_app import article
+    from discover_app.pipeline import readable
+
+    async def readable_page(settings, url, title, llm):
+        return readable.PageCheck(True, None)
+
+    monkeypatch.setattr(readable, "check_page", readable_page)
+    article._cache.clear()
+
+    async def judged_article(llm, title, text):
+        return True  # no test asks a real chat model what a page is
+
+    monkeypatch.setattr(article, "is_article", judged_article)
 
 
 class _FakeRerankLLM:
@@ -358,7 +380,7 @@ def test_feedback_endpoints_error_mapping(tmp_path, monkeypatch):
     assert client.post("/feed/1/interest", json={"value": "sideways"}).status_code == 422
     assert client.post("/feed/999/mood", json={"value": "happy"}).status_code == 404
 
-    async def _lw_down(settings, candidate_id):
+    async def _lw_down(settings, candidate_id, section):
         raise httpx.ConnectError("no route to linkwarden")
 
     monkeypatch.setattr(app_mod, "capture_candidate", _lw_down)
@@ -765,6 +787,28 @@ def test_arm_stats_one_reward_per_item_latest_interest_wins(tmp_path):
         stats = arm_stats(conn)
     assert stats["Science"] == (2, 1)
     assert stats["Travel"] == (1, 0)
+
+
+def test_arm_stats_counts_a_read_story_as_a_small_reward(tmp_path):
+    from discover_app.pipeline.broad import arm_stats
+    from discover_app.pipeline.feedback import record_open
+
+    settings = _settings(tmp_path)
+    init_db(settings)
+    with connection(settings) as conn:
+        for cid in (1, 2, 3, 4):
+            _add_candidate(conn, cid, f"https://sx.example/{cid}", f"sx {cid}", [0, 1.0, 0, 0])
+            conn.execute(
+                "UPDATE candidates SET source='searxng', topic='Science' WHERE id=?", (cid,)
+            )
+            _serve(conn, cid, "broad")
+    for cid in (1, 2, 3):
+        record_open(settings, cid, "broad")
+    record_feedback(settings, 2, "interest", "down")  # a vote overrides the read
+    record_feedback(settings, 3, "interest", "up")  # counts 1, not 1.1
+    with connection(settings) as conn:
+        assert arm_stats(conn, 0.1) == {"Science": (4, 1.1)}
+        assert arm_stats(conn) == {"Science": (4, 1.0)}
 
 
 def test_pick_broad_items_excludes_served_and_saved(tmp_path):
@@ -2019,6 +2063,153 @@ def test_extract_article_is_escaped_and_image_free():
     assert "Grüße aus München" in extract_article(latin, "https://ex.de/a")
 
 
+def test_extract_article_drops_headings_without_text():
+    """A forum renders only the posts on screen: the others keep their
+    author line and nothing else, and a "Load more" line ends the page."""
+    from discover_app.reader import _without_empty_heads, extract_article
+
+    post = "<p>" + "This is what the post says about the licence change. " * 6 + "</p>"
+    page = (
+        "<html><body><article>"
+        f"<h2>Post by ann</h2>{post}<h2>Post by bob</h2><h2>Post by cid</h2>"
+        f"<h3>Empty part</h3><h2>Section</h2><h3>Part</h3>{post}</article></body></html>"
+    )
+    body = extract_article(page, "https://forum.ex/t/1", "A thread")
+    assert "<h2>Post by ann</h2>" in body
+    assert "<h2>Section</h2>\n<h3>Part</h3>" in body
+    for gone in ("bob", "cid", "Empty part"):
+        assert gone not in body
+    # trafilatura keeps the trailing ones of a real page; they go too
+    tail = ["<p>Text.</p>", "<h2>Post by dan</h2>", "<h2>Load more posts below</h2>"]
+    assert _without_empty_heads(tail) == ["<p>Text.</p>"]
+
+
+_PLAIN = """
+OpenSSH 10.6 was released on 2026-10-06. It is available from the
+mirrors listed at <a href="https://www.openssh.com/">https://www.openssh.com/</a>.
+
+Recently the OpenSSH team have received a large number of security
+bug reports, many of which are findings from AI models or made with
+AI assistance. We very much welcome these reports.
+
+** We have seen a number of cases where a security bug identified
+** by AI tools is subsequently independently discovered by a
+** different researcher.
+
+Future deprecation notice
+-------------------------
+
+ * scp(1): begin deprecating the -R flag, which is used to perform a
+   remote-to-remote copy by executing scp on a remote host. This
+   option is a fragile optimisation.
+
+ * sshd(8): support for platforms that do not allow file descriptor
+   passing will be removed in a future release. It is <rare>.
+
+Checksums:
+==========
+
+ - SHA1 (openssh-10.6.tar.gz) = 854863c04cd28242d73ac6c3ee9c37fa756f1a2f
+ - SHA1 (openssh-10.6p1.tar.gz) = 9c78838ec07af14aff54f3755ac56ce6812452a9
+"""
+
+
+def test_extract_article_reflows_plain_text():
+    """Hard-wrapped plain text in <pre> stays plain text, but its soft line
+    breaks are joined so that it wraps to the screen."""
+    from discover_app.reader import extract_article
+
+    # one <pre> with a link inside: trafilatura flattens that to a quote
+    # unless it is marked as code first
+    page = (
+        "<html><body><h2>Release notes</h2><hr><h3>OpenSSH 10.6</h3><pre>"
+        + _PLAIN.replace("<rare>", "&lt;rare&gt;")
+        + "</pre><hr><h3>OpenSSH 10.5</h3><pre>"
+        + _PLAIN.replace("<rare>", "&lt;rare&gt;").replace("10.6", "10.5")
+        + "</pre></body></html>"
+    )
+    body = extract_article(page, "https://ex.org/releasenotes.html#10.6", "OpenSSH 10.6")
+    assert "<blockquote>" not in body and "<pre>" not in body
+    assert body.count('<div class="plain">') == 2
+    block = body.split('<div class="plain">')[1]
+    lines = re.findall(r"<span[^>]*>.*?</span>", block)
+    assert (
+        "<span>OpenSSH 10.6 was released on 2026-10-06. It is available from the "
+        "mirrors listed at https://www.openssh.com/.</span>"
+    ) in lines
+    assert (
+        "<span>Recently the OpenSSH team have received a large number of security "
+        "bug reports, many of which are findings from AI models or made with "
+        "AI assistance. We very much welcome these reports.</span>"
+    ) in lines
+    # a quote prefix repeats on each line: kept once
+    assert (
+        '<span style="--h:3">** We have seen a number of cases where a security bug '
+        "identified by AI tools is subsequently independently discovered by a "
+        "different researcher.</span>"
+    ) in lines
+    # a heading keeps its underline, which never wraps
+    assert "<span>Future deprecation notice</span>" in lines
+    assert '<span class="rule">-------------------------</span>' in lines
+    # list items: one line each, hanging under their text
+    assert (
+        '<span style="--h:3"> * scp(1): begin deprecating the -R flag, which is used to '
+        "perform a remote-to-remote copy by executing scp on a remote host. This "
+        "option is a fragile optimisation.</span>"
+    ) in lines
+    assert any("It is &lt;rare&gt;.</span>" in line for line in lines)
+    assert any(line.startswith('<span style="--h:3"> - SHA1 (openssh-10.6.tar') for line in lines)
+    assert any(line.startswith('<span style="--h:3"> - SHA1 (openssh-10.6p1') for line in lines)
+    # blank lines stay paragraph breaks
+    assert "<span></span>" in block and "\n" not in block.split("</div>")[0]
+
+
+def test_extract_article_keeps_code_as_code():
+    from discover_app.reader import extract_article
+
+    code = "".join(
+        f"int f{i}(int x) {{\n    return x + {i}; /* add it. Then return. */\n}}\n"
+        for i in range(20)
+    )
+    page = _ARTICLE.replace("<h2>A section</h2>", f"<h2>A section</h2><pre>{code}</pre>")
+    body = extract_article(page, "https://ex.com/a", "An article")
+    assert "<pre><code>int f0(int x) {\n    return x + 0;" in body
+    assert 'class="plain"' not in body
+
+
+_DIAGRAM = """
+FTL                                   Linux
+┌────────────────────────────────┐    ┌────────────────────────────────┐
+│┏━━━━━━━━━━━━━┓  ┏━━━━━━━━━━━━━┓│    │┏━━━━━━━━━━━━━┓  ┏━━━━━━━━━━━━━┓│
+│┃             ┃  ┃             ┃│    │┃             ┃  ┃             ┃│
+│┃    Linux    ┃  ┃    Linux    ┃│    │┃    Linux    ┃  ┃    Linux    ┃│
+│┃   Process   ┃  ┃   Process   ┃│    │┃   Process   ┃  ┃   Process   ┃│
+│┃             ┃  ┃             ┃│    │┃             ┃  ┃             ┃│
+│┃╌╌╌╌╌ Linux system calls ╌╌╌╌╌┃│    │┗━━━━━━━━━━━━━┛  ┗━━━━━━━━━━━━━┛│
+│┃                              ┃│    └────────────────────────────────┘
+│┃         Userspace OS         ┃│    ╌╌╌╌╌╌╌╌ Linux's interface ╌╌╌╌╌╌╌
+│┃   (Process, VFS, TCP, ...)   ┃│    ╔════════════════════════════════╗
+│┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛│    ║                                ║
+└────────────────────────────────┘    ║          Linux Kernel          ║
+╌╌╌╌╌╌╌ minimal interface ╌╌╌╌╌╌╌╌    ║                                ║
+╔════════════════════════════════╗    ║   process, fork/exec, memory,  ║
+║           FTL Kernel           ║    ║     signals, TCP/IP, /proc,    ║
+║    vCPU, memory, drivers, ...  ║    ║       /dev, drivers ...        ║
+╚════════════════════════════════╝    ╚════════════════════════════════╝
+"""
+
+
+def test_extract_article_keeps_diagrams_as_they_are():
+    """A diagram has labels with full stops, but its lines are not prose:
+    it stays <pre> line for line."""
+    from discover_app.reader import extract_article
+
+    page = _ARTICLE.replace("<h2>A section</h2>", f"<h2>A section</h2><pre>{_DIAGRAM}</pre>")
+    body = extract_article(page, "https://ex.com/a", "An article")
+    assert 'class="plain"' not in body
+    assert "<pre><code>" + _DIAGRAM.replace("'", "&#x27;") + "</code></pre>" in body
+
+
 def _page_with_pictures(pictures: str) -> str:
     text = "".join(
         f"<p>Paragraph {i} of the story, with enough words in it to count as prose.</p>"
@@ -2125,7 +2316,6 @@ def _counts(settings):
 
 
 def test_reader_page_has_actions_and_records_nothing(tmp_path, monkeypatch):
-    from discover_app import app as app_mod
 
     settings, client = _reader_app(tmp_path, monkeypatch)
 
@@ -2133,7 +2323,7 @@ def test_reader_page_has_actions_and_records_nothing(tmp_path, monkeypatch):
         assert url == "https://ex.com/a"
         return _ARTICLE.encode()
 
-    monkeypatch.setattr(app_mod, "fetch_html", fake_fetch)
+    monkeypatch.setattr("discover_app.article.load_html", fake_fetch)
     before = _counts(settings)
     resp = client.get("/read/1")
     assert resp.status_code == 200
@@ -2141,7 +2331,7 @@ def test_reader_page_has_actions_and_records_nothing(tmp_path, monkeypatch):
     assert resp.headers["cache-control"] == "no-store"
     page = resp.text
     assert "<h1>An article</h1>" in page and "Paragraph 7 of the story" in page
-    assert '<article class="card" data-id="1">' in page
+    assert '<article class="card" data-id="1" data-section="curated">' in page
     assert 'onclick="save(this)"' in page and "vote(this, 'down')" in page
     assert 'href="https://ex.com/a" rel="noreferrer">Open the original page' in page
     assert _counts(settings) == before  # no read event, no cache: no tracking
@@ -2203,21 +2393,20 @@ def test_reader_font_size_buttons():
 
 
 def test_reader_falls_back_to_the_original(tmp_path, monkeypatch):
-    from discover_app import app as app_mod
 
     _, client = _reader_app(tmp_path, monkeypatch)
 
     async def no_page(url, timeout_s):
         return None
 
-    monkeypatch.setattr(app_mod, "fetch_html", no_page)
+    monkeypatch.setattr("discover_app.article.load_html", no_page)
     resp = client.get("/read/1")
     assert resp.status_code == 302 and resp.headers["location"] == "https://ex.com/a"
 
     async def teaser(url, timeout_s):
         return b"<html><body><p>Subscribe to keep reading.</p></body></html>"
 
-    monkeypatch.setattr(app_mod, "fetch_html", teaser)
+    monkeypatch.setattr("discover_app.article.load_html", teaser)
     assert client.get("/read/1").headers["location"] == "https://ex.com/a"
     assert client.get("/read/99").status_code == 404
 
@@ -2840,6 +3029,10 @@ async def test_embed_pending_signals_uses_stored_text(tmp_path):
             "(1, 'ex.com/a', 'interest', 'up'), (NULL, 'gone.example/x', 'interest', 'down'),"
             "(NULL, 'ex.com/a', 'mood', 'happy')"
         )
+        conn.execute(
+            "INSERT INTO opens(candidate_id, url, section) "
+            "VALUES(NULL, 'read.example/y', 'curated')"
+        )
     seen: list[str] = []
 
     class _Rec:
@@ -2847,21 +3040,22 @@ async def test_embed_pending_signals_uses_stored_text(tmp_path):
             seen.extend(texts)
             return [[1.0, 0, 0, 0] for _ in texts]
 
-    assert await embed_pending_signals(settings, _Rec()) == 3  # mood feedback skipped
+    assert await embed_pending_signals(settings, _Rec()) == 4  # mood feedback skipped
     assert "Saved https://ex.com/s" in seen
     assert any(t.startswith("Candidate title") for t in seen)
     assert "gone.example/x" in seen  # pruned candidate: falls back to the URL
+    assert "read.example/y" in seen  # a read story, too
     assert await embed_pending_signals(settings, _Rec()) == 0  # nothing pending
 
 
 # ── Exploring stays separate from the interest profile ──────────
 
 
-def _serve(conn, cid: int, section: str) -> None:
+def _serve(conn, cid: int, section: str, cycle: str = "t1") -> None:
     conn.execute(
         "INSERT INTO feed_items(rank, section, candidate_id, score, reason, cycle_ts) "
-        "VALUES(?, ?, ?, 0.0, '', 't1')",
-        (cid, section, cid),
+        "VALUES(?, ?, ?, 0.0, '', ?)",
+        (cid, section, cid, cycle),
     )
 
 
@@ -2954,6 +3148,30 @@ def test_exploring_feedback_stays_out_of_the_profile(tmp_path):
         weights = _centroid_weights(conn, centroids, 30.0, 0.0)
     assert weights[0] > 1.0  # the curated upvote
     assert weights[1] == 1.0 and weights[2] == 1.0  # Exploring votes/saves: untouched
+
+
+def test_stories_read_in_the_reader_weigh_lightly_on_their_cluster(tmp_path):
+    from discover_app.pipeline.feedback import record_open
+    from discover_app.pipeline.profile import _centroid_weights
+
+    settings = _settings(tmp_path)
+    init_db(settings)
+    with connection(settings) as conn:
+        for cid in (1, 2, 3, 4):
+            vec = [0.0] * 4
+            vec[cid - 1] = 1.0
+            _add_candidate(conn, cid, f"https://ex.com/{cid}", f"t{cid}", vec)
+    record_open(settings, 1, "curated")
+    record_open(settings, 2, "curated")
+    record_feedback(settings, 2, "interest", "down", "curated")  # the vote wins
+    record_open(settings, 3, "broad")  # Exploring reads stay out of "For you"
+    assert not record_open(settings, 1, "curated")  # once per story
+    with connection(settings) as conn:
+        weights = _centroid_weights(conn, np.eye(4, dtype=np.float32), 30.0, 0.0, 0.1)
+        off = _centroid_weights(conn, np.eye(4, dtype=np.float32), 30.0, 0.0)
+    assert weights[0] == pytest.approx(1.1, abs=1e-3)
+    assert weights[1] < 1.0 and weights[2] == 1.0 and weights[3] == 1.0
+    assert off[0] == 1.0
 
 
 def test_pending_domains_ignore_exploring(tmp_path):
@@ -3147,8 +3365,20 @@ def test_find_video_sources():
     assert find_video(_video_page(meta=html_player)) is None
 
 
+def test_reader_redirects_at_once_when_the_build_found_no_article(tmp_path, monkeypatch):
+    settings, client = _reader_app(tmp_path, monkeypatch)
+
+    async def no_fetch(url, timeout_s):
+        raise AssertionError("a page checked unreadable is not fetched again")
+
+    monkeypatch.setattr("discover_app.article.load_html", no_fetch)
+    with connection(settings) as conn:
+        conn.execute("INSERT INTO page_checks(candidate_id, readable) VALUES(1, 0)")
+    resp = client.get("/read/1")
+    assert resp.status_code == 302 and resp.headers["location"] == "https://ex.com/a"
+
+
 def test_reader_plays_video_pages(tmp_path, monkeypatch):
-    from discover_app import app as app_mod
 
     settings, client = _reader_app(tmp_path, monkeypatch)
     ld = (
@@ -3159,7 +3389,7 @@ def test_reader_plays_video_pages(tmp_path, monkeypatch):
     async def video_page(url, timeout_s):
         return _video_page(ld)
 
-    monkeypatch.setattr(app_mod, "fetch_html", video_page)
+    monkeypatch.setattr("discover_app.article.load_html", video_page)
     resp = client.get("/read/1")
     assert resp.status_code == 200
     page = resp.text
@@ -3170,6 +3400,7 @@ def test_reader_plays_video_pages(tmp_path, monkeypatch):
     assert '<p class="video-info">Video · 0:59 min</p>' in page
     assert 'class="lead"' not in page  # the description only repeats the headline
     assert "Rubrik1" not in page  # no navigation text
+    assert "/opened" not in page  # a video is no read text
 
 
 def test_ui_remembers_the_open_tab_in_the_fragment():
@@ -3415,6 +3646,91 @@ def test_explore_button_only_on_for_you(tmp_path, monkeypatch):
     broad = page[page.index('id="c2"') : page.index("</article>", page.index('id="c2"'))]
     assert "explore(this)" in curated and "promote(this)" not in curated
     assert "promote(this)" in broad and "explore(this)" not in broad
+    # each card carries its tab, and Exploring cards open the reader in Exploring
+    assert 'data-section="curated"' in curated and 'href="/read/1"' in curated
+    assert 'data-section="broad"' in broad and 'href="/read/2?section=broad"' in broad
+
+
+async def test_the_tab_decides_not_an_earlier_serve(tmp_path):
+    """A story once shown in Exploring, now in "For you": Save and votes there
+    count for "For you"; unsaid, the last serve decides."""
+    from discover_app.pipeline.feedback import served_section
+
+    settings = _settings(tmp_path, linkwarden_collection_id=17)
+    init_db(settings)
+    with connection(settings) as conn:
+        for cid in (1, 2, 3):
+            _add_candidate(conn, cid, f"https://ex.com/{cid}", str(cid), [1.0, 0, 0, 0])
+            _serve(conn, cid, "broad", "t1")
+        _serve(conn, 1, "curated", "t2")
+        _serve(conn, 2, "curated", "t2")
+        assert served_section(conn, 1) == "curated"  # the last serve, not "ever"
+        assert served_section(conn, 3) == "broad"
+    fake = _FakeLinkwardenCollections()
+    await capture_candidate(settings, 1, linkwarden=fake, section="curated")
+    await capture_candidate(settings, 2, linkwarden=fake)  # Bookmarks tab: no tab sent
+    await capture_candidate(settings, 3, linkwarden=fake, section="curated")
+    assert [c["collection_id"] for c in fake.created] == [17, 17, 17]
+    record_feedback(settings, 3, "interest", "up", section="curated")
+    record_feedback(settings, 3, "interest", "down", section="broad")
+    with connection(settings) as conn:
+        assert {r[0] for r in conn.execute("SELECT section FROM saves")} == {"curated"}
+        rows = conn.execute(
+            "SELECT axis, value, section FROM feedback WHERE candidate_id = 3 ORDER BY id"
+        ).fetchall()
+    assert [tuple(r) for r in rows] == [
+        ("saved", "explicit", "curated"),
+        ("interest", "up", "curated"),
+        ("interest", "down", "broad"),
+    ]
+
+
+async def test_save_to_exploring_lowers_for_you_after_an_exploring_serve(tmp_path):
+    from discover_app.pipeline.feedback import explore_candidate
+
+    settings = _settings(tmp_path, linkwarden_collection_id=17)
+    init_db(settings)
+    with connection(settings) as conn:
+        _add_candidate(conn, 1, "https://ex.com/c", "c", [1.0, 0, 0, 0])
+        _serve(conn, 1, "curated", "t2")
+        _serve(conn, 1, "broad", "t3")
+    await explore_candidate(settings, 1, linkwarden=_FakeLinkwardenMovable())
+    with connection(settings) as conn:
+        down = conn.execute("SELECT section FROM feedback WHERE axis = 'interest'").fetchone()
+    assert down[0] == "curated"
+
+
+def test_reader_buttons_follow_the_tab_it_was_opened_from(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from discover_app import app as app_mod
+
+    settings = _settings(tmp_path).model_copy(update={"linkwarden_token": ""})  # saves stay local
+    init_db(settings)
+    with connection(settings) as conn:
+        _add_candidate(conn, 1, "https://ex.com/a", "a", [1.0, 0, 0, 0])
+        _serve(conn, 1, "broad", "t1")
+        _serve(conn, 1, "curated", "t2")
+        conn.execute(
+            "INSERT INTO articles(candidate_id, lang, body, title_tr, body_tr) "
+            "VALUES(1, 'en', '<p>Text.</p>', NULL, NULL)"
+        )
+    monkeypatch.setattr("discover_app.db.get_settings", lambda: settings)
+    monkeypatch.setattr(app_mod, "get_settings", lambda: settings)
+    client = TestClient(app_mod.create_app())
+    plain = client.get("/read/1").text  # last served in "For you"
+    assert "explore(this)" in plain and "promote(this)" not in plain
+    assert 'data-section="curated"' in plain
+    exploring = client.get("/read/1?section=broad").text
+    assert "promote(this)" in exploring and "explore(this)" not in exploring
+    assert 'data-section="broad"' in exploring
+    assert client.get("/read/1?section=other").status_code == 422
+    # Save and votes from that page send its tab along
+    assert client.post("/feed/1/interest", json={"value": "up", "section": "broad"}).is_success
+    assert client.post("/feed/1/save", json={"section": "broad"}).json()["status"] == "saved"
+    with connection(settings) as conn:
+        assert conn.execute("SELECT section FROM saves").fetchone()[0] == "broad"
+        assert {r[0] for r in conn.execute("SELECT section FROM feedback")} == {"broad"}
 
 
 # --- reader translations ---
@@ -3593,7 +3909,7 @@ async def test_prepare_articles_translates_each_served_item_once(tmp_path, monke
     async def fake_fetch(url, timeout_s):
         return _EN_ARTICLE.encode()
 
-    monkeypatch.setattr(articles, "fetch_html", fake_fetch)
+    monkeypatch.setattr("discover_app.article.load_html", fake_fetch)
     llm = _Translator()
     with caplog.at_level(logging.INFO, logger="discover_app.pipeline.articles"):
         assert await articles.prepare_articles(settings, llm) == 1
@@ -3619,7 +3935,7 @@ async def test_prepare_articles_keeps_the_original_when_translation_fails(tmp_pa
     async def fake_fetch(url, timeout_s):
         return _EN_ARTICLE.encode()
 
-    monkeypatch.setattr(articles, "fetch_html", fake_fetch)
+    monkeypatch.setattr("discover_app.article.load_html", fake_fetch)
     await articles.prepare_articles(settings, _Translator(drop=True))
     with connection(settings) as conn:
         row = conn.execute("SELECT lang, body, body_tr FROM articles").fetchone()
@@ -3627,14 +3943,13 @@ async def test_prepare_articles_keeps_the_original_when_translation_fails(tmp_pa
 
 
 def test_reader_serves_the_prepared_article_with_a_language_toggle(tmp_path, monkeypatch):
-    from discover_app import app as app_mod
 
     settings, client = _reader_app(tmp_path, monkeypatch)
 
     async def no_fetch(url, timeout_s):
         raise AssertionError("a prepared article is not fetched again")
 
-    monkeypatch.setattr(app_mod, "fetch_html", no_fetch)
+    monkeypatch.setattr("discover_app.article.load_html", no_fetch)
     with connection(settings) as conn:
         conn.execute(
             "INSERT INTO articles(candidate_id, lang, body, title_tr, body_tr) "
@@ -3900,7 +4215,7 @@ def test_reader_chat_off(tmp_path, monkeypatch):
 
 
 def test_reader_chat_caps_the_search_rounds(tmp_path, monkeypatch):
-    from discover_app.chat import MAX_ROUNDS
+    from discover_app.chat import LAST_ROUND, MAX_ROUNDS
 
     replies = [[_tool_call(f"q{i}", f"c{i}")] for i in range(MAX_ROUNDS)] + [
         [_tool_call("again", "cx"), ("text", "Done.")]
@@ -3912,7 +4227,11 @@ def test_reader_chat_caps_the_search_rounds(tmp_path, monkeypatch):
         client.post("/read/1/chat", json={"messages": [{"role": "user", "content": "?"}]})
     )
     assert search.queries == [f"q{i}" for i in range(MAX_ROUNDS)]
-    assert [c["tool_choice"] for c in llm.calls] == ["auto"] * MAX_ROUNDS + ["none"]
+    # the last round offers no tool and says so
+    assert [c.get("tool_choice") for c in llm.calls] == ["auto"] * MAX_ROUNDS + [None]
+    assert "tools" not in llm.calls[-1]
+    assert llm.calls[-1]["messages"][-1] == {"role": "user", "content": LAST_ROUND}
+    assert llm.calls[-2]["messages"][-1]["role"] == "tool"
     assert [e["type"] for e in events][-2:] == ["text", "done"]
 
 
@@ -3926,6 +4245,25 @@ def test_reader_chat_goes_on_without_search_when_tools_are_rejected(tmp_path, mo
     assert events[0] == {"type": "text", "text": "From the story."}
 
 
+def test_reader_chat_asks_again_after_an_empty_reply(tmp_path, monkeypatch):
+    llm = _ChatLLM([[_tool_call("unix register")], [("text", "\n\n")], [("text", "The answer.")]])
+    _, client = _chat_app(tmp_path, monkeypatch, llm, _ChatSearch())
+    events = _events(
+        client.post("/read/1/chat", json={"messages": [{"role": "user", "content": "?"}]})
+    )
+    assert len(llm.calls) == 3 and llm.calls[1] == llm.calls[2]
+    assert events[-2:] == [{"type": "text", "text": "The answer."}, {"type": "done"}]
+
+
+def test_reader_chat_empty_twice_is_no_answer(tmp_path, monkeypatch):
+    llm = _ChatLLM([[("text", "\n")], [("text", "")]])
+    _, client = _chat_app(tmp_path, monkeypatch, llm, _ChatSearch())
+    events = _events(
+        client.post("/read/1/chat", json={"messages": [{"role": "user", "content": "?"}]})
+    )
+    assert len(llm.calls) == 2 and events[-1] == {"type": "done"}
+
+
 def test_reader_chat_model_failure_is_an_error_event(tmp_path, monkeypatch):
     class _Broken(_ChatLLM):
         async def chat_stream(self, messages, **kwargs):
@@ -3937,6 +4275,25 @@ def test_reader_chat_model_failure_is_an_error_event(tmp_path, monkeypatch):
         client.post("/read/1/chat", json={"messages": [{"role": "user", "content": "?"}]})
     )
     assert events == [{"type": "error"}, {"type": "done"}]
+
+
+def test_reader_reports_a_read_of_the_text(tmp_path, monkeypatch):
+    settings, client = _chat_app(tmp_path, monkeypatch, _ChatLLM([]))
+    page = client.get("/read/1").text
+    assert "navigator.sendBeacon(`/read/${card.dataset.id}/opened?section=" in page
+    assert client.post("/read/1/opened?section=broad").status_code == 204
+    assert client.post("/read/1/opened").status_code == 204  # once per story
+    assert client.post("/read/9/opened").status_code == 404
+    with connection(settings) as conn:
+        rows = conn.execute("SELECT candidate_id, url, section FROM opens").fetchall()
+    assert [tuple(r) for r in rows] == [(1, "ex.com/a", "broad")]
+    assert client.get("/healthz").json()["opens_count"] == 1
+
+
+def test_reader_learns_nothing_when_off(tmp_path, monkeypatch):
+    _, client = _chat_app(tmp_path, monkeypatch, _ChatLLM([]), reader_learn=False)
+    assert "/opened" not in client.get("/read/1").text
+    assert client.post("/read/1/opened").status_code == 404
 
 
 def test_reader_page_has_the_chat(tmp_path, monkeypatch):
@@ -4260,7 +4617,8 @@ async def test_rerank_chunks_the_shortlist_and_survives_a_failed_chunk(tmp_path)
     low = "[" + ",".join(f'{{"i": {i}, "score": 0.1}}' for i in range(50)) + "]"
     llm = _RecordingRerankLLM([low, RuntimeError("endpoint down"), low])
     wrote = await build_feed(settings, llm)
-    assert len(llm.prompts) == 3  # 50 + 50 + 20
+    reranks = [p for p in llm.prompts if p.startswith("You are curating")]
+    assert len(reranks) == 3  # 50 + 50 + 20
     # chunks 1 and 3 scored everything below MIN_RELEVANCE; the failed chunk
     # keeps its 50 stories on similarity
     assert wrote == 50
@@ -4512,3 +4870,750 @@ def test_prune_keeps_held_candidates_until_the_hold_expires(tmp_path):
     with connection(settings) as conn:
         assert conn.execute("SELECT COUNT(*) FROM holds").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM candidates").fetchone()[0] == 0
+
+
+# ── Diagrams as SVG ─────────────────────────────────────────────
+
+
+def test_is_diagram_wants_wide_box_drawings_only():
+    from discover_app.diagrams import is_diagram
+
+    assert is_diagram(_DIAGRAM)
+    ascii_boxes = "\n".join(
+        ["+------------------+      +------------------+"]
+        + ["|  client process  | ---> |  server process  |"]
+        + ["+------------------+      +------------------+"]
+    )
+    assert is_diagram(ascii_boxes)
+    assert not is_diagram("├── src\n│   └── main.py\n└── README.md")  # narrow: fits a phone
+    assert not is_diagram("int main(void) {\n    return 0; /* " + "x" * 60 + " */\n}")
+    assert not is_diagram(_PLAIN)
+
+
+def test_clean_svg_keeps_drawing_and_drops_everything_active():
+    from discover_app.diagrams import clean_svg
+
+    dirty = (
+        '<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" '
+        'viewBox="0 0 360 200" width="360" height="200" onload="alert(1)">'
+        "<script>alert(2)</script><style>text{fill:red}</style>"
+        '<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto">'
+        '<path d="M0,0 L8,4 L0,8 z" fill="currentColor"/></marker></defs>'
+        '<rect x="10" y="10" width="340" height="60" fill="#ff0000" stroke="currentColor" '
+        'style="fill:url(javascript:alert(3))"/>'
+        '<text x="180" y="45" text-anchor="middle" fill="currentColor" font-size="14">'
+        "Linux &amp; &lt;FTL&gt;</text>"
+        '<line x1="180" y1="70" x2="180" y2="120" stroke="currentColor" marker-end="url(#arrow)"/>'
+        '<a xlink:href="javascript:alert(4)"><text x="1" y="1">link</text></a>'
+        '<foreignObject><div xmlns="http://www.w3.org/1999/xhtml">x</div></foreignObject>'
+        '<image href="https://tracker.ex/p.png"/>'
+        '<path d="M0 0" fill="url(https://evil.ex/x#y)"/>'
+        "</svg>"
+    )
+    svg = clean_svg(dirty, "d0")
+    for bad in (
+        "script",
+        "alert",
+        "style",
+        "onload",
+        "href",
+        "foreignObject",
+        "image",
+        "evil",
+        "#ff0000",
+    ):
+        assert bad not in svg
+    assert svg.startswith("<svg") and 'viewBox="0 0 360 200"' in svg
+    assert "width=" not in svg.split(">")[0]  # the page sizes it
+    assert "Linux &amp; &lt;FTL&gt;</text>" in svg
+    assert 'id="d0-arrow"' in svg and 'marker-end="url(#d0-arrow)"' in svg
+    assert '<rect x="10" y="10" width="340" height="60" fill="currentColor"' in svg
+    assert clean_svg("not svg at all", "d0") is None
+    assert clean_svg('<svg xmlns="http://www.w3.org/2000/svg"><text>x</text></svg>', "d0") is None
+    assert clean_svg('<svg viewBox="0 0 1 1"><rect/></svg>', "d0") is None  # no labels
+
+
+async def test_draw_diagrams_replaces_wide_drawings(tmp_path, monkeypatch):
+    import html as html_mod
+
+    from discover_app import diagrams
+
+    pre = f"<pre><code>{html_mod.escape(_DIAGRAM)}</code></pre>"
+    code = "<pre><code>if (x) { y(); }</code></pre>"
+    blocks = ["<p>Intro.</p>", pre, code]
+    asked = []
+
+    async def fake_draw(client, model, text, effort):
+        asked.append((model, text, effort))
+        return (
+            '```svg\n<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 100">'
+            '<rect x="0" y="0" width="360" height="100" fill="none" stroke="currentColor"/>'
+            '<text x="180" y="50" fill="currentColor">FTL Kernel</text></svg>\n```'
+        )
+
+    monkeypatch.setattr(diagrams, "_draw", fake_draw)
+    off = _settings(tmp_path)
+    assert await diagrams.draw_diagrams(blocks, off) == blocks and not asked
+    on = _settings(tmp_path, diagram_llm_token="t", diagram_llm_model="m/svg")  # noqa: S106
+    out = await diagrams.draw_diagrams(blocks, on)
+    assert asked == [("m/svg", _DIAGRAM, "")]
+    assert out[0] == blocks[0] and out[2] == code
+    assert out[1].startswith('<figure class="diagram"><svg ') and "FTL Kernel" in out[1]
+
+    # a failed drawing shows the error image in the diagram's place
+    async def unusable(client, model, text, effort):
+        return "Sorry, I cannot draw that."
+
+    async def no_credits(client, model, text, effort):
+        raise RuntimeError("Error code: 402 - This request requires more credits")
+
+    for failure in (unusable, no_credits):
+        monkeypatch.setattr(diagrams, "_draw", failure)
+        out = await diagrams.draw_diagrams(blocks, on)
+        assert out[0] == blocks[0] and out[2] == code
+        assert out[1].startswith('<figure class="diagram diagram-error"><svg ')
+        assert "Diagram not available" in out[1] and "currentColor" in out[1]
+
+
+async def test_draw_leaves_room_for_reasoning():
+    """Claude Haiku 5.5 reasons 8-22k tokens before it draws: max_tokens
+    must leave room for the SVG, and the effort goes out only when set."""
+    from types import SimpleNamespace
+
+    from discover_app import diagrams
+
+    sent = []
+
+    async def create(**kwargs):
+        sent.append(kwargs)
+        message = SimpleNamespace(content="<svg/>")
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    assert await diagrams._draw(client, "m", "box", "") == "<svg/>"
+    assert await diagrams._draw(client, "m", "box", "low") == "<svg/>"
+    assert all(kwargs["max_tokens"] >= 32000 for kwargs in sent)
+    assert "extra_body" not in sent[0]
+    assert sent[1]["extra_body"] == {"reasoning": {"effort": "low"}}
+
+
+# --- un-save ---
+
+
+class _FakeLinkwardenDeleting(_FakeLinkwardenWriter):
+    def __init__(self, fail: bool = False) -> None:
+        super().__init__()
+        self.deleted: list[int] = []
+        self.fail = fail
+
+    async def delete_link(self, link_id):
+        if self.fail:
+            raise httpx.ConnectError("no route to linkwarden")
+        self.deleted.append(link_id)
+
+
+async def test_unsave_removes_the_links_and_the_save_but_keeps_votes(tmp_path):
+    from discover_app.pipeline.feedback import unsave_candidate
+
+    settings = _settings(tmp_path, linkwarden_collection_id=17)
+    init_db(settings)
+    with connection(settings) as conn:
+        _add_candidate(conn, 1, "https://ex.com/a", "a", [1.0, 0, 0, 0])
+        _add_candidate(conn, 2, "https://ex.com/b", "b", [0, 1.0, 0, 0])
+        _serve(conn, 1, "curated")
+    fake = _FakeLinkwardenDeleting()
+    await capture_candidate(settings, 1, linkwarden=fake)  # link 4711
+    await capture_candidate(settings, 2, linkwarden=fake)
+    record_feedback(settings, 1, "interest", "up")
+    blob = sqlite_vec.serialize_float32
+    with connection(settings) as conn:
+        # the poll mirrored the save, and an older bookmark of the same page
+        for link_id, url in ((4711, "https://ex.com/a"), (12, "http://www.ex.com/a/")):
+            conn.execute(
+                "INSERT INTO links(id, url, embedding) VALUES(?, ?, ?)",
+                (link_id, url, blob([1.0, 0, 0, 0])),
+            )
+            conn.execute(
+                "INSERT INTO vec_links(rowid, embedding) VALUES(?, ?)",
+                (link_id, blob([1.0, 0, 0, 0])),
+            )
+    assert await unsave_candidate(settings, 1, linkwarden=fake) == {"status": "unsaved"}
+    assert sorted(fake.deleted) == [12, 4711]
+    with connection(settings) as conn:
+        assert [r[0] for r in conn.execute("SELECT url_key FROM saves")] == ["ex.com/b"]
+        assert conn.execute("SELECT COUNT(*) FROM links").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM vec_links").fetchone()[0] == 0
+        rows = conn.execute("SELECT axis, value FROM feedback WHERE candidate_id = 1").fetchall()
+    assert [tuple(r) for r in rows] == [("interest", "up")]  # the vote stays
+    # idempotent, and Save works again afterwards
+    assert await unsave_candidate(settings, 1, linkwarden=fake) == {"status": "unsaved"}
+    assert len(fake.deleted) == 2
+    assert (await capture_candidate(settings, 1, linkwarden=fake))["status"] == "saved"
+
+
+async def test_unsave_keeps_everything_when_linkwarden_fails(tmp_path):
+    from discover_app.pipeline.feedback import unsave_candidate
+
+    settings = _settings(tmp_path, linkwarden_collection_id=17)
+    init_db(settings)
+    with connection(settings) as conn:
+        _add_candidate(conn, 1, "https://ex.com/a", "a", [1.0, 0, 0, 0])
+    await capture_candidate(settings, 1, linkwarden=_FakeLinkwardenDeleting())
+    with pytest.raises(httpx.ConnectError):
+        await unsave_candidate(settings, 1, linkwarden=_FakeLinkwardenDeleting(fail=True))
+    with connection(settings) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM saves").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0] == 1
+    with pytest.raises(LookupError):
+        await unsave_candidate(settings, 999, linkwarden=_FakeLinkwardenDeleting())
+
+
+async def test_linkwarden_delete_link_treats_gone_as_deleted(tmp_path):
+    from discover_app.clients.linkwarden import LinkwardenClient
+
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, request.url.path))
+        if request.url.path.endswith("/2"):  # what Linkwarden says for a missing link
+            return httpx.Response(401, json={"response": "Collection is not accessible."})
+        if request.url.path.endswith("/3"):
+            return httpx.Response(401, json={"response": "You must be logged in."})
+        return httpx.Response(200, json={})
+
+    client = LinkwardenClient(_settings(tmp_path))
+    client._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://lw.test/api/v1"
+    )
+    await client.delete_link(1)
+    await client.delete_link(2)  # already gone
+    assert calls == [("DELETE", "/api/v1/links/1"), ("DELETE", "/api/v1/links/2")]
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.delete_link(3)  # a bad token is an error, not "gone"
+    await client.aclose()
+
+
+def test_unsave_endpoint(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from discover_app import app as app_mod
+
+    settings = _settings(tmp_path).model_copy(update={"linkwarden_token": ""})  # saves stay local
+    init_db(settings)
+    with connection(settings) as conn:
+        _add_candidate(conn, 1, "https://ex.com/a", "a", [1.0, 0, 0, 0])
+    monkeypatch.setattr("discover_app.db.get_settings", lambda: settings)
+    monkeypatch.setattr(app_mod, "get_settings", lambda: settings)
+    client = TestClient(app_mod.create_app())
+    assert client.post("/feed/1/save").json()["status"] == "saved"
+    assert client.delete("/feed/1/save").json() == {
+        "status": "unsaved",
+        "linkwarden_id": None,
+        "attached": None,
+    }
+    with connection(settings) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM saves").fetchone()[0] == 0
+    assert client.delete("/feed/999/save").status_code == 404
+    # the page toggles: a second tap on a saved Save undoes it
+    page = client.get("/ui").text
+    assert "post(card.dataset.id, 'save', undefined, 'DELETE')" in page
+
+
+def test_site_penalty_rules():
+    from datetime import date
+
+    from discover_app.pipeline.readable import current_penalty, penalty_after_failure
+
+    assert penalty_after_failure(0.0) == 0.2  # first failure
+    assert penalty_after_failure(0.2) == pytest.approx(0.3)  # every further one
+    day = date(2026, 10, 1)
+    assert current_penalty(0.5, day, day) == 0.5
+    assert current_penalty(0.5, day, date(2026, 10, 2)) == pytest.approx(0.3)
+    assert current_penalty(0.5, day, date(2026, 10, 4)) == 0.0  # never a boost
+
+
+def test_record_failure_recovers_then_restarts(tmp_path):
+    from datetime import date
+
+    from discover_app.pipeline.readable import record_failure, site_penalties
+
+    settings = _settings(tmp_path)
+    init_db(settings)
+    day1, day2, day5 = date(2026, 10, 1), date(2026, 10, 2), date(2026, 10, 5)
+    with connection(settings) as conn:
+        assert record_failure(conn, "msn.com", day1) == 0.2
+        assert record_failure(conn, "msn.com", day1) == pytest.approx(0.3)
+        assert record_failure(conn, "msn.com", day1) == pytest.approx(0.4)
+        # a failure-free day takes 0.2 off before the next failure adds 0.1
+        assert record_failure(conn, "msn.com", day2) == pytest.approx(0.3)
+        assert site_penalties(conn, day2) == {"msn.com": pytest.approx(0.3)}
+        assert site_penalties(conn, day5) == {}
+        # fully recovered: the next failure is a first failure again
+        assert record_failure(conn, "msn.com", day5) == 0.2
+
+
+_PROSE = " ".join(f"Sentence number {i} says something about the story." for i in range(12))
+_ARTICLE_PAGE = f"<html><body><article><p>{_PROSE}</p></article></body></html>".encode()
+_CONSENT_PAGE = (
+    "<html><body><article><p>"
+    + " ".join(f"We use cookies for purpose number {i} on this site." for i in range(12))
+    + "</p></article></body></html>"
+).encode()
+
+
+class _JudgeLLM:
+    """Chat double for article.get_page: calls a page the article unless it
+    talks about cookies, and picks the button labelled "Accept all"."""
+
+    def __init__(self, fail: bool = False):
+        self.fail = fail
+        self.prompts: list[str] = []
+
+    async def chat(self, messages, **kwargs):
+        prompt = messages[-1]["content"]
+        self.prompts.append(prompt)
+        if self.fail:
+            raise RuntimeError("endpoint down")
+        if "Is the text that story?" in prompt:
+            return json.dumps({"article": "cookies" not in prompt})
+        labels = re.findall(r"^(\d+)\. (.+)$", prompt, re.M)
+        choice = next((int(n) for n, label in labels if label == "Accept all"), None)
+        return json.dumps({"choice": choice})
+
+
+class _FakeTab:
+    """A browser tab whose page shows ``before`` until "Accept all" is clicked."""
+
+    def __init__(self, before: bytes, after: bytes):
+        self.page, self.after, self.clicks = before, after, []
+
+    async def html(self):
+        return self.page
+
+    async def buttons(self):
+        return ["Menu", "Settings", "Accept all"]
+
+    async def click(self, n):
+        self.clicks.append(n)
+        if n == 2:
+            self.page = self.after
+
+
+def _fake_browser(monkeypatch, tab: _FakeTab | None, opened: list):
+    from contextlib import asynccontextmanager
+
+    from discover_app import article
+
+    @asynccontextmanager
+    async def open_tab(settings, url):
+        opened.append(url)
+        if tab is None:
+            raise article.browser.PlaywrightError("browser down")
+        yield tab
+
+    monkeypatch.setattr(article.browser, "open_tab", open_tab)
+
+
+def _plain_pages(monkeypatch, pages: dict):
+    from discover_app import article
+
+    monkeypatch.setattr(article, "is_article", _is_article)  # the real check
+
+    async def fake_load(url, timeout_s):
+        if pages.get(url) == "down":
+            raise httpx.ConnectError("refused")
+        return pages.get(url)
+
+    monkeypatch.setattr(article, "load_html", fake_load)
+
+
+async def test_get_page_takes_text_or_a_playable_video(tmp_path, monkeypatch):
+    from discover_app.article import get_page
+
+    settings = _settings(tmp_path)
+    _plain_pages(
+        monkeypatch,
+        {
+            "https://a.ex/text": _ARTICLE_PAGE,
+            "https://a.ex/video": _video_page(
+                '{"@type": "VideoObject", "contentUrl": "https://cdn.ex/v.mp4"}'
+            ),
+            "https://a.ex/empty": b"<html><body><div>Enable JavaScript</div></body></html>",
+        },
+    )
+    page = await get_page(settings, "https://a.ex/text", "A story")
+    assert page is not None and page.article
+    page = await get_page(settings, "https://a.ex/video", "A story")
+    assert page is not None and not page.article
+    assert await get_page(settings, "https://a.ex/empty", "A story") is None
+    assert await get_page(settings, "https://a.ex/missing", "A story") is None
+
+
+async def test_get_page_renders_what_the_plain_fetch_cannot_read(tmp_path, monkeypatch):
+    from discover_app.article import get_page
+
+    settings = _settings(tmp_path, browser_ws_url="ws://browser:3000/")
+    _plain_pages(monkeypatch, {"https://a.ex/consent": _CONSENT_PAGE})
+    opened: list = []
+    tab = _FakeTab(_CONSENT_PAGE, _ARTICLE_PAGE)  # autoconsent missed the banner
+    _fake_browser(monkeypatch, tab, opened)
+    llm = _JudgeLLM()
+    page = await get_page(settings, "https://a.ex/consent", "A story", llm)
+    assert page == type(page)(_ARTICLE_PAGE, True)
+    assert tab.clicks == [2]  # the model picked "Accept all"
+    # cached: the next reader of the page fetches nothing
+    assert await get_page(settings, "https://a.ex/consent", "A story", llm) == page
+    assert opened == ["https://a.ex/consent"]
+
+
+async def test_get_page_gives_up_when_no_button_accepts(tmp_path, monkeypatch):
+    from discover_app.article import get_page
+
+    settings = _settings(tmp_path, browser_ws_url="ws://browser:3000/")
+    _plain_pages(monkeypatch, {"https://a.ex/consent": _CONSENT_PAGE})
+    tab = _FakeTab(_CONSENT_PAGE, _CONSENT_PAGE)  # the banner stays
+    _fake_browser(monkeypatch, tab, [])
+    assert await get_page(settings, "https://a.ex/consent", "A story", _JudgeLLM()) is None
+    assert tab.clicks == [2, 2]  # MAX_CLICKS tries, then unreadable
+
+
+async def test_get_page_keeps_the_text_when_the_chat_model_fails(tmp_path, monkeypatch):
+    from discover_app.article import get_page
+
+    settings = _settings(tmp_path, browser_ws_url="ws://browser:3000/")
+    _plain_pages(monkeypatch, {"https://a.ex/text": _ARTICLE_PAGE})
+    opened: list = []
+    _fake_browser(monkeypatch, None, opened)
+    page = await get_page(settings, "https://a.ex/text", "A story", _JudgeLLM(fail=True))
+    assert page is not None and page.article
+    assert opened == []  # the extractor's verdict stands: no browser
+
+
+async def test_get_page_is_unreachable_when_nothing_loads(tmp_path, monkeypatch):
+    from discover_app.article import Unreachable, get_page
+
+    settings = _settings(tmp_path, browser_ws_url="ws://browser:3000/")
+    _plain_pages(monkeypatch, {"https://a.ex/down": "down", "https://a.ex/consent": _CONSENT_PAGE})
+    _fake_browser(monkeypatch, None, [])  # and the browser is down too
+    with pytest.raises(Unreachable):
+        await get_page(settings, "https://a.ex/down", "A story", _JudgeLLM())
+    # the browser being down says nothing about the page either
+    with pytest.raises(Unreachable):
+        await get_page(settings, "https://a.ex/consent", "A story", _JudgeLLM())
+
+
+def test_site_of_keys_on_host_and_first_directory():
+    from discover_app.pipeline.readable import site_of
+
+    assert site_of("https://www.tagesschau.de/tagesthemen/tt-12874.html") == (
+        "tagesschau.de/tagesthemen"
+    )
+    assert site_of("https://www.tagesschau.de/inland/a/b-100.html") == "tagesschau.de/inland"
+    assert site_of("https://www.youtube.com/watch?v=x") == "youtube.com"
+    assert site_of("https://ok.ex/") == "ok.ex"
+
+
+async def test_check_pages_leaves_pages_that_did_not_load_unchecked(tmp_path, monkeypatch):
+    from discover_app.article import Unreachable
+    from discover_app.pipeline import readable
+
+    settings = _settings(tmp_path)
+    init_db(settings)
+    down = True
+
+    async def flaky(settings, url, title, llm):
+        if down:
+            raise Unreachable(url)
+        return readable.PageCheck(True, None)
+
+    monkeypatch.setattr(readable, "check_page", flaky)
+    items = [(1, "https://carbuzz.com/a", "A story")]
+    assert await readable.check_pages(settings, items) == {}
+    with connection(settings) as conn:
+        assert readable.site_penalties(conn) == {}
+    down = False
+    assert await readable.check_pages(settings, items) == {1: (True, None)}  # checked again
+
+
+async def test_check_pages_checks_each_story_once(tmp_path, monkeypatch):
+    from discover_app.pipeline import readable
+
+    settings = _settings(tmp_path)
+    init_db(settings)
+    fetched = []
+
+    async def fake_readable(settings, url, title, llm):
+        fetched.append(url)
+        return readable.PageCheck("msn" not in url, None)
+
+    monkeypatch.setattr(readable, "check_page", fake_readable)
+    items = [
+        (1, "https://www.msn.com/a", "A"),
+        (2, "https://msn.com/b", "B"),
+        (3, "https://ok.ex/c", "C"),
+    ]
+    checks = {1: (False, None), 2: (False, None), 3: (True, None)}
+    assert await readable.check_pages(settings, items) == checks
+    assert await readable.check_pages(settings, items) == checks
+    assert len(fetched) == 3  # the second call reuses the stored results
+    with connection(settings) as conn:
+        # two failures from one site, charged once each
+        assert readable.site_penalties(conn) == {"msn.com": pytest.approx(0.3)}
+
+
+async def test_build_feed_ranks_down_sites_the_reader_cannot_show(tmp_path, monkeypatch):
+    from discover_app.pipeline import readable
+
+    async def fake_readable(settings, url, title, llm):
+        return readable.PageCheck("msn" not in url, None)
+
+    monkeypatch.setattr(readable, "check_page", fake_readable)
+    settings = _settings(tmp_path)
+    init_db(settings)
+    with connection(settings) as conn:
+        _add_centroid(conn, [1.0, 0.0, 0.0, 0.0])
+        _add_candidate(conn, 1, "https://www.msn.com/a", "msn story", [1.0, 0, 0, 0])
+        _add_candidate(conn, 2, "https://ok.ex/b", "readable story", [0.9, 0.1, 0, 0])
+        _add_candidate(conn, 3, "https://msn.com/c", "second msn story", [0.8, 0.2, 0, 0])
+    llm = _FakeRerankLLM(
+        '[{"i": 0, "score": 0.9, "why": "a"}, {"i": 1, "score": 0.8, "why": "b"},'
+        ' {"i": 2, "score": 0.5, "why": "c"}]'
+    )
+    await build_feed(settings, llm)
+    with connection(settings) as conn:
+        rows = conn.execute(
+            "SELECT candidate_id, score FROM feed_items WHERE section = 'curated' ORDER BY rank"
+        ).fetchall()
+    # two msn failures put msn.com at 0.3: story 1 drops to 0.6, behind
+    # story 2, and story 3 to 0.2, below MIN_RELEVANCE (0.3)
+    assert [(r[0], round(r[1], 2)) for r in rows] == [(2, 0.8), (1, 0.6)]
+
+
+def test_page_date_is_the_pages_own():
+    from datetime import date
+
+    from discover_app.pipeline import readable
+
+    page = (
+        b'<html><head><meta property="article:published_time" content="2015-12-11T10:00:00Z">'
+        b"</head><body><p>Introducing OpenAI.</p></body></html>"
+    )
+    assert readable.page_date(page, "https://openai.com/index/introducing-openai/") == date(
+        2015, 12, 11
+    )
+    assert (
+        readable.page_date(b"<html><body><p>No date.</p></body></html>", "https://ex.com/a") is None
+    )
+    settings = Settings(candidate_max_age_days=14)
+    today = date(2026, 10, 11)
+    assert readable.is_stale(readable.PageCheck(True, date(2015, 12, 11)), settings, today)
+    assert not readable.is_stale(readable.PageCheck(True, date(2026, 9, 27)), settings, today)
+    assert not readable.is_stale(readable.PageCheck(True, None), settings, today)
+
+
+async def test_build_feed_drops_old_pages_posted_again(tmp_path, monkeypatch):
+    """A story is dated by its listing; an old page posted again is not new."""
+    from datetime import date
+
+    from discover_app.pipeline import readable
+
+    async def dated(settings, url, title, llm):
+        return readable.PageCheck(True, date(2015, 12, 11) if "old" in url else None)
+
+    monkeypatch.setattr(readable, "check_page", dated)
+    settings = _no_linkwarden(tmp_path, feed_size=10, broad_ratio=0.3)
+    init_db(settings)
+    with connection(settings) as conn:
+        _add_centroid(conn, [1.0, 0.0, 0.0, 0.0])
+        _add_candidate(conn, 1, "https://hn.example/old", "OpenAI (2015)", [1.0, 0, 0, 0])
+        _add_candidate(conn, 2, "https://hn.example/new", "new story", [0.9, 0.1, 0, 0])
+        for i in range(12):
+            url = f"https://sx.example/{'old' if i % 2 else 'new'}/{i}"
+            _add_candidate(conn, 10 + i, url, f"sx {i}", [0, 0, 0, 1.0])
+            conn.execute(
+                "UPDATE candidates SET source='searxng', topic='Science' WHERE id=?", (10 + i,)
+            )
+    set_topic(settings, "Science", True)
+    await build_feed(settings, _FakeRerankLLM('[{"i": 0, "score": 0.9}, {"i": 1, "score": 0.8}]'))
+    with connection(settings) as conn:
+        served = dict(conn.execute("SELECT candidate_id, section FROM feed_items").fetchall())
+        published = conn.execute("SELECT published FROM page_checks WHERE candidate_id = 1")
+        assert published.fetchone()[0] == "2015-12-11"
+    assert served.get(2) == "curated" and 1 not in served
+    explored = [cid for cid, section in served.items() if section == "broad"]
+    assert explored and all(cid % 2 == 0 for cid in explored)  # odd ids are the old pages
+
+
+def test_exploring_prefers_sites_without_a_penalty(tmp_path):
+    import random
+
+    from discover_app.pipeline.broad import pick_broad_items
+
+    settings = _settings(tmp_path, epsilon=1.0)  # always the newest-story pick
+    init_db(settings)
+    set_topic(settings, "Science", True)
+    with connection(settings) as conn:
+        _add_candidate(conn, 10, "https://ok.ex/old", "older", [0, 1.0, 0, 0])
+        _add_candidate(conn, 11, "https://msn.com/new", "newest", [0, 1.0, 0, 0])
+        conn.execute("UPDATE candidates SET source='searxng', topic='Science'")
+        rng = random.Random(0)  # noqa: S311 - deterministic test rng
+        penalties = {"msn.com": 0.2}
+        picks = pick_broad_items(conn, settings, ["Science"], 1, rng, penalties=penalties)
+    assert [p["id"] for p in picks] == [10]
+
+
+class _SameStoryLLM:
+    """Chat double for build_feed with dedup: rerank prompts get ``rerank``;
+    dedup prompts call a pair one story when both titles share a word from
+    ``stories``."""
+
+    def __init__(self, rerank: str, stories: set[str]) -> None:
+        self.rerank = rerank
+        self.stories = stories
+
+    async def chat(self, messages, temperature: float = 0.0, **kwargs) -> str:
+        import json
+
+        prompt = messages[0]["content"]
+        if prompt.startswith("You are curating"):
+            return self.rerank
+        pairs = re.findall(r"^\d+\. A: (.*)\n   B: (.*)$", prompt, re.M)
+        return json.dumps(
+            [
+                {"a": a, "b": b, "same": any(w in a and w in b for w in self.stories)}
+                for a, b in pairs
+            ]
+        )
+
+    async def aclose(self) -> None:
+        pass
+
+
+def _story(title: str, vec: list[float]) -> dict:
+    v = np.array(vec, dtype=np.float32)
+    return {"title": title, "snippet": "", "vector": v / np.linalg.norm(v)}
+
+
+def test_neighbour_pairs_take_the_nearest_above_the_floor():
+    from discover_app.pipeline.dedup import neighbour_pairs
+
+    fresh = np.array([[1, 0, 0], [0.9, 0.436, 0], [0, 0, 1]], dtype=np.float32)
+    earlier = np.array([[0.8, 0, 0.6], [0, 1, 0]], dtype=np.float32)
+    # 0~1 (0.9) asked once; 0~earlier 0 (0.8); 1~earlier 1 (0.436) below the
+    # floor; 2~earlier 0 (0.6) at the floor
+    assert neighbour_pairs(fresh, earlier) == [(0, 1), (0, 3), (1, 3), (2, 3)]
+
+
+async def test_duplicates_keep_the_readable_copy_and_drop_repeats():
+    from discover_app.pipeline.dedup import duplicates
+
+    llm = _SameStoryLLM("", {"plague", "musk"})
+    fresh = [
+        _story("msn plague story", [1, 0.05, 0]),  # 0: higher ranked, not readable
+        _story("yahoo plague story", [1, 0, 0.05]),  # 1: readable
+        _story("musk award again", [0, 1, 0]),  # 2: served yesterday already
+        _story("unrelated", [0, 0, 1]),
+    ]
+    earlier = [_story("musk award", [0, 1, 0.05])]
+    readable = {0: False, 1: True, 2: True, 3: True}
+    rank = {0: 0.9, 1: 0.8, 2: 0.7, 3: 0.6}
+    drop = await duplicates(llm, fresh, earlier, lambda i: (readable[i], rank[i]))
+    assert drop == {0, 2}
+    # both readable: the higher-ranked copy stays
+    assert await duplicates(llm, fresh[:2], [], lambda i: (True, rank[i])) == {1}
+
+
+async def test_duplicates_follow_copies_of_copies():
+    from discover_app.pipeline.dedup import duplicates
+
+    llm = _SameStoryLLM("", {"plague"})
+    # A ~ B and B ~ the earlier story; A and the earlier story are too far
+    # apart to be compared, yet A repeats it through B
+    fresh = [_story("plague A", [1, 0, 0]), _story("plague B", [0.8, 0.6, 0])]
+    earlier = [_story("plague earlier", [0.28, 0.96, 0])]
+    assert await duplicates(llm, fresh, earlier, lambda i: (-i,)) == {0, 1}
+
+
+async def test_duplicates_drop_nothing_when_the_chat_model_fails():
+    from discover_app.pipeline.dedup import duplicates
+
+    fresh = [_story("a", [1, 0, 0]), _story("b", [1, 0.01, 0])]
+    assert await duplicates(_FakeRerankLLM("no json"), fresh, [], lambda i: (i,)) == set()
+
+
+async def test_build_feed_serves_one_copy_of_a_story(tmp_path, monkeypatch):
+    from discover_app.pipeline import readable
+
+    async def fake_readable(settings, url, title, llm):
+        return readable.PageCheck("msn" not in url, None)
+
+    monkeypatch.setattr(readable, "check_page", fake_readable)
+    settings = _settings(tmp_path)
+    init_db(settings)
+    with connection(settings) as conn:
+        _add_centroid(conn, [1.0, 0.0, 0.0, 0.0])
+        _add_candidate(conn, 1, "https://ok.ex/1", "earlier musk story", [0.7, 0.7, 0, 0])
+        conn.execute(
+            "INSERT INTO feed_items(rank, section, candidate_id, score, reason, cycle_ts) "
+            "VALUES(0, 'curated', 1, 0.9, '', '2026-10-09')"
+        )
+        _add_candidate(conn, 2, "https://msn.com/p", "msn plague story", [1.0, 0.05, 0, 0])
+        _add_candidate(conn, 3, "https://yahoo.com/p", "yahoo plague story", [1.0, 0, 0.05, 0])
+        _add_candidate(conn, 4, "https://ok.ex/4", "musk story again", [0.7, 0.69, 0, 0])
+        _add_candidate(conn, 5, "https://ok.ex/5", "other story", [0.9, 0, 0, 0.4])
+    rerank = (
+        '[{"i": 0, "score": 0.9}, {"i": 1, "score": 0.8}, '
+        '{"i": 2, "score": 0.7}, {"i": 3, "score": 0.7}]'
+    )
+    await build_feed(settings, _SameStoryLLM(rerank, {"plague", "musk"}))
+    with connection(settings) as conn:
+        served = {
+            r[0]
+            for r in conn.execute(
+                "SELECT candidate_id FROM feed_items WHERE cycle_ts != '2026-10-09'"
+            )
+        }
+    # the readable yahoo copy beats the msn one; the musk story was served before
+    assert served == {3, 5}
+
+
+async def test_exploring_drops_a_story_for_you_already_has(tmp_path):
+    settings = _settings(tmp_path, feed_size=10, broad_ratio=0.3)
+    init_db(settings)
+    set_topic(settings, "Science", True)
+    with connection(settings) as conn:
+        _add_centroid(conn, [1.0, 0, 0, 0])
+        _add_candidate(conn, 1, "https://hn.example/a", "plague in siberia", [1.0, 0, 0, 0])
+        _add_candidate(conn, 10, "https://sx.example/0", "plague report", [0.9, 0.1, 0, 0])
+        _add_candidate(conn, 11, "https://sx.example/1", "comet news", [0, 1.0, 0, 0])
+        conn.execute("UPDATE candidates SET source='searxng', topic='Science' WHERE id >= 10")
+    await build_feed(settings, _SameStoryLLM('[{"i": 0, "score": 0.9}]', {"plague"}))
+    with connection(settings) as conn:
+        broad = {
+            r[0] for r in conn.execute("SELECT candidate_id FROM feed_items WHERE section='broad'")
+        }
+    assert broad == {11}
+
+
+def test_browser_names_itself_as_plain_chrome():
+    """Bot checks stop a browser that calls itself HeadlessChrome."""
+    from discover_app import browser
+
+    agent = browser._user_agent("136.0.7103.25")
+    assert "Headless" not in agent and "Chrome/136.0.0.0 " in agent
+
+
+def test_browser_drops_only_closed_browser_noise():
+    from discover_app import browser
+
+    logged = []
+
+    class Loop:
+        def default_exception_handler(self, context):
+            logged.append(context["exception"])
+
+    closed = browser.PlaywrightError("Channel.send: Playwright connection closed")
+    other = browser.PlaywrightError("Timeout 5000ms exceeded")
+    for exc in (closed, other, ValueError("bug")):
+        browser._quiet_closed(Loop(), {"exception": exc})
+    assert [str(e) for e in logged] == ["Timeout 5000ms exceeded", "bug"]

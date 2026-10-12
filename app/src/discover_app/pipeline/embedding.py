@@ -244,7 +244,7 @@ async def embed_pending_candidates(settings: Settings, llm: LLMClient) -> int:
     )
 
 
-# Saves, feedback and ratings carry a copy of their page's vector (so they
+# Saves, feedback, ratings and opens carry a copy of their page's vector (so they
 # outlive the candidate prune). After an embedding-model change those copies
 # are cleared, and this re-embeds them from the text still at hand: the
 # candidate's title and snippet while it exists, else the saved title, else
@@ -261,11 +261,13 @@ _SIGNAL_TEXT = {
     "s.title || ' ' || s.url, r.url) AS text FROM ratings r "
     "LEFT JOIN candidates c ON c.id = r.candidate_id "
     "LEFT JOIN saves s ON s.url_key = r.url WHERE r.embedding IS NULL",
+    "opens": "SELECT o.id, COALESCE(c.title || ' ' || COALESCE(c.snippet, ''), o.url) AS text "
+    "FROM opens o LEFT JOIN candidates c ON c.id = o.candidate_id WHERE o.embedding IS NULL",
 }
 
 
 async def embed_pending_signals(settings: Settings, llm: LLMClient) -> int:
-    """Re-embed saves, feedback and ratings that have no vector; returns the
+    """Re-embed saves, feedback, ratings and opens that have no vector; returns the
     number embedded. A no-op in normal operation."""
     done = 0
     for table, query in _SIGNAL_TEXT.items():

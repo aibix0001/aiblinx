@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.7.0
+
+- **Reads behind cookie banners:** pages the plain fetch can't read (a
+  consent banner, text built by scripts, an automatic bot check) are opened
+  in a headless browser, a second container `docker compose up -d` now
+  starts. Known banners are accepted automatically; for others the chat
+  model picks the button that accepts.
+- **One story once:** when several sites carry the same story, the feed
+  serves it once.
+- **Fresh stories only:** a story whose page says it is older than the
+  freshness window (14 days) is left out, even when its feed lists it as new.
+- **Sites the reader can't show rank lower:** a site whose pages repeatedly
+  give the reader no article text is ranked down, in the section where it
+  failed.
+- **The feed learns from reading:** a story read in the reader (its text
+  20 s on screen, or scrolled past its middle) counts 0.1 toward its
+  interest, where a save or ↑ counts 1. Only stories shown as text count; a
+  save or vote replaces the read. `READER_OPEN_WEIGHT` sets the value,
+  `READER_LEARN=false` turns it off.
+- **Undo a save:** a second tap on Save takes it back and removes the link
+  from Linkwarden.
+- **Buttons follow the tab:** Save, votes and the reader count for the tab
+  you used, not for an earlier Exploring showing of the same story.
+- **Diagrams on a phone:** an ASCII box drawing too wide for the screen can
+  be redrawn as SVG by a hosted model (`DIAGRAM_LLM_*`, off by default);
+  when that fails the reader shows an error image instead of a broken
+  drawing. Plain-text articles wrap to the screen width, diagrams in them
+  stay as drawn.
+- **Reader fixes:** headings with no text under them are dropped.
+- **Chat fix:** after its last web search the chat always answers, instead
+  of sometimes showing "No answer came back".
+
 ## 0.6.0
 
 - **Save for later:** a paper button on every card and in the reader keeps

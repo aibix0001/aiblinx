@@ -26,7 +26,13 @@ The interest profile is built from the pages you keep, one point per page:
 The points are clustered with k-means into interests: about √(points / 2)
 clusters, at least 8 and at most 32. Each interest's weight comes from your
 taps: a save counts +1, more like this +1, less like this −1, and each signal
-loses half its weight every 30 days. Nothing is retrained; the profile is
+loses half its weight every 30 days. A story you read in the reader counts
++0.1 (`READER_OPEN_WEIGHT`): the reader page reports it once the text has
+been on screen for 20 seconds or you have scrolled past its middle. Only
+stories the reader shows as text count, never a redirect to the original or
+a video, and a save or vote on the same story replaces it. A read only
+weights an interest; it is never a point of the profile, so what you open
+doesn't move the clusters. `READER_LEARN=false` turns this off. Nothing is retrained; the profile is
 recomputed from the log every cycle. Votes act on what a story is about, never
 on the site it came from.
 
@@ -61,10 +67,29 @@ step is isolated, so one failing source never costs you the day's feed.
    configured, re-reads the top 150 against your interests (shown to it as
    titles of pages you keep) and writes one line on why each fits. Stories it
    scores as unrelated are dropped: a thin day gives a shorter feed, not
-   filler. Maximal Marginal Relevance then thins out near-duplicates.
+   filler. Sites the reader cannot show (no article text, no playable video)
+   are ranked down: each shortlisted page is checked once, a site's first
+   failure costs its stories 0.2 relevance, each further failure 0.1 more,
+   and every failure-free day gives 0.2 back. A site here is the host plus
+   the page's first directory (`tagesschau.de/tagesthemen`), and a page that
+   did not load at all is checked again next build instead. The same check
+   reads the page's own publication date (`htmldate`: page metadata,
+   structured data, the URL). A story is dated by its listing, so an old page
+   posted again on Hacker News looks new; a page dated before the 14-day
+   window is dropped, and a page without a date is kept. One story from several sites
+   is served once: each story's nearest neighbours (up to three, cosine 0.6
+   or more) among the shortlist and everything served before go to the chat
+   model, which says from titles and snippets whether a pair is one news
+   event. A story served before is not served again; of two copies, the one
+   the reader can show wins, else the higher-ranked one. Maximal Marginal
+   Relevance then thins out near-duplicates.
 6. **Explore:** fill 30% of the slots from your chosen topics, picked by an
    epsilon-greedy bandit (20% exploration) that learns from what you save
-   there. Without a profile yet, Exploring gets every slot.
+   and upvote there, and a little (`READER_OPEN_WEIGHT`) from what you read. The same site penalty applies when a topic's story is picked, and
+   a pick that repeats a story served before or chosen for "For you" is
+   dropped, as is a pick whose page is dated before the window (the picks'
+   pages are checked before the feed is written).
+   Without a profile yet, Exploring gets every slot.
 7. **Enrich:** read each chosen article's page once for its preview image and
    description.
 8. **Publish:** the phone page, an Atom feed and a daily markdown digest.
@@ -83,9 +108,29 @@ pictures are shown where they stand in the text, with their captions. Like the
 title image, they load from the publisher without a referrer. Logos, teasers
 for other stories and tracking pixels are left out.
 Text only counts as an article when it has real sentences, so a page of menus
-is not shown. A page without an article but with a directly playable video
-(schema.org `VideoObject` or `og:video`, mp4 or webm) shows that video, which
-loads only when you press play. Anything else redirects to the original.
+is not shown, and, with a chat model configured, when the model confirms it
+is the story and not a cookie notice, a block page or an error. A page
+without an article but with a directly playable video (schema.org
+`VideoObject` or `og:video`, mp4 or webm) shows that video, which loads only
+when you press play.
+
+A page that fails this is opened in a headless Chromium (the `browser`
+service, `BROWSER_WS_URL`): a browser of its own per page, without images,
+media or fonts. It is the full Chromium build in new headless mode and names
+itself as plain Chrome, so automatic bot checks such as Cloudflare's "Just a
+moment..." page let it through. There DuckDuckGo's
+[autoconsent](https://github.com/duckduckgo/autoconsent) accepts the consent
+banner (it knows hundreds of consent tools and finds unknown ones by
+heuristics), text that web components render inside shadow roots is written
+out, and the page is checked again. If a banner still hides the story, the
+chat model picks the button that accepts it from the page's clickable
+elements, the browser clicks it, and the text is checked again (twice at
+most). Anything else redirects to the original; so does a story the feed
+build already found unreadable, without fetching it again. Sites that block
+automated browsers outright (reuters.com) or want a human to click a check
+box (Cloudflare Turnstile) stay unreadable. The result is kept
+in memory for six hours, so the build's check, the preparation and an early
+read share one fetch.
 
 Each daily cycle prepares the served stories in advance: the text is
 extracted the same way and, with a chat model configured, translated between
@@ -93,7 +138,19 @@ German and English (`READER_TRANSLATE`, on by default). A prepared story opens
 in the language it was published in, with a DE / EN button that swaps in the
 translation. The toggle is not remembered; the A− / A+ text size is, per
 device, in the browser. Stories are prepared whether or not you read them, so
-the stored text says nothing about what you opened.
+the stored text says nothing about what you opened; with `READER_LEARN` on,
+the read report above does.
+
+Plain text from a `<pre>` (release notes, mailing-list posts) is reflowed to
+the screen width; code, tables and diagrams keep their lines. An ASCII box
+drawing wider than a phone is redrawn as an SVG at preparation time by a
+hosted model (`DIAGRAM_LLM_TOKEN` and `DIAGRAM_LLM_MODEL`, off by default). The
+SVG is rebuilt from an allowlist of drawing elements before it is stored, so
+no script, style or outside reference reaches the page, and it takes the
+reader's light or dark colours. When drawing fails (no credits left, an API
+error, an unusable reply), the diagram's place shows a "Diagram not
+available" image instead; the article is not drawn again on its own. Without
+the hosted model configured, the reader shows the ASCII drawing.
 
 Opening a story writes nothing to the database and is kept out of the access
 log; a prepared story is not fetched from the publisher again. The page sends
@@ -111,7 +168,9 @@ was picked. The page can only send your questions and the earlier answers.
 With SearXNG set up, the model has one tool, `web_search`. It gets the top five
 results (title, address, snippet) and may search up to three times per
 question; the page shows each search with its result links. Nothing fetches
-the result pages. Without SearXNG, or when the model endpoint does not support
+the result pages. After the third search the model gets no tool and a closing
+message asking for the answer from what it has. A reply with neither text nor
+a search is asked for once more. Without SearXNG, or when the model endpoint does not support
 tools, the chat answers from the story alone.
 
 The server writes each answer as a background job, so it finishes even when
@@ -148,7 +207,7 @@ records which model built it. When the configured model changes, the app
 copies the database next to itself (`discover.db.before-<model>-<time>`),
 clears every vector and re-computes them over the next cycle from the stored
 text: bookmark and article text, import titles and descriptions, save titles
-and URLs. Saves, imports, votes and topics are kept. To undo a change, stop the
+and URLs. Saves, imports, votes, reads and topics are kept. To undo a change, stop the
 app, restore the copy and set the old model again.
 
 ## Endpoints
@@ -163,11 +222,13 @@ app, restore the copy and set the old model again.
 | GET | `/feed` | the current feed as JSON |
 | GET | `/feed.atom` | Atom feed (with `APP_PASSWORD`: `?token=` from `/setup`) |
 | GET | `/digest` | markdown digest |
-| POST | `/feed/{id}/save` | save a story (and to Linkwarden when connected); optional `{discussion}` attaches a chat as PDF |
-| POST | `/feed/{id}/interest` | `{value: up\|down}` |
+| POST | `/feed/{id}/save` | save a story (and to Linkwarden when connected); optional `{discussion}` attaches a chat as PDF, optional `{section}` names the tab |
+| DELETE | `/feed/{id}/save` | undo a save: its Linkwarden links are deleted, and its save and `saved` signal go; votes stay |
+| POST | `/feed/{id}/interest` | `{value: up\|down, section}` |
 | POST | `/feed/{id}/promote` | file an Exploring story as a main interest |
 | POST | `/feed/{id}/explore` | file a "For you" story under Exploring, and less like it |
 | GET | `/read/{id}` | reader view (or a redirect to the original) |
+| POST | `/read/{id}/opened` | `?section=`: the reader page's report that its text was read (with `READER_LEARN`) |
 | POST | `/read/{id}/chat` | `{messages, lang}`: one chat answer about the story, as server-sent events; the first event is the job id |
 | GET | `/read/{id}/chat/{job}` | the same answer again from its first event, until an hour after it is done |
 | GET | `/feed/version` | the current cycle, so an open feed page reloads when a newer one exists |
@@ -206,12 +267,18 @@ values count as unset.
 | `MIN_SIMILARITY` | `0` (off) | similarity to your interests a story needs; depends on the embedding model |
 | `MIN_RELEVANCE` | `0.3` | chat model score a story needs; below it the slot stays empty |
 | `FEEDBACK_HALF_LIFE_DAYS` | `30` | decay of taps |
-| `CANDIDATE_MAX_AGE_DAYS` | `14` | freshness window |
+| `CANDIDATE_MAX_AGE_DAYS` | `14` | freshness window, by listing date and by the page's own date |
 | `HOLD_DAYS` | `14` | days a story saved for later stays in the Bookmarks tab |
 | `AD_FILTER_PATTERNS` | `anzeige:`, `advertorial`, `sponsored` | title substrings dropped |
 | `POLL_CRON` / `CYCLE_CRON` | `7-59/15 * * * *` / `0 6 * * *` | UTC |
 | `LINK_TARGET` | `same` | `new` opens articles in a new tab |
 | `READER_TRANSLATE` | `true` | translate prepared stories between German and English with the chat model |
+| `DIAGRAM_LLM_TOKEN`, `DIAGRAM_LLM_MODEL` | empty | hosted model that redraws wide ASCII diagrams as SVG at preparation time; empty = off. `DIAGRAM_LLM_BASE_URL` defaults to OpenRouter |
+| `DIAGRAM_LLM_EFFORT` | empty | OpenRouter `reasoning.effort` for that model; empty = its default. `low` for Claude Haiku 5.5 |
+| `BROWSER_WS_URL` | `ws://browser:3000/` in compose, else empty | Playwright server for pages the plain fetch can't read; empty = off |
+| `BROWSER_CONCURRENCY` / `BROWSER_TIMEOUT_S` | `3` / `30` | pages rendered at once / page load timeout |
+| `READER_LEARN` | `true` | a story read in the reader is a small positive signal |
+| `READER_OPEN_WEIGHT` | `0.1` | what a read counts, where a save or an upvote counts 1 (0–1) |
 | `READER_CHAT` | `true` | chat about a story in the reader; web search with `SEARXNG_URL`; the chat goes to Linkwarden as PDF on save |
 | `APP_PASSWORD` | — | optional login |
 | `ADMIN_TOKEN` | — | protects `POST /admin/run-cycle` |

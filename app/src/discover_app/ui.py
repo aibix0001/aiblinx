@@ -172,8 +172,9 @@ def _actions(
 
 def _card(item: dict, new_tab: bool, explore: bool = False) -> str:
     cid = int(item["candidate_id"])
-    # The title opens the reader view, which falls back to the page itself.
-    url = f"/read/{cid}" if _http(item.get("url")) else "#"
+    # The title opens the reader view, which falls back to the page itself;
+    # it gets the tab along, so its buttons and Save follow the card's.
+    url = f"/read/{cid}{'?section=broad' if explore else ''}" if _http(item.get("url")) else "#"
     meta_html = _meta(item)
     # noreferrer either way: publishers never learn where the reader came from
     link_attrs = 'rel="noopener noreferrer" target="_blank"' if new_tab else 'rel="noreferrer"'
@@ -197,8 +198,10 @@ def _card(item: dict, new_tab: bool, explore: bool = False) -> str:
         )
     saved = bool(item.get("saved"))
     interest = item.get("interest")
+    section = "broad" if explore else "curated"
     return f"""\
-<article class="card" id="c{cid}" data-id="{cid}"{' data-down=""' if interest == "down" else ""}>
+<article class="card" id="c{cid}" data-id="{cid}" data-section="{section}"\
+{' data-down=""' if interest == "down" else ""}>
   <div class="gone">Less like this, noted.</div>
   <div class="body">
     {figure}
@@ -394,6 +397,7 @@ def render_reader(
     translation: dict | None = None,
     chat: bool = False,
     held: bool = False,
+    learn: bool = False,
 ) -> str:
     """The reader page: an article's extracted text, then save / more / less.
 
@@ -407,7 +411,8 @@ def render_reader(
     language ("de" / "en"): both versions go into the page and a DE / EN
     toggle swaps them. The article always opens in its own language.
     chat: whether the chat about the story sits under the text; with
-    ``linkwarden`` a discussion goes to the saved link as a PDF."""
+    ``linkwarden`` a discussion goes to the saved link as a PDF.
+    learn: whether the page reports a read of the text (``LEARN_JS``)."""
     url = _http(item.get("url")) or "#"
     image = _http(item.get("image_url"))
     figure = (
@@ -447,6 +452,7 @@ def render_reader(
         .replace("__ACTIONS__", ACTIONS_JS)
         .replace("__THEMEBTN__", THEME_BUTTON)
         .replace("__ID__", str(int(item["id"])))
+        .replace("__SECTION__", "curated" if promoted is None else "broad")
         .replace("__ACTIONBAR__", _actions(saved, interest, promoted, explored, held))
         .replace("__URL__", html.escape(url, quote=True))
         .replace("__META__", _meta(item))
@@ -456,6 +462,7 @@ def render_reader(
         .replace("__TITLE__", title)
         .replace("__CHAT__", _chat(linkwarden) if chat else "")
         .replace("__CHATJS__", CHAT_JS if chat else "")
+        .replace("__LEARNJS__", LEARN_JS if learn else "")
         .replace("__BODY__", article)  # last: article text is never scanned for placeholders
     )
 
@@ -636,9 +643,9 @@ function toggleTheme() {
   root.dataset.theme = dark ? 'light' : 'dark';
   try { localStorage.setItem('theme', root.dataset.theme); } catch (e) {}
 }
-async function post(id, path, body) {
-  const resp = await fetch(`/feed/${id}/${path}`, body === undefined ? {method: 'POST'} : {
-    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+async function post(id, path, body, method = 'POST') {
+  const resp = await fetch(`/feed/${id}/${path}`, body === undefined ? {method} : {
+    method, headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
   if (!resp.ok) {
     let detail = resp.status;
     try { detail = (await resp.json()).detail || detail; } catch (e) {}
@@ -671,17 +678,32 @@ async function hold(btn) {
   } catch (e) { toast('Could not update: ' + e.message); }
   finally { btn.disabled = false; }
 }
+// un-saved: Promote and Save to Exploring filed the save, so they go with it
+function markUnsaved(id) {
+  document.querySelectorAll(`[data-id="${id}"] .save`).forEach(b => press(b, false, 'Save'));
+  document.querySelectorAll(`[data-id="${id}"] .promote, [data-id="${id}"] .explore`)
+    .forEach(b => press(b, false));
+}
 async function save(btn) {
-  if (btn.classList.contains('on')) return;
   const card = btn.closest('.card');
+  const undo = btn.classList.contains('on');
   btn.disabled = true;
   try {
+    if (undo) {
+      // a second tap undoes the save: its link leaves Linkwarden
+      await post(card.dataset.id, 'save', undefined, 'DELETE');
+      markUnsaved(card.dataset.id);
+      if (typeof updateAttach === 'function') updateAttach();
+      toast('Save undone');
+      return;
+    }
     // the reader chat's discussion goes along, as a PDF for Linkwarden
     const body = typeof saveBody === 'function' ? saveBody() : undefined;
-    const result = await post(card.dataset.id, 'save', body);
+    // the tab Save was pressed in decides the collection
+    const result = await post(card.dataset.id, 'save', {...body, section: card.dataset.section});
     markSaved(card.dataset.id);
     if (typeof saved === 'function') saved(result);
-  } catch (e) { toast('Could not save: ' + e.message); }
+  } catch (e) { toast((undo ? 'Could not undo the save: ' : 'Could not save: ') + e.message); }
   finally { btn.disabled = false; }
 }
 async function promote(btn) {
@@ -714,7 +736,7 @@ async function vote(btn, value) {
   const card = btn.closest('.card');
   btn.disabled = true;
   try {
-    await post(card.dataset.id, 'interest', {value});
+    await post(card.dataset.id, 'interest', {value, section: card.dataset.section});
     if (value === 'down') { card.setAttribute('data-down', ''); }
     else {
       btn.classList.add('on'); btn.setAttribute('aria-pressed', 'true');
@@ -733,6 +755,32 @@ async function vote(btn, value) {
 # page went away is fetched again by its job id when the story opens. Model
 # text is escaped before the little Markdown it may use (paragraphs, lists,
 # bold, http/https links) becomes markup.
+# A read, not a glance: the text 20 s on screen (a visible tab, counted per
+# second) or its middle scrolled into view. Reported once, with the tab the
+# story came from.
+LEARN_JS = r"""
+(() => {
+  const card = document.querySelector('.end .card');
+  let sent = false, seconds = 0;
+  function read() {
+    if (sent) return;
+    sent = true;
+    clearInterval(timer);
+    removeEventListener('scroll', scrolled);
+    navigator.sendBeacon(`/read/${card.dataset.id}/opened?section=${card.dataset.section}`);
+  }
+  function scrolled() {
+    const text = document.querySelector('.article:not([hidden])');
+    const box = text && text.getBoundingClientRect();
+    if (box && box.top + box.height / 2 < innerHeight) read();
+  }
+  const timer = setInterval(() => {
+    if (document.visibilityState === 'visible' && ++seconds >= 20) read();
+  }, 1000);
+  addEventListener('scroll', scrolled, {passive: true});
+})();
+"""
+
 CHAT_JS = r"""
 const turns = [];
 let attachedTurns = 0;
@@ -1322,6 +1370,23 @@ h1 { margin: 12px 0 0; font-size: 30px; line-height: 1.15; font-weight: 720;
   padding: 12px 14px; border-radius: 12px; background: var(--chip); overflow-x: auto;
   font-size: 0.79em; line-height: 1.45;
 }
+/* plain text: monospace, but wrapped to the screen; each <span> is a
+   paragraph or list item whose wrapped lines start at column --h */
+.article .plain {
+  margin: 0 0 1em; font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 0.84em; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.article .plain span {
+  display: block; padding-left: calc(var(--h, 0) * 1ch); text-indent: calc(var(--h, 0) * -1ch);
+}
+.article .plain span:empty { height: 1.5em; }
+.article .plain .rule { white-space: pre; overflow: hidden; }
+/* an ASCII diagram redrawn as SVG: as wide as the screen, not wider than a page */
+.article .diagram svg {
+  display: block; width: 100%; max-width: 480px; height: auto; margin: 0 auto;
+  color: var(--ink);
+}
+.article .diagram-error svg { color: var(--muted); }
 main > .meta .chip { background: var(--card); }  /* on the page, not a card */
 .article .lead { font-size: 1.05em; line-height: 1.5; }
 .article .video-info { margin: -4px 0 0; font-size: 0.79em; color: var(--muted); }
@@ -1393,7 +1458,7 @@ __FIGURE__
 __BODY__
 __CHAT__
 <div class="end">
-  <article class="card" data-id="__ID__">
+  <article class="card" data-id="__ID__" data-section="__SECTION__">
     <div class="gone">Less like this, noted.</div>
     <div class="body">__ACTIONBAR__</div>
   </article>
@@ -1404,6 +1469,7 @@ __CHAT__
 <script>
 __ACTIONS__sizeButtons();
 __CHATJS__
+__LEARNJS__
 </script>
 </body>
 </html>

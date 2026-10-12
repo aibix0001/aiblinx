@@ -41,7 +41,25 @@ _SENTENCE_END = re.compile(r"[.!?…][\"'»«“”)\]]*(?:\s|$)")
 
 _BLOCK = {"p": "p", "quote": "blockquote"}
 _HEADS = {"h1": "h2", "h2": "h2", "h3": "h3"}  # the page title is the only <h1>
+_HEAD_RANK = re.compile(r"<h([2-6])>")
 _HI = {"#b": "strong", "#i": "em", "#u": "em", "#t": "code"}
+
+
+# Plain text in a <pre> (release notes, mailing-list posts) is prose wrapped
+# by hand at 72 columns or so. It stays plain text, but its line breaks
+# inside a paragraph are joined, so it wraps to the screen. Code keeps its
+# lines: code has lines that end in ; { or }, prose next to none. So do
+# diagrams and tables: they draw boxes or set text in columns.
+_CODE_LINE = re.compile(r"[;{}]\s*$")
+_BOX = re.compile("[\u2500-\u257f]")
+_COLUMNS = re.compile(r"\S {3,}\S")
+_RULE = re.compile(r"\s*([-=~_*#])\1{2,}\s*")  # a heading's underline
+_BULLET = re.compile(r"\s*(?:[-*+•]|\d{1,3}[.)])\s+(?=\S)")
+# A mark that a quoted paragraph repeats on each of its lines
+_QUOTE = re.compile(r"\s*(?:\*\*|>+|\|)(?:\s+|$)")
+# A line shorter than this share of the text's width ends where its author
+# ended it, not where the next word did not fit.
+_FULL_LINE = 0.8
 
 
 # A picture's place in the text: it goes through the extraction as a word
@@ -74,27 +92,32 @@ def hide_reads_from_access_log() -> None:
         access.addFilter(_NoReads())
 
 
-async def fetch_html(url: str, timeout_s: float) -> bytes | None:
-    """The page's raw HTML, or None if it is not an HTML page or fails to load.
+async def load_html(url: str, timeout_s: float) -> bytes | None:
+    """The page's raw HTML, or None if the server answers with something that
+    is not an HTML page. Raises ``httpx.HTTPError`` when the page could not be
+    loaded at all (timeout, dropped connection).
     Bytes, not text: many pages declare their charset only in a <meta> tag,
     which trafilatura's own encoding detection reads."""
     if not url.startswith(("http://", "https://")):
         return None
+    async with (
+        httpx.AsyncClient(headers=PAGE_HEADERS, timeout=timeout_s, follow_redirects=True) as client,
+        client.stream("GET", url) as resp,
+    ):
+        if resp.status_code != 200 or "html" not in resp.headers.get("content-type", ""):
+            return None
+        body = b""
+        async for chunk in resp.aiter_bytes():
+            body += chunk
+            if len(body) >= _MAX_BYTES:
+                break
+        return body
+
+
+async def fetch_html(url: str, timeout_s: float) -> bytes | None:
+    """The page's raw HTML, or None if it is not an HTML page or fails to load."""
     try:
-        async with (
-            httpx.AsyncClient(
-                headers=PAGE_HEADERS, timeout=timeout_s, follow_redirects=True
-            ) as client,
-            client.stream("GET", url) as resp,
-        ):
-            if resp.status_code != 200 or "html" not in resp.headers.get("content-type", ""):
-                return None
-            body = b""
-            async for chunk in resp.aiter_bytes():
-                body += chunk
-                if len(body) >= _MAX_BYTES:
-                    break
-            return body
+        return await load_html(url, timeout_s)
     except httpx.HTTPError:
         return None
 
@@ -120,10 +143,25 @@ def _text(el: etree._Element, figures: list[str], out: list[str]) -> str:
     return _TOKEN.sub(" ", text).strip()
 
 
-def _blocks(parent: etree._Element, figures: list[str]) -> list[str]:
+def _words(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _pre(text: str) -> str:
+    if _is_plain_text(text):
+        return _plain(text)
+    return f"<pre><code>{html.escape(text)}</code></pre>"
+
+
+def _blocks(parent: etree._Element, figures: list[str], pres: dict[str, str]) -> list[str]:
+    """Reader HTML of trafilatura's blocks. ``pres`` holds the text of the
+    page's <pre> elements by their words, with their line breaks."""
     out = []
     for el in parent:
-        if el.tag in _BLOCK:
+        pre = pres.get(_words("".join(el.itertext()))) if el.tag in ("code", "quote") else None
+        if pre is not None:
+            out.append(_pre(pre))
+        elif el.tag in _BLOCK:
             text = _text(el, figures, out)
             if text:
                 out.append(f"<{_BLOCK[el.tag]}>{text}</{_BLOCK[el.tag]}>")
@@ -139,14 +177,80 @@ def _blocks(parent: etree._Element, figures: list[str]) -> list[str]:
             if items:
                 out.append(f"<{tag}>{items}</{tag}>")
         elif el.tag == "code":
-            out.append(f"<pre><code>{html.escape(''.join(el.itertext()))}</code></pre>")
+            out.append(_pre("".join(el.itertext())))
         elif el.tag == "div":
-            out.extend(_blocks(el, figures))
+            out.extend(_blocks(el, figures, pres))
         # text the page left outside a paragraph, behind a picture
         tail = html.escape((el.tail or "").strip())
         if tail and _TOKEN.fullmatch(el.text or "") and not len(el):
             out.append(f"<p>{tail}</p>")
     return out
+
+
+def _is_plain_text(text: str) -> bool:
+    lines = [line for line in text.splitlines() if line.strip()]
+    code = sum(1 for line in lines if _CODE_LINE.search(line))
+    columns = sum(1 for line in lines if _COLUMNS.search(line))
+    return (
+        _is_prose(text)
+        and code * 20 <= len(lines)
+        and columns * 10 <= len(lines)
+        and not _BOX.search(text)
+    )
+
+
+def _plain(text: str) -> str:
+    """Plain text as one <span> per paragraph, list item or heading, its
+    line breaks joined. ``--h`` is the column where a line's text starts
+    after its indent and list or quote mark; the lines it wraps into start
+    there too. An empty <span> is a blank line."""
+    lines = [line.rstrip() for line in text.expandtabs().splitlines()]
+    lengths = sorted(len(line) for line in lines if line)
+    width = lengths[len(lengths) * 9 // 10] if lengths else 0  # a long URL aside
+    spans: list[str] = []
+    words: list[str] = []
+    hang, mark, last = 0, None, ""
+
+    def flush() -> None:
+        if words:
+            style = f' style="--h:{hang}"' if hang else ""
+            spans.append(f"<span{style}>{html.escape(' '.join(words))}</span>")
+            words.clear()
+
+    for i, line in enumerate(lines):
+        if not line.strip():
+            flush()
+            if spans and spans[-1] != "<span></span>":
+                spans.append("<span></span>")
+            continue
+        if _RULE.fullmatch(line):
+            flush()
+            spans.append(f'<span class="rule">{html.escape(line)}</span>')
+            continue
+        indent = len(line) - len(line.lstrip())
+        quote = _QUOTE.match(line)
+        rest = line[quote.end() :] if quote else line.lstrip()
+        first = rest.split()[0] if rest.strip() else ""
+        # the line before broke here because this word did not fit on it
+        full = len(last) + 1 + len(first) > width * _FULL_LINE
+        heading = i + 1 < len(lines) and _RULE.fullmatch(lines[i + 1])
+        if quote and mark:
+            same = quote.group().strip() == mark
+        else:
+            same = not quote and not mark and indent == hang
+        if words and same and full and first and not heading and not _BULLET.match(rest):
+            words.append(rest.strip())
+        else:
+            flush()
+            start = quote or _BULLET.match(line)
+            hang = start.end() if start else indent
+            mark = quote.group().strip() if quote else None
+            words.append(line)
+        last = line
+    flush()
+    while spans and spans[-1] == "<span></span>":
+        spans.pop()
+    return '<div class="plain">' + "".join(spans) + "</div>"
 
 
 def _px(value: str | None) -> int | None:
@@ -337,6 +441,9 @@ def extract_blocks(
     if tree is None:
         return None
     figures = _take_figures(tree, url, image)
+    # trafilatura may take a <pre> for a quote and run its lines together
+    texts = ("".join(pre.itertext()) for pre in tree.iter("pre"))
+    pres = {_words(text): text for text in texts if text.strip()}
     xml = trafilatura.extract(
         tree,
         url=url,
@@ -361,7 +468,26 @@ def extract_blocks(
         and "".join(first.itertext()).strip().casefold() == title.strip().casefold()
     ):
         main.remove(first)
-    return _blocks(main, figures)
+    return _without_empty_heads(_blocks(main, figures, pres))
+
+
+def _without_empty_heads(blocks: list[str]) -> list[str]:
+    """The blocks without the headings that have no text under them: a
+    heading followed by one of its rank or higher, or by the end. A page
+    that shows only part of itself (a forum's posts off screen, a "Load
+    more" button) leaves such headings behind."""
+    kept: list[str] = []
+    after = 0  # rank of the next kept heading; 9 for text, 0 for the end
+    for block in reversed(blocks):
+        head = _HEAD_RANK.match(block)
+        if head:
+            if int(head[1]) >= after:
+                continue
+            after = int(head[1])
+        else:
+            after = 9
+        kept.append(block)
+    return kept[::-1]
 
 
 # Files a browser plays natively everywhere. HLS (.m3u8) is not among them,

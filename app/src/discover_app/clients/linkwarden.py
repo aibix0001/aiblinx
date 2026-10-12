@@ -91,6 +91,17 @@ class LinkwardenClient:
         data = resp.json()
         return data.get("response", data) if isinstance(data, dict) else data
 
+    async def delete_link(self, link_id: int) -> None:
+        """Delete a link with its archives; one that is already gone counts as
+        deleted. Linkwarden answers a missing link with 401 "Collection is not
+        accessible." (a bad token says "You must be logged in.")."""
+        resp = await self._client.delete(f"/links/{int(link_id)}")
+        if resp.status_code == 404 or (
+            resp.status_code == 401 and _message(resp) == "Collection is not accessible."
+        ):
+            return
+        resp.raise_for_status()
+
     async def upload_pdf(self, link_id: int, data: bytes, filename: str) -> None:
         """Put ``data`` into the link's PDF slot (``format=2``). A link has one
         PDF: this replaces the page PDF Linkwarden made, and the preservation
@@ -122,3 +133,12 @@ class LinkwardenClient:
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+
+def _message(resp: httpx.Response) -> str | None:
+    """Linkwarden's ``{"response": "..."}`` error text, if that is the body."""
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+    return data.get("response") if isinstance(data, dict) else None

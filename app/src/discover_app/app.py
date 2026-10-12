@@ -7,7 +7,7 @@ import json
 import logging
 import secrets
 from contextlib import asynccontextmanager
-from typing import Annotated
+from typing import Annotated, Literal
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Query
@@ -20,6 +20,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 
+from .article import Page, Unreachable, get_page
 from .auth import feed_token, password_ok, require_login, set_session
 from .chat import (
     Chat,
@@ -37,7 +38,7 @@ from .clients.llm import LLMClient
 from .clients.miniflux import MinifluxClient
 from .clients.rss import subscribe
 from .clients.searxng import SearxngClient
-from .config import get_settings
+from .config import Settings, get_settings
 from .db import connection, get_meta, init_db
 from .html_text import card_summary, strip_html
 from .icons import ICONS, MANIFEST
@@ -68,8 +69,10 @@ from .pipeline.feedback import (
     mirror_facet_tags,
     promote_candidate,
     record_feedback,
+    record_open,
     record_rating,
     served_section,
+    unsave_candidate,
 )
 from .pipeline.feeds import add_feed, list_feeds, remove_feed
 from .pipeline.holds import held_ids, hold_candidate, list_holds, release_hold
@@ -77,7 +80,6 @@ from .pipeline.miniflux_key import ensure_miniflux_token, miniflux_configured
 from .pipeline.output import current_items, render_atom, render_markdown
 from .reader import (
     extract_article,
-    fetch_html,
     find_video,
     hide_reads_from_access_log,
     video_body,
@@ -92,6 +94,18 @@ log = logging.getLogger("discover_app")
 
 # The Saved panel shows the newest saves; older ones stay in the database.
 _SAVED_LIST_MAX = 200
+
+
+async def _page(settings: Settings, item: dict) -> Page | None:
+    """The story's page for the reader view, None when it can't be shown."""
+    llm = LLMClient(settings) if settings.llm_chat_model else None
+    try:
+        return await get_page(settings, item["url"], item["title"], llm)
+    except Unreachable:
+        return None
+    finally:
+        if llm is not None:
+            await llm.aclose()
 
 
 @asynccontextmanager
@@ -127,7 +141,10 @@ def create_app() -> FastAPI:
             }
             saved = conn.execute("SELECT COUNT(*) FROM feedback WHERE axis = 'saved'").fetchone()[0]
             ratings = conn.execute("SELECT COUNT(*) FROM ratings").fetchone()[0]
-        return HealthResponse(status="ok", saved_events=saved, ratings_count=ratings, **counts)
+            opens = conn.execute("SELECT COUNT(*) FROM opens").fetchone()[0]
+        return HealthResponse(
+            status="ok", saved_events=saved, ratings_count=ratings, opens_count=opens, **counts
+        )
 
     @app.get("/feed", response_model=FeedResponse)
     def feed(
@@ -478,9 +495,14 @@ def create_app() -> FastAPI:
     # token dance. ADMIN_TOKEN stays reserved for credit-spending admin routes.
 
     @app.get("/read/{candidate_id}", response_class=HTMLResponse, include_in_schema=False)
-    async def read(candidate_id: int) -> Response:
+    async def read(
+        candidate_id: int, section: Literal["curated", "broad"] | None = None
+    ) -> Response:
         """Reader view of one feed item; the original page when there is no
-        article text to show. Records nothing about the visit (no tracking)."""
+        article text to show. The visit itself records nothing: with
+        ``READER_LEARN`` the page reports a read of the text to
+        ``/read/{id}/opened``. ``section`` is the tab the story was opened
+        from; its buttons follow it."""
         settings = get_settings()
         with connection() as conn:
             row = conn.execute(
@@ -501,7 +523,7 @@ def create_app() -> FastAPI:
             ).fetchone()
             # the one button that files the story on the other side
             filed = conn.execute("SELECT section FROM saves WHERE url_key = ?", (key,)).fetchone()
-            if served_section(conn, candidate_id) == "broad":
+            if (section or served_section(conn, candidate_id)) == "broad":
                 promoted, explored = bool(filed and filed[0] == "curated"), None
             else:
                 promoted, explored = None, bool(filed and filed[0] == "broad")
@@ -510,9 +532,15 @@ def create_app() -> FastAPI:
                 "SELECT lang, body, title_tr, body_tr FROM articles WHERE candidate_id = ?",
                 (candidate_id,),
             ).fetchone()
+            # the build found nothing the reader can show: no wait for a refetch
+            checked_unreadable = conn.execute(
+                "SELECT 1 FROM page_checks WHERE candidate_id = ? AND readable = 0",
+                (candidate_id,),
+            ).fetchone()
         item = dict(row)
         translation = None
-        page = body = None
+        body = None
+        text = True  # article text, not a video
         if prepared and prepared["body"]:
             # prepared at cycle time: no fetch from the publisher now
             body = prepared["body"]
@@ -522,21 +550,19 @@ def create_app() -> FastAPI:
                     "title": prepared["title_tr"],
                     "body": prepared["body_tr"],
                 }
-        else:
-            page = await fetch_html(item["url"], settings.enrich_timeout_s)
-            body = (
-                await asyncio.to_thread(
-                    extract_article, page, item["url"], item["title"], item["image_url"]
+        elif not checked_unreadable:
+            page = await _page(settings, item)
+            if page and page.article:
+                body = await asyncio.to_thread(
+                    extract_article, page.html, item["url"], item["title"], item["image_url"]
                 )
-                if page
-                else None
-            )
-        if body is None and page:
-            # no article, but maybe a video we can play without its page
-            video = await asyncio.to_thread(find_video, page)
-            if video:
-                body = video_body(video, item["title"])
-                item["image_url"] = None  # the poster is the picture
+            elif page:
+                # no article, but a video we can play without its page
+                video = await asyncio.to_thread(find_video, page.html)
+                if video:
+                    body = video_body(video, item["title"])
+                    text = False
+                    item["image_url"] = None  # the poster is the picture
         if body is None:
             return RedirectResponse(item["url"], status_code=302)
         return HTMLResponse(
@@ -551,6 +577,7 @@ def create_app() -> FastAPI:
                 held=held,
                 translation=translation,
                 chat=settings.chat_enabled,
+                learn=settings.reader_learn and text,
             ),
             headers={"Referrer-Policy": "no-referrer", "Cache-Control": "no-store"},
         )
@@ -567,6 +594,22 @@ def create_app() -> FastAPI:
             media_type="text/event-stream",
             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
         )
+
+    @app.post("/read/{candidate_id}/opened", status_code=204, include_in_schema=False)
+    def read_opened(
+        candidate_id: int, section: Literal["curated", "broad"] | None = None
+    ) -> Response:
+        """The reader page's report that its text was read (20 s on screen or
+        half scrolled past): a small positive signal, once per story. A
+        beacon without a body, the tab in the query."""
+        settings = get_settings()
+        if not settings.reader_learn:
+            raise HTTPException(status_code=404, detail="reader learning is off")
+        try:
+            record_open(settings, candidate_id, section)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail="no such item") from exc
+        return Response(status_code=204)
 
     @app.post("/read/{candidate_id}/chat", include_in_schema=False)
     async def read_chat(candidate_id: int, body: ChatRequest) -> StreamingResponse:
@@ -588,7 +631,7 @@ def create_app() -> FastAPI:
             llm = LLMClient(settings)  # its own client: never queued behind the cycle
             searxng = SearxngClient(settings) if settings.searxng_url else None
             try:
-                text = await article_text(settings, item, body.lang)
+                text = await article_text(settings, item, body.lang, llm)
                 system = system_prompt(item, text, search=searxng is not None)
                 async for event in Chat(llm, searxng, system, body.messages).run():
                     yield event
@@ -620,7 +663,9 @@ def create_app() -> FastAPI:
         when the story was saved before."""
         settings = get_settings()
         try:
-            result = await capture_candidate(settings, candidate_id)
+            result = await capture_candidate(
+                settings, candidate_id, section=body.section if body else None
+            )
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except httpx.HTTPError as exc:
@@ -632,6 +677,20 @@ def create_app() -> FastAPI:
             result["attached"] = await attach_discussion(
                 settings, candidate_id, body.discussion, link_id=result.get("linkwarden_id")
             )
+        return CaptureResponse(**result)
+
+    @app.delete("/feed/{candidate_id}/save", response_model=CaptureResponse)
+    async def feed_unsave(candidate_id: int) -> CaptureResponse:
+        """Undo Save: the story's links leave Linkwarden, its save and
+        ``saved`` signal leave the database (idempotent)."""
+        try:
+            result = await unsave_candidate(get_settings(), candidate_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=502, detail=f"Linkwarden rejected the removal: {exc}"
+            ) from exc
         return CaptureResponse(**result)
 
     @app.post("/feed/{candidate_id}/promote", response_model=CaptureResponse)
@@ -680,11 +739,11 @@ def create_app() -> FastAPI:
 
     @app.post("/feed/{candidate_id}/interest", response_model=FeedbackResponse)
     async def feed_interest(candidate_id: int, body: FeedbackRequest) -> FeedbackResponse:
-        return await _record(candidate_id, "interest", body.value)
+        return await _record(candidate_id, "interest", body.value, body.section)
 
     @app.post("/feed/{candidate_id}/mood", response_model=FeedbackResponse)
     async def feed_mood(candidate_id: int, body: FeedbackRequest) -> FeedbackResponse:
-        return await _record(candidate_id, "mood", body.value)
+        return await _record(candidate_id, "mood", body.value, body.section)
 
     @app.post("/feed/{candidate_id}/rating", response_model=RatingResponse)
     async def feed_rating(candidate_id: int, body: FeedbackRequest) -> RatingResponse:
@@ -709,10 +768,12 @@ def create_app() -> FastAPI:
             changed=changed,
         )
 
-    async def _record(candidate_id: int, axis: str, value: str) -> FeedbackResponse:
+    async def _record(
+        candidate_id: int, axis: str, value: str, section: str | None
+    ) -> FeedbackResponse:
         settings = get_settings()
         try:
-            url_key = record_feedback(settings, candidate_id, axis, value)
+            url_key = record_feedback(settings, candidate_id, axis, value, section)
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:

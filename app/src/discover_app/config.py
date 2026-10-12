@@ -108,6 +108,32 @@ class Settings(BaseSettings):
     # Reader chat: talk about the story under its text, with web search when
     # SearXNG is set up; the discussion goes to Linkwarden as a PDF on save
     reader_chat: bool = True
+    # Reader learning: a story read in the reader (its text 20 s on screen, or
+    # half of it scrolled past) is a small positive signal, READER_OPEN_WEIGHT
+    # where a save or an upvote counts 1. Only stories the reader shows as
+    # text count; a save or a vote on the same story overrides it.
+    reader_learn: bool = True
+    reader_open_weight: float = Field(default=0.1, ge=0.0, le=1.0)
+    # Reader browser: pages the plain fetch can't read (consent banners, text
+    # built by scripts) are rendered in a remote Playwright browser, e.g.
+    # ws://browser:3000/ (compose service "browser"); empty = off
+    browser_ws_url: str = ""
+    browser_concurrency: int = Field(default=3, ge=1)
+    browser_timeout_s: float = Field(default=30.0, gt=0.0)
+    # DuckDuckGo autoconsent's playwright bundle and rules (the Dockerfile
+    # puts them here); without them the chat model alone handles banners
+    autoconsent_dir: str = "/app/autoconsent"
+    # Reader diagrams: a box drawing too wide for a phone is redrawn as SVG
+    # at cycle time by this hosted model (OpenRouter by default; about $0.02
+    # a diagram with Claude Sonnet). No token or no model = off. Apart from
+    # OPENROUTER_API_KEY, which would also move the chat and embedding model.
+    diagram_llm_base_url: str = OPENROUTER_BASE_URL
+    diagram_llm_token: str = ""
+    diagram_llm_model: str = ""
+    # OpenRouter reasoning effort for the drawing (none, minimal, low, medium,
+    # high); empty = the model's own default. Claude Haiku 5.5 reasons at
+    # length by default: "low" draws as well in about half the time and cost.
+    diagram_llm_effort: str = ""
 
     # --- ranking ---
     # Nearest stories per interest centroid. Most of them were served in an
@@ -196,6 +222,11 @@ class Settings(BaseSettings):
     def translate_enabled(self) -> bool:
         """Reader translations need the chat model."""
         return self.reader_translate and bool(self.llm_chat_model)
+
+    @property
+    def diagrams_enabled(self) -> bool:
+        """Redrawing diagrams needs the hosted model's token and name."""
+        return bool(self.diagram_llm_token and self.diagram_llm_model)
 
     @property
     def chat_enabled(self) -> bool:

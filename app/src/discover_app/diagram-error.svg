@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 200" role="img" aria-label="Diagram not available: drawing it failed. The original page shows it.">
+  <rect x="8" y="8" width="344" height="184" rx="14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-dasharray="6 5" opacity="0.45"/>
+  <g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="104" y="34" width="56" height="38" rx="7"/>
+    <rect x="200" y="34" width="56" height="38" rx="7" stroke-dasharray="5 4" opacity="0.45"/>
+    <line x1="160" y1="53" x2="170" y2="53"/>
+    <line x1="190" y1="53" x2="200" y2="53" opacity="0.45"/>
+    <line x1="174" y1="60" x2="178" y2="46"/>
+    <line x1="182" y1="60" x2="186" y2="46"/>
+    <circle cx="256" cy="34" r="11" stroke-width="1.75"/>
+    <line x1="256" y1="28" x2="256" y2="35"/>
+  </g>
+  <circle cx="256" cy="40" r="1.4" fill="currentColor"/>
+  <g fill="currentColor" text-anchor="middle">
+    <text x="180" y="118" font-size="17" font-weight="700">Diagram not available</text>
+    <text x="180" y="146" font-size="13" opacity="0.8">Drawing it for your screen failed.</text>
+    <text x="180" y="166" font-size="13" opacity="0.8">The original page shows it.</text>
+  </g>
+</svg>

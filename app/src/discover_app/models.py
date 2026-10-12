@@ -39,10 +39,13 @@ class HealthResponse(BaseModel):
     saved_events: int = 0
     # Explicit ratings count
     ratings_count: int = 0
+    # Stories read in the reader (implicit signal)
+    opens_count: int = 0
 
 
 class FeedbackRequest(BaseModel):
     value: str  # interest: up|down; mood: happy|sad (validated in the pipeline)
+    section: Literal["curated", "broad"] | None = None  # the tab the vote came from
 
 
 class FeedbackResponse(BaseModel):
@@ -63,7 +66,7 @@ class RatingResponse(BaseModel):
 
 
 class CaptureResponse(BaseModel):
-    status: Literal["saved", "already_saved", "promoted", "saved_to_exploring"]
+    status: Literal["saved", "already_saved", "promoted", "saved_to_exploring", "unsaved"]
     linkwarden_id: int | None = None
     # a discussion sent with the save: whether it reached the Linkwarden link
     attached: bool | None = None

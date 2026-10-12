@@ -32,6 +32,7 @@ from openai import BadRequestError
 from PIL import Image
 from pydantic import BaseModel, Field
 
+from .article import Unreachable, get_page
 from .clients.linkwarden import LinkwardenClient
 from .clients.llm import LLMClient
 from .clients.searxng import SearxngClient
@@ -40,7 +41,7 @@ from .db import connection
 from .discussion_pdf import render_discussion
 from .html_text import card_summary, strip_html
 from .pipeline.enrich import PAGE_HEADERS
-from .reader import extract_article, fetch_html
+from .reader import extract_article
 from .urls import norm_url
 
 log = logging.getLogger(__name__)
@@ -77,6 +78,16 @@ SEARCH_TOOL = {
         },
     },
 }
+# The last round offers no tool and asks for the answer in a message after
+# the search results. Offered with tool_choice "none", Qwen3.6 on vLLM still
+# wrote a search call, which the server drops: an empty reply in 2 of 9 last
+# rounds. Without the tool and with this line at the end of the system prompt
+# (behind the article), 3 of 8; as the last message, 0 of 6 (measured
+# 2026-10-12).
+LAST_ROUND = (
+    "The searches are done and web_search is no longer available: answer the "
+    "question now, from the story and the search results you have."
+)
 
 
 class SearchResult(BaseModel):
@@ -102,9 +113,11 @@ class ChatRequest(BaseModel):
 
 
 class SaveRequest(BaseModel):
-    """Save's optional body: the discussion to attach to the Linkwarden link."""
+    """Save's optional body: the discussion to attach to the Linkwarden link,
+    and the tab Save was pressed in."""
 
     discussion: list[ChatTurn] = Field(default=[], max_length=MAX_TURNS)
+    section: Literal["curated", "broad"] | None = None  # the tab Save was pressed in
 
 
 _BLOCK_END = re.compile(r"</(?:p|h2|h3|li|blockquote|pre|figcaption)>|<br>", re.I)
@@ -140,7 +153,9 @@ def story(settings: Settings, candidate_id: int) -> dict:
     return item
 
 
-async def article_text(settings: Settings, item: dict, lang: str | None) -> str:
+async def article_text(
+    settings: Settings, item: dict, lang: str | None, llm: LLMClient | None = None
+) -> str:
     """The article as the reader shows it: the prepared text, or its
     translation when that is on screen; else fetched and extracted now, the
     way the reader does it, and not stored."""
@@ -153,10 +168,13 @@ async def article_text(settings: Settings, item: dict, lang: str | None) -> str:
         if lang and prepared["lang"] and lang != prepared["lang"] and prepared["body_tr"]:
             shown = prepared["body_tr"]
         return plain_text(shown)
-    page = await fetch_html(item["url"], settings.enrich_timeout_s)
-    if not page:
+    try:
+        page = await get_page(settings, item["url"], item["title"], llm)
+    except Unreachable:
+        page = None
+    if not page or not page.article:
         return ""
-    body = await asyncio.to_thread(extract_article, page, item["url"], item["title"])
+    body = await asyncio.to_thread(extract_article, page.html, item["url"], item["title"])
     return plain_text(body) if body else ""
 
 
@@ -246,14 +264,14 @@ class Chat:
         for n, turn in enumerate(turns):
             self.messages.extend(_history(turn, n))
 
-    async def _stream(self, tools: bool, last: bool) -> AsyncIterator[tuple[str, Any]]:
+    async def _stream(self, tools: bool) -> AsyncIterator[tuple[str, Any]]:
         """The model's reply. On HTTP 400 with the tool the call goes again
         without it, and the chat goes on without search (logged once)."""
         while True:
             kwargs: dict[str, Any] = {"presence_penalty": PRESENCE_PENALTY}
             if tools:
                 kwargs["tools"] = [SEARCH_TOOL]
-                kwargs["tool_choice"] = "none" if last else "auto"
+                kwargs["tool_choice"] = "auto"
             started = False
             try:
                 async for event in self.llm.chat_stream(self.messages, **kwargs):
@@ -274,14 +292,25 @@ class Chat:
         """Events for the page: ``{"type": "text", "text"}`` pieces of the
         answer and ``{"type": "search", "query", "results"}`` per search."""
         for round_ in range(MAX_ROUNDS + 1):
-            tools = self.searxng is not None
-            calls = None
-            async for kind, value in self._stream(tools, last=round_ == MAX_ROUNDS):
-                if kind == "text":
-                    yield {"type": "text", "text": value}
-                else:
-                    calls = value
-            if not calls or self.searxng is None or round_ == MAX_ROUNDS:
+            last = round_ == MAX_ROUNDS
+            if last:
+                self.messages.append({"role": "user", "content": LAST_ROUND})
+            # A reply with neither text nor a search (a call the server
+            # dropped, or the answer left in the reasoning) goes once more.
+            for attempt in range(2):
+                calls = None
+                said = False
+                async for kind, value in self._stream(self.searxng is not None and not last):
+                    if kind == "text":
+                        said = said or bool(value.strip())
+                        yield {"type": "text", "text": value}
+                    else:
+                        calls = value
+                if said or calls:
+                    break
+                if attempt == 0:
+                    log.info("reader chat: an empty reply, asking again")
+            if not calls or self.searxng is None or last:
                 return
             self.messages.append(
                 {

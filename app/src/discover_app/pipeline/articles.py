@@ -1,7 +1,9 @@
 """Reader articles prepared at cycle time, with a German / English translation.
 
 Runs after enrich_feed on the current cycle's items. Each page is fetched
-once, its main text extracted exactly as the reader does, its language told
+once the way the reader does (``article.get_page``: past consent banners, in
+the headless browser when needed), its main text extracted (a wide ASCII
+diagram redrawn as SVG when ``DIAGRAM_LLM_*`` is set), its language told
 apart (German or English) and the title and text translated into the other
 one by the chat model. The reader then serves both from the ``articles``
 table and toggles between them in place.
@@ -23,10 +25,12 @@ import time
 
 from openai import BadRequestError
 
+from ..article import Unreachable, get_page
 from ..clients.llm import LLMClient
 from ..config import Settings, get_settings
 from ..db import connection
-from ..reader import extract_blocks, fetch_html
+from ..diagrams import draw_diagrams
+from ..reader import extract_blocks
 
 log = logging.getLogger(__name__)
 
@@ -204,12 +208,17 @@ async def prepare_articles(settings: Settings | None = None, llm: LLMClient | No
         t0 = time.monotonic()
         title = html.unescape(row["title"] or "")
         async with semaphore:
-            page = await fetch_html(row["url"], settings.enrich_timeout_s)
+            try:
+                page = await get_page(settings, row["url"], title, llm)
+            except Unreachable:
+                page = None
         blocks = (
-            await asyncio.to_thread(extract_blocks, page, row["url"], title, row["image_url"])
-            if page
+            await asyncio.to_thread(extract_blocks, page.html, row["url"], title, row["image_url"])
+            if page and page.article
             else None
         )
+        if blocks:
+            blocks = await draw_diagrams(blocks, settings)
         body = "\n".join(blocks) if blocks else None
         t1 = time.monotonic()
         lang = title_tr = body_tr = None

@@ -19,6 +19,15 @@ RUN apt-get update \
 
 WORKDIR /app
 
+# DuckDuckGo autoconsent (MPL-2.0): the content script and rules the reader
+# browser runs to accept consent banners (see src/discover_app/browser.py)
+ADD --checksum=sha256:53133e678d55f30e225e52cf90f7e303e637a72dca2e478aafa873b6bd4abcdc \
+    https://registry.npmjs.org/@duckduckgo/autoconsent/-/autoconsent-16.41.0.tgz /tmp/autoconsent.tgz
+RUN mkdir -p /app/autoconsent \
+ && tar -xzf /tmp/autoconsent.tgz -C /app/autoconsent --strip-components=1 \
+      package/LICENSE package/dist/autoconsent.playwright.js package/rules/rules.json \
+ && rm /tmp/autoconsent.tgz
+
 # Install dependencies first (cached unless the lockfile changes). The uv cache
 # mount persists wheel downloads across builds so re-runs don't re-download.
 COPY pyproject.toml uv.lock ./

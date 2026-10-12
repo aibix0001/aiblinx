@@ -12,6 +12,10 @@ The candidate's embedding is copied onto the feedback row at write time so the
 signal survives the 14-day candidate prune. URLs are stored normalized
 (``urls.norm_url``) — the same identity used by ranking exclusions.
 
+A story read in the reader lands in ``opens`` instead (``record_open``):
+an implicit signal worth ``reader_open_weight``, ignored wherever the same
+page has a save or an interest vote.
+
 Every signal also records the section its item was served in. Exploring
 (``broad``) feedback steers only Exploring: it never enters the interest
 profile, and Exploring saves go to their own Linkwarden collection.
@@ -48,12 +52,14 @@ _EXPLORE_COLLECTION_KEY = "linkwarden_explore_collection_id"
 
 
 def served_section(conn, candidate_id: int) -> str:
-    """'broad' when the item was served under Exploring, else 'curated'."""
+    """'broad' when the item was last served under Exploring, else 'curated':
+    the fallback for a request that does not say which tab it came from."""
     row = conn.execute(
-        "SELECT 1 FROM feed_items WHERE candidate_id = ? AND section = 'broad' LIMIT 1",
+        "SELECT section FROM feed_items WHERE candidate_id = ? "
+        "ORDER BY cycle_ts DESC, section = 'broad' LIMIT 1",
         (candidate_id,),
     ).fetchone()
-    return "broad" if row else "curated"
+    return "broad" if row and row[0] == "broad" else "curated"
 
 
 def known_explore_collection(conn, settings: Settings) -> int | None:
@@ -129,8 +135,32 @@ def record_rating(settings: Settings, candidate_id: int, value: float) -> tuple[
     return value, True
 
 
-def record_feedback(settings: Settings, candidate_id: int, axis: str, value: str) -> str:
-    """Store one explicit interest/mood event for a known candidate.
+def record_open(settings: Settings, candidate_id: int, section: str | None = None) -> bool:
+    """Note that a story was read in the reader, once per page identity.
+    True when this call added the row. LookupError for an unknown candidate."""
+    with connection(settings) as conn:
+        row = conn.execute(
+            "SELECT url, embedding FROM candidates WHERE id = ?", (candidate_id,)
+        ).fetchone()
+        if row is None:
+            raise LookupError(f"unknown candidate {candidate_id}")
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO opens(candidate_id, url, section, embedding) VALUES(?, ?, ?, ?)",
+            (
+                candidate_id,
+                norm_url(row["url"]),
+                section or served_section(conn, candidate_id),
+                row["embedding"],
+            ),
+        )
+        return cur.rowcount == 1
+
+
+def record_feedback(
+    settings: Settings, candidate_id: int, axis: str, value: str, section: str | None = None
+) -> str:
+    """Store one explicit interest/mood event for a known candidate, under
+    ``section``: the tab it was given in (where it was served when unsaid).
 
     Returns the normalized page identity (callers pass it to the tag mirror —
     no second candidate lookup, so a concurrent prune cannot break the caller).
@@ -156,7 +186,7 @@ def record_feedback(settings: Settings, candidate_id: int, axis: str, value: str
                 axis,
                 value,
                 row["embedding"],
-                served_section(conn, candidate_id),
+                section or served_section(conn, candidate_id),
             ),
         )
     return url_key
@@ -166,9 +196,12 @@ async def capture_candidate(
     settings: Settings,
     candidate_id: int,
     linkwarden: LinkwardenClient | None = None,
+    section: str | None = None,
 ) -> dict:
     """Save: record the candidate in the local Saved list and the ``saved``
     signal, and — when Linkwarden is connected — create it there as a link.
+    ``section`` is the tab Save was pressed in: Exploring files it in the
+    Exploring collection (where it was served when unsaid).
 
     Idempotent per normalized URL: an item already saved (explicitly,
     implicitly, or as a pre-existing bookmark) is not saved again; the capture
@@ -179,7 +212,7 @@ async def capture_candidate(
     state written (retry is safe).
     """
     async with _capture_lock:
-        result = await _capture(settings, candidate_id, linkwarden, section=None)
+        result = await _capture(settings, candidate_id, linkwarden, section=section)
     release_hold(settings, candidate_id)  # saved now: no longer held for later
     return result
 
@@ -212,7 +245,7 @@ async def explore_candidate(
     async with _capture_lock:
         link_id = await _file_as(settings, candidate_id, "broad", linkwarden)
     release_hold(settings, candidate_id)
-    record_feedback(settings, candidate_id, "interest", "down")
+    record_feedback(settings, candidate_id, "interest", "down", section="curated")
     log.info("explore: candidate %d filed under Exploring", candidate_id)
     return {"status": "saved_to_exploring", "linkwarden_id": link_id}
 
@@ -233,16 +266,7 @@ async def _file_as(
     with connection(settings) as conn:
         (url,) = conn.execute("SELECT url FROM candidates WHERE id = ?", (candidate_id,)).fetchone()
         url_key = norm_url(url)
-        save = conn.execute(
-            "SELECT linkwarden_id FROM saves WHERE url_key = ?", (url_key,)
-        ).fetchone()
-        link_ids = {
-            link_id
-            for link_id, link_url in conn.execute("SELECT id, url FROM links")
-            if norm_url(link_url) == url_key
-        }
-    if save and save[0]:
-        link_ids.add(int(save[0]))
+        link_ids = _story_links(conn, url_key)
     target = None
     if settings.linkwarden_enabled and link_ids:
         owns_client = linkwarden is None
@@ -274,6 +298,57 @@ async def _file_as(
     return min(link_ids) if link_ids else None
 
 
+def _story_links(conn, url_key: str) -> set[int]:
+    """The Linkwarden links of one story: the one its save made, and every
+    mirrored link with the same normalized URL."""
+    link_ids = {
+        link_id
+        for link_id, link_url in conn.execute("SELECT id, url FROM links")
+        if norm_url(link_url) == url_key
+    }
+    save = conn.execute("SELECT linkwarden_id FROM saves WHERE url_key = ?", (url_key,)).fetchone()
+    if save and save[0]:
+        link_ids.add(int(save[0]))
+    return link_ids
+
+
+async def unsave_candidate(
+    settings: Settings,
+    candidate_id: int,
+    linkwarden: LinkwardenClient | None = None,
+) -> dict:
+    """Un-save: delete the story's links from Linkwarden, then its local save,
+    ``saved`` event and mirrored links, so it no longer shapes the profile.
+    Votes stay. Idempotent; a Linkwarden failure propagates with no local
+    state changed (retry is safe)."""
+    async with _capture_lock:
+        with connection(settings) as conn:
+            row = conn.execute(
+                "SELECT url FROM candidates WHERE id = ?", (candidate_id,)
+            ).fetchone()
+            if row is None:
+                raise LookupError(f"unknown candidate {candidate_id}")
+            url_key = norm_url(row["url"])
+            link_ids = _story_links(conn, url_key)
+        if settings.linkwarden_enabled and link_ids:
+            owns_client = linkwarden is None
+            linkwarden = linkwarden or LinkwardenClient(settings)
+            try:
+                for link_id in sorted(link_ids):
+                    await linkwarden.delete_link(link_id)
+            finally:
+                if owns_client:
+                    await linkwarden.aclose()
+        with connection(settings) as conn:
+            conn.execute("DELETE FROM saves WHERE url_key = ?", (url_key,))
+            conn.execute("DELETE FROM feedback WHERE axis = 'saved' AND url = ?", (url_key,))
+            for link_id in link_ids:
+                conn.execute("DELETE FROM links WHERE id = ?", (link_id,))
+                conn.execute("DELETE FROM vec_links WHERE rowid = ?", (link_id,))
+    log.info("unsave: candidate %d removed, %d links deleted", candidate_id, len(link_ids))
+    return {"status": "unsaved"}
+
+
 async def _capture(
     settings: Settings,
     candidate_id: int,
@@ -281,7 +356,7 @@ async def _capture(
     section: str | None,
 ) -> dict:
     """capture_candidate's body, run under ``_capture_lock``; ``section``
-    overrides where the item was served (promote saves as ``curated``)."""
+    is the tab (promote saves as ``curated``), where it was served when unsaid."""
     with connection(settings) as conn:
         row = conn.execute(
             "SELECT url, title, image_url, embedding FROM candidates WHERE id = ?",

@@ -47,6 +47,13 @@ services:
       LINK_TARGET: ${LINK_TARGET:-}
       READER_TRANSLATE: ${READER_TRANSLATE:-}
       READER_CHAT: ${READER_CHAT:-}
+      READER_LEARN: ${READER_LEARN:-}
+      READER_OPEN_WEIGHT: ${READER_OPEN_WEIGHT:-}
+      BROWSER_WS_URL: ${BROWSER_WS_URL:-ws://browser:3000/}
+      DIAGRAM_LLM_BASE_URL: ${DIAGRAM_LLM_BASE_URL:-}
+      DIAGRAM_LLM_TOKEN: ${DIAGRAM_LLM_TOKEN:-}
+      DIAGRAM_LLM_MODEL: ${DIAGRAM_LLM_MODEL:-}
+      DIAGRAM_LLM_EFFORT: ${DIAGRAM_LLM_EFFORT:-}
       FEED_SIZE: ${FEED_SIZE:-}
       KNN_K: ${KNN_K:-}
       RERANK_TOP_N: ${RERANK_TOP_N:-}
@@ -72,6 +79,19 @@ services:
       timeout: 10s
       retries: 3
       start_period: 15s
+    restart: unless-stopped
+
+  # Headless Chromium for the reader: pages the plain fetch can't read
+  # (consent banners, text built by scripts) are rendered here, never in the
+  # app. Pinned to the playwright version in app/pyproject.toml: the two must
+  # match. No ports: only the app reaches it.
+  browser:
+    image: mcr.microsoft.com/playwright:v1.52.0-noble  # all images are pinned
+    command: ["npx", "-y", "playwright@1.52.0", "run-server", "--port", "3000", "--host", "0.0.0.0"]
+    init: true
+    user: pwuser
+    working_dir: /home/pwuser
+    shm_size: 1gb
     restart: unless-stopped
 
   # RSS reader. Stateless — everything lives in miniflux-db. Reached by

@@ -5,7 +5,9 @@ centroid; drop stories below the similarity floor and stories closer to a
 downvoted one than to any kept page; re-score the shortlist with the chat
 model, which is shown the user's interests as titles of kept pages (graceful
 fallback to raw similarity on any failure) and drop what it scores below the
-relevance floor; then greedily select a diverse set with Maximal Marginal
+relevance floor, less the penalty of sites the reader cannot show
+(``readable.py``); drop copies of one story from other sites (``dedup.py``);
+then greedily select a diverse set with Maximal Marginal
 Relevance (Carbonell & Goldstein, 1998). The "broad" (Exploring)
 section is filled separately by the bandit in ``broad.py``.
 """
@@ -28,8 +30,10 @@ from ..topics import selected_topics
 from ..urls import norm_url
 from .articles import _NO_THINKING
 from .broad import pick_broad_items
+from .dedup import duplicates, served_stories
 from .feedback import known_explore_collection
 from .profile import load_kept_pages
+from .readable import check_pages, is_stale, site_of, site_penalties
 
 log = logging.getLogger(__name__)
 
@@ -352,35 +356,80 @@ async def _select_curated(
     relevance = [0.05 + 0.95 * (s - lo) / (hi - lo) if hi > lo else 0.5 for s in sims]
     reasons = ["" for _ in items]
     scored: dict[int, tuple[float, str]] = {}
+    # The page checks (network) run while the chat model scores (LLM).
+    judge = llm if settings.llm_chat_model else None  # tells articles from banners
+    checks = check_pages(
+        settings, [(item["id"], item["url"], item["title"]) for item in items], judge
+    )
     if settings.rerank_enabled:
         interests = _interest_context(centroids, weights, kept_titles, kept, rejected_titles)
-        scored = await _rerank_shortlist(llm, items, interests)
+        scored, pages = await asyncio.gather(_rerank_shortlist(llm, items, interests), checks)
         for idx, (score, why) in scored.items():
             relevance[idx] = score
             reasons[idx] = why
+    else:
+        pages = await checks
+    with connection(settings) as conn:
+        penalties = site_penalties(conn)
+    penalized = 0
+    for idx, item in enumerate(items):
+        if penalty := penalties.get(site_of(item["url"])):
+            relevance[idx] -= penalty
+            penalized += 1
 
     # Drop non-positive relevance (e.g. LLM-zeroed ads) so MMR's diversity
     # term can't pull them back in, and what the LLM scored below the floor:
-    # empty slots beat filler.
+    # empty slots beat filler. An old page posted again is dropped too.
+    stale = {
+        i
+        for i, item in enumerate(items)
+        if item["id"] in pages and is_stale(pages[item["id"]], settings)
+    }
     keep = [
         i
         for i, rel in enumerate(relevance)
-        if rel > 0.0 and (i not in scored or rel >= settings.min_relevance)
+        if rel > 0.0 and (i not in scored or rel >= settings.min_relevance) and i not in stale
     ]
     log.info(
         "curated: %d in pool, %d below min_similarity, %d nearer a downvote, "
-        "%d shortlisted, %d scored, %d kept",
+        "%d shortlisted, %d scored, %d site-penalized, %d stale, %d kept",
         pool_size,
         int(too_far.sum()),
         int((nearer_rejected & ~too_far).sum()),
         len(items),
         len(scored),
+        penalized,
+        len(stale),
         len(keep),
     )
     items = [items[i] for i in keep]
     vectors = [vectors[i] for i in keep]
     relevance = [relevance[i] for i in keep]
     reasons = [reasons[i] for i in keep]
+    # One story from several sites: serve it once, from the site the reader
+    # can show. Asking which pairs are one story needs the chat model.
+    if settings.rerank_enabled and items:
+        with connection(settings) as conn:
+            earlier = served_stories(conn, settings.embed_dim)
+        fresh = [
+            {"title": item["title"], "snippet": item["snippet"], "vector": vec}
+            for item, vec in zip(items, vectors, strict=True)
+        ]
+        drop = await duplicates(
+            llm,
+            fresh,
+            earlier,
+            lambda i: (
+                pages[items[i]["id"]].readable if items[i]["id"] in pages else False,
+                relevance[i],
+            ),
+        )
+        if drop:
+            kept_idx = [i for i in range(len(items)) if i not in drop]
+            items = [items[i] for i in kept_idx]
+            vectors = [vectors[i] for i in kept_idx]
+            relevance = [relevance[i] for i in kept_idx]
+            reasons = [reasons[i] for i in kept_idx]
     order = mmr_select(relevance, vectors, curated_slots, settings.mmr_lambda)
     return items, relevance, reasons, vectors, order
 
@@ -429,7 +478,43 @@ async def build_feed(settings: Settings | None = None, llm: LLMClient | None = N
         # exclusion set (pruned alongside their candidates); readers select the
         # current cycle via the last_cycle_ts meta key.
         with connection(settings) as conn:
-            broad = pick_broad_items(conn, settings, topics, broad_slots)
+            broad = pick_broad_items(
+                conn, settings, topics, broad_slots, penalties=site_penalties(conn)
+            )
+            earlier = served_stories(conn, settings.embed_dim) if broad else []
+        # An Exploring pick that repeats a story served before or chosen for
+        # "For you" is dropped; of two picks of one story the first stays.
+        if broad and settings.rerank_enabled:
+            curated_now = [
+                {"title": items[i]["title"], "snippet": items[i]["snippet"], "vector": vectors[i]}
+                for i in order
+            ]
+            fresh = [
+                {
+                    "title": pick["title"],
+                    "snippet": pick["snippet"],
+                    "vector": _blob_to_unit_vec(pick["embedding"]),
+                }
+                for pick in broad
+            ]
+            drop = await duplicates(llm, fresh, earlier + curated_now, lambda i: (-i,))
+            broad = [pick for k, pick in enumerate(broad) if k not in drop]
+        # Exploring picks are checked before they are served: a stale page is
+        # dropped, and a failure charges its site for the next build.
+        checked = await check_pages(
+            settings,
+            [(pick["id"], pick["url"], pick["title"]) for pick in broad],
+            llm if settings.llm_chat_model else None,
+        )
+        stale = [
+            pick
+            for pick in broad
+            if pick["id"] in checked and is_stale(checked[pick["id"]], settings)
+        ]
+        if stale:
+            log.info("exploring: dropped %d stale picks", len(stale))
+            broad = [pick for pick in broad if pick not in stale]
+        with connection(settings) as conn:
             if not order and not broad:
                 log.warning(
                     "build_feed: no profile and no exploring topics yet, nothing to publish"

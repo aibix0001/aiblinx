@@ -117,30 +117,58 @@ def _load_profile_vectors(conn, dim: int, explore_collection: int | None = None)
 
 
 def _centroid_weights(
-    conn: sqlite3.Connection, centroids: np.ndarray, half_life_days: float, min_assign_sim: float
+    conn: sqlite3.Connection,
+    centroids: np.ndarray,
+    half_life_days: float,
+    min_assign_sim: float,
+    open_weight: float = 0.0,
 ) -> np.ndarray:
     """Recompute per-centroid weights from the feedback log.
 
     Events considered: all ``saved`` events (unique per page identity by
     schema), the LATEST ``interest`` event per page (repeated clicks are an
-    event log; only the newest opinion counts), and all ``ratings`` events
+    event log; only the newest opinion counts), all ``ratings`` events
     (each distinct rating value counts — the latest value per URL drives the
-    UI, but the weight recompute includes every rating as a learning signal).
-    ``mood`` never contributes.  Rows without an embedding (candidate fed
-    back before its embed ran) are skipped, as are vectors from a previous
-    embedder (dimension mismatch).
+    UI, but the weight recompute includes every rating as a learning signal),
+    and stories read in the reader (``opens``, worth ``open_weight``) on pages
+    without a save or an interest vote. ``mood`` never contributes.  Rows
+    without an embedding (candidate fed back before its embed ran) are
+    skipped, as are vectors from a previous embedder (dimension mismatch).
     """
     weights = np.ones(len(centroids), dtype=np.float64)
-    rows = conn.execute(
-        "SELECT axis, value, embedding, created_at FROM feedback "
-        "WHERE embedding IS NOT NULL AND section = 'curated' AND (axis = 'saved' OR id IN ("
-        "  SELECT MAX(id) FROM feedback WHERE axis = 'interest' GROUP BY url))"
-    ).fetchall()
+    signals: list[tuple[bytes, str, float]] = [
+        (
+            row["embedding"],
+            row["created_at"],
+            _SAVED_BASE if row["axis"] == "saved" else _INTEREST_BASE.get(row["value"], 0.0),
+        )
+        for row in conn.execute(
+            "SELECT axis, value, embedding, created_at FROM feedback "
+            "WHERE embedding IS NOT NULL AND section = 'curated' AND (axis = 'saved' OR id IN ("
+            "  SELECT MAX(id) FROM feedback WHERE axis = 'interest' GROUP BY url))"
+        )
+    ]
+    signals += [
+        (row["embedding"], row["created_at"], _RATING_BASE.get(row["value"], 0.0))
+        for row in conn.execute(
+            "SELECT value, embedding, created_at FROM ratings WHERE embedding IS NOT NULL"
+        )
+    ]
+    if open_weight:
+        signals += [
+            (row["embedding"], row["created_at"], open_weight)
+            for row in conn.execute(
+                "SELECT embedding, created_at FROM opens o "
+                "WHERE embedding IS NOT NULL AND section = 'curated' AND NOT EXISTS ("
+                "  SELECT 1 FROM feedback f WHERE f.url = o.url "
+                "  AND f.axis IN ('saved', 'interest'))"
+            )
+        ]
     now = datetime.now(UTC)
     nearest_sims: list[float] = []
     gated = 0
-    for row in rows:
-        vec = np.frombuffer(row["embedding"], dtype=np.float32)
+    for blob, created_at, base in signals:
+        vec = np.frombuffer(blob, dtype=np.float32)
         if vec.shape[0] != centroids.shape[1]:
             continue
         norm = float(np.linalg.norm(vec)) or 1.0
@@ -156,35 +184,12 @@ def _centroid_weights(
         if float(sims[nearest]) < min_assign_sim:
             gated += 1
             continue
-        created = datetime.fromisoformat(row["created_at"])
+        created = datetime.fromisoformat(created_at)
         # created_at is naive UTC from SQLite's datetime('now'); convert rather
         # than relabel if a future writer ever stores an offset-aware string.
         created = created.replace(tzinfo=UTC) if created.tzinfo is None else created.astimezone(UTC)
         age_days = max(0.0, (now - created).total_seconds() / 86400.0)
         decay = 0.5 ** (age_days / half_life_days)
-        base = _SAVED_BASE if row["axis"] == "saved" else _INTEREST_BASE.get(row["value"], 0.0)
-        weights[nearest] += base * decay
-    # Include ratings as additional learning signals. Each rating row (each
-    # distinct value per URL counts; re-rating the same value is idempotent).
-    rating_rows = conn.execute(
-        "SELECT value, embedding, created_at FROM ratings WHERE embedding IS NOT NULL"
-    ).fetchall()
-    for row in rating_rows:
-        vec = np.frombuffer(row["embedding"], dtype=np.float32)
-        if vec.shape[0] != centroids.shape[1]:
-            continue
-        norm = float(np.linalg.norm(vec)) or 1.0
-        sims = centroids @ (vec / norm)
-        nearest = int(np.argmax(sims))
-        nearest_sims.append(float(sims[nearest]))
-        if float(sims[nearest]) < min_assign_sim:
-            gated += 1
-            continue
-        created = datetime.fromisoformat(row["created_at"])
-        created = created.replace(tzinfo=UTC) if created.tzinfo is None else created.astimezone(UTC)
-        age_days = max(0.0, (now - created).total_seconds() / 86400.0)
-        decay = 0.5 ** (age_days / half_life_days)
-        base = _RATING_BASE.get(row["value"], 0.0)
         weights[nearest] += base * decay
     if nearest_sims:
         log.info(
@@ -230,7 +235,11 @@ def rebuild_profile(settings: Settings | None = None) -> int:
             [c / (float(np.linalg.norm(c)) or 1.0) for c in kmeans.cluster_centers_]
         ).astype(np.float32)
         weights = _centroid_weights(
-            conn, normalized, settings.feedback_half_life_days, settings.min_assign_sim
+            conn,
+            normalized,
+            settings.feedback_half_life_days,
+            settings.min_assign_sim,
+            settings.reader_open_weight if settings.reader_learn else 0.0,
         )
         conn.execute("DELETE FROM profile")
         for centroid, weight in zip(normalized, weights, strict=True):

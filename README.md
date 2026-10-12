@@ -69,8 +69,10 @@ OpenRouter models may keep or train on the text they are sent.
 
 ## Optional parts
 
-Everything beyond the one container is opt-in. Add profiles to
-`COMPOSE_PROFILES` in `.env`:
+`docker compose up -d` starts two containers: the app, and a headless browser
+it uses to read pages hidden behind cookie banners or built by scripts.
+Everything beyond those is opt-in. Add profiles to `COMPOSE_PROFILES` in
+`.env`:
 
 | Profile | What you get | Also set |
 |---|---|---|

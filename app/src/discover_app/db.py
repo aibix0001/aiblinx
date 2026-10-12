@@ -126,6 +126,18 @@ CREATE TABLE IF NOT EXISTS feedback (
 CREATE UNIQUE INDEX IF NOT EXISTS feedback_saved_url
     ON feedback(url) WHERE axis = 'saved';
 
+-- Stories read in the reader, one row per page identity: a small implicit
+-- signal (``reader_open_weight``) that a save or a vote on the same page
+-- overrides. ``section`` is the tab the story was read from.
+CREATE TABLE IF NOT EXISTS opens (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    candidate_id INTEGER REFERENCES candidates(id) ON DELETE SET NULL,
+    url          TEXT NOT NULL UNIQUE,          -- normalized (urls.norm_url)
+    section      TEXT NOT NULL,
+    embedding    BLOB,                          -- copied from the candidate at write time
+    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS ratings (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     candidate_id INTEGER REFERENCES candidates(id) ON DELETE SET NULL,
@@ -205,6 +217,23 @@ CREATE TABLE IF NOT EXISTS articles (
     body_tr  TEXT                               -- safe reader HTML; NULL = not translated
 );
 
+-- Whether the reader can show a candidate (article text or a playable
+-- video), checked once at feed-build time (pipeline/readable.py).
+CREATE TABLE IF NOT EXISTS page_checks (
+    candidate_id INTEGER PRIMARY KEY,
+    readable     INTEGER NOT NULL,
+    published    TEXT,  -- the page's own date (YYYY-MM-DD), when it names one
+    checked_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Ranking penalty of sites the reader cannot show; it recovers 0.2 per
+-- failure-free day after last_failure (pipeline/readable.py).
+CREATE TABLE IF NOT EXISTS site_penalties (
+    site         TEXT PRIMARY KEY,              -- hostname without www.
+    penalty      REAL NOT NULL,                 -- as of last_failure, > 0
+    last_failure TEXT NOT NULL                  -- ISO date (UTC)
+);
+
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT
@@ -242,6 +271,7 @@ def init_db(settings: Settings | None = None) -> None:
             ("links", "collection_id INTEGER"),
             ("feedback", "section TEXT NOT NULL DEFAULT 'curated'"),
             ("saves", "section TEXT NOT NULL DEFAULT 'curated'"),
+            ("page_checks", "published TEXT"),
         ):
             try:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {column}")
@@ -330,13 +360,13 @@ def _backup(settings: Settings, label: str) -> Path:
 
 def _reset_embeddings(conn: sqlite3.Connection) -> None:
     """Forget every vector so the next cycle re-embeds from stored text:
-    bookmarks, imports and candidates via their ``embedded`` flag, saves and
-    feedback via a NULL embedding (``embedding.embed_pending_signals``)."""
+    bookmarks, imports and candidates via their ``embedded`` flag, saves,
+    feedback, ratings and opens via a NULL embedding (``embedding.embed_pending_signals``)."""
     for table in _VEC_TABLES:
         conn.execute(f"DROP TABLE IF EXISTS {table}")
     for table in ("links", "imports", "candidates"):
         conn.execute(f"UPDATE {table} SET embedded = 0, embedding = NULL")  # noqa: S608
-    for table in ("saves", "feedback", "ratings"):
+    for table in ("saves", "feedback", "ratings", "opens"):
         conn.execute(f"UPDATE {table} SET embedding = NULL")  # noqa: S608
     conn.execute("DELETE FROM profile")
 
