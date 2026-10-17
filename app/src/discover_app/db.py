@@ -172,15 +172,9 @@ CREATE TABLE IF NOT EXISTS saves (
     embedding     BLOB,
     linkwarden_id INTEGER,
     created_at    TEXT NOT NULL DEFAULT (datetime('now')),
-    section       TEXT NOT NULL DEFAULT 'curated' -- 'broad': Exploring save, own collection
-);
-
--- "Save for later": stories the owner holds to read later. A hold is no
--- signal: profile, ranking and Linkwarden never read this table. It keeps
--- its candidate (and reader text) from the prune until it expires.
-CREATE TABLE IF NOT EXISTS holds (
-    candidate_id INTEGER PRIMARY KEY REFERENCES candidates(id),
-    held_at      TEXT NOT NULL DEFAULT (datetime('now'))
+    section       TEXT NOT NULL DEFAULT 'curated' -- 'broad': Exploring save, own
+                                                  -- collection; 'archive': kept
+                                                  -- without any effect on the feed
 );
 
 -- Pages imported on the setup page (browser bookmarks export, pasted URLs):
@@ -278,6 +272,9 @@ def init_db(settings: Settings | None = None) -> None:
             except sqlite3.OperationalError as exc:
                 if "duplicate column" not in str(exc).lower():
                     raise
+        # "Save for later" (holds, 0.7.0) was replaced by the Archive save:
+        # pipeline/migrate_holds.py files the held stories into Archive at
+        # startup and drops the table once it is empty.
         # feed_domains gained the 'unsubscribed' status (user removed the
         # feed; discovery must not re-add it). SQLite cannot alter a CHECK,
         # so an old table is rebuilt once.

@@ -35,6 +35,9 @@ own server, and your reading profile is one SQLite file.
   which distractions you like, without changing your main feed, and Exploring
   saves get their own Linkwarden collection. *Promote* moves a story into your
   main interests; the compass sends a main-feed story to Exploring.
+- **Keeps links without learning from them.** *Archive* (the box button) saves
+  a story, discussion included, into a third Linkwarden collection that has
+  no effect on your feed.
 - **Finds your sources itself.** It looks at the sites you keep and subscribes
   to their feeds, and adds Hacker News. The setup page lists every feed, so
   you can unsubscribe or add a site. Optional: a

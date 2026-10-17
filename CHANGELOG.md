@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.0
+
+- **Archive:** the box button on every card and in the reader saves a story
+  into a third Linkwarden collection, "Archive", discussion included, with no
+  effect on your feed. `LINKWARDEN_ARCHIVE_COLLECTION_ID` names the
+  collection; empty, it is found or created by name.
+- **Save for later is gone:** the Bookmarks tab, the paper button and
+  `HOLD_DAYS` are replaced by Archive. On the first start after the upgrade,
+  every held story is archived, oldest hold first: a link in the Archive
+  collection, or a local Archive save without Linkwarden.
+
 ## 0.7.0
 
 - **Reads behind cookie banners:** pages the plain fetch can't read (a

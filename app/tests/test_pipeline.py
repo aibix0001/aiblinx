@@ -3066,8 +3066,7 @@ class _FakeLinkwardenCollections(_FakeLinkwardenWriter):
 
     async def find_or_create_collection(self, name):
         self.lookups += 1
-        assert name == "Exploring"
-        return 99
+        return {"Exploring": 99, "Archive": 77}[name]
 
 
 async def test_exploring_save_goes_to_its_own_collection(tmp_path):
@@ -3139,7 +3138,7 @@ def test_exploring_feedback_stays_out_of_the_profile(tmp_path):
             "'ex.com/b-save', ?, 'broad')",
             (blob([0, 0, 1.0, 0]),),
         )
-        vectors = _load_profile_vectors(conn, 4, 99)
+        vectors = _load_profile_vectors(conn, 4, {99})
         kept = {tuple(np.round(v, 3)) for v in vectors}
         assert kept == {(0, 0, 0, 1.0), (1.0, 1.0, 0, 0), (1.0, 0, 0, 0)}
         # no Exploring collection yet: every link counts (NULL collection too)
@@ -3278,7 +3277,7 @@ async def test_promote_moves_an_exploring_save(tmp_path):
             "VALUES(4711, 'https://ex.com/e', ?, 99)",
             (sqlite_vec.serialize_float32([0, 1.0, 0, 0]),),
         )
-        assert len(_load_profile_vectors(conn, 4, 99)) == 0  # not an interest yet
+        assert len(_load_profile_vectors(conn, 4, {99})) == 0  # not an interest yet
 
     result = await promote_candidate(settings, 1, linkwarden=fake)
     assert result == {"status": "promoted", "linkwarden_id": 4711}
@@ -3289,7 +3288,7 @@ async def test_promote_moves_an_exploring_save(tmp_path):
         assert conn.execute("SELECT section FROM saves").fetchone()[0] == "curated"
         assert conn.execute("SELECT section FROM feedback").fetchone()[0] == "curated"
         assert conn.execute("SELECT collection_id FROM links").fetchone()[0] == 17
-        assert len(_load_profile_vectors(conn, 4, 99)) == 1  # now it shapes "For you"
+        assert len(_load_profile_vectors(conn, 4, {99})) == 1  # now it shapes "For you"
     await promote_candidate(settings, 1, linkwarden=fake)
     assert len(fake.updated) == 1  # idempotent: already in the main collection
 
@@ -3408,7 +3407,7 @@ def test_ui_remembers_the_open_tab_in_the_fragment():
 
     page = render_page([], [], broad=[], saves=[])
     assert "history.replaceState(null, '', panel === 'curated'" in page
-    assert "['broad', 'held', 'saved'].includes(location.hash.slice(1))" in page
+    assert "['broad', 'saved'].includes(location.hash.slice(1))" in page
 
 
 def test_cluster_count_scales_with_the_profile():
@@ -3649,6 +3648,175 @@ def test_explore_button_only_on_for_you(tmp_path, monkeypatch):
     # each card carries its tab, and Exploring cards open the reader in Exploring
     assert 'data-section="curated"' in curated and 'href="/read/1"' in curated
     assert 'data-section="broad"' in broad and 'href="/read/2?section=broad"' in broad
+
+
+# ── Archive: a save that never shapes the feed ─────────────────
+
+
+async def test_archive_saves_to_the_archive_collection_and_is_no_signal(tmp_path):
+    from discover_app.pipeline.feedback import archive_candidate, archive_collection
+
+    settings = _settings(tmp_path, linkwarden_collection_id=17)
+    init_db(settings)
+    with connection(settings) as conn:
+        _add_candidate(conn, 1, "https://ex.com/c", "c", [1.0, 0, 0, 0])
+        _serve(conn, 1, "curated")
+    fake = _FakeLinkwardenMovable()
+    result = await archive_candidate(settings, 1, linkwarden=fake)
+    assert result == {"status": "archived", "linkwarden_id": 4711}
+    assert [c["collection_id"] for c in fake.created] == [77]  # the Archive collection
+    assert fake.lookups == 1
+    with connection(settings) as conn:
+        assert conn.execute("SELECT section FROM saves").fetchone()[0] == "archive"
+        rows = conn.execute("SELECT axis, value, section FROM feedback ORDER BY id").fetchall()
+        assert get_meta(conn, "linkwarden_archive_collection_id") == "77"
+    # the save is recorded (never served again), nothing else
+    assert [tuple(r) for r in rows] == [("saved", "explicit", "archive")]
+    assert await archive_candidate(settings, 1, linkwarden=fake) == result  # idempotent
+    assert len(fake.created) == 1 and fake.updated == []
+    # a configured id wins over the lookup
+    configured = _settings(tmp_path, linkwarden_archive_collection_id=5)
+    assert await archive_collection(configured, fake) == 5
+
+
+async def test_archive_moves_a_main_save_and_promote_takes_it_back(tmp_path):
+    from discover_app.pipeline.feedback import archive_candidate, promote_candidate
+
+    settings = _settings(tmp_path, linkwarden_collection_id=17)
+    init_db(settings)
+    with connection(settings) as conn:
+        _add_candidate(conn, 1, "https://ex.com/c", "c", [1.0, 0, 0, 0])
+        _serve(conn, 1, "curated")
+    fake = _FakeLinkwardenMovable()
+    await capture_candidate(settings, 1, linkwarden=fake)
+    assert fake.link["collectionId"] == 17
+    await archive_candidate(settings, 1, linkwarden=fake)
+    assert fake.updated[-1]["collectionId"] == 77
+    assert len(fake.created) == 1  # moved, not created again
+    with connection(settings) as conn:
+        assert conn.execute("SELECT section FROM saves").fetchone()[0] == "archive"
+        assert conn.execute("SELECT section FROM feedback").fetchone()[0] == "archive"
+    await promote_candidate(settings, 1, linkwarden=fake)
+    assert fake.updated[-1]["collectionId"] == 17
+    with connection(settings) as conn:
+        assert conn.execute("SELECT section FROM saves").fetchone()[0] == "curated"
+
+
+def test_archived_pages_shape_nothing(tmp_path):
+    """Archive links, saves and saved events stay out of the profile, the
+    centroid weights, the Exploring picker and the feed discovery."""
+    from discover_app.pipeline.broad import explore_taste
+    from discover_app.pipeline.feedback import ignored_collections
+    from discover_app.pipeline.feeds import pending_domains
+    from discover_app.pipeline.profile import _centroid_weights, _load_profile_vectors
+
+    settings = _settings(tmp_path, feed_sync_min_links=1)
+    init_db(settings)
+    blob = sqlite_vec.serialize_float32
+    with connection(settings) as conn:
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES('linkwarden_explore_collection_id', '99'), "
+            "('linkwarden_archive_collection_id', '77')"
+        )
+        assert ignored_collections(conn, settings) == {99, 77}
+        conn.execute(
+            "INSERT INTO links(id, url, embedding, collection_id) "
+            "VALUES(1, 'https://kept.ex/1', ?, 1), (2, 'https://dump.ex/2', ?, 77), "
+            "(3, 'https://dump.ex/3', ?, 77)",
+            (blob([1.0, 0, 0, 0]), blob([0, 1.0, 0, 0]), blob([0, 1.0, 0, 0])),
+        )
+        _add_candidate(conn, 4, "https://dump.ex/4", "d", [0, 0, 1.0, 0])
+        _serve(conn, 4, "curated")
+        conn.execute(
+            "INSERT INTO saves(url, url_key, embedding, section) "
+            "VALUES('https://dump.ex/4', 'dump.ex/4', ?, 'archive')",
+            (blob([0, 0, 1.0, 0]),),
+        )
+        conn.execute(
+            "INSERT INTO feedback(candidate_id, url, axis, value, embedding, section) "
+            "VALUES(4, 'dump.ex/4', 'saved', 'explicit', ?, 'archive')",
+            (blob([0, 0, 1.0, 0]),),
+        )
+        vectors = _load_profile_vectors(conn, 4, ignored_collections(conn, settings))
+        assert [tuple(np.round(v, 3)) for v in vectors] == [(1.0, 0, 0, 0)]
+        weights = _centroid_weights(conn, np.eye(4, dtype=np.float32), 30.0, 0.0)
+        assert weights[2] == 1.0
+        assert explore_taste(conn) == ([], [])
+    assert pending_domains(settings) == ["kept.ex"]
+
+
+def test_detect_saved_skips_links_filed_in_the_archive(tmp_path):
+    """A link put straight into Archive in Linkwarden is no implicit save."""
+    settings = _settings(tmp_path)
+    init_db(settings)
+    with connection(settings) as conn:
+        _add_candidate(conn, 1, "https://ex.com/served", "served", [1.0, 0, 0, 0])
+        _add_candidate(conn, 2, "https://ex.com/dumped", "dumped", [0, 1.0, 0, 0])
+        _serve(conn, 1, "curated")
+        _serve(conn, 2, "curated")
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES('linkwarden_archive_collection_id', '77')"
+        )
+        conn.execute(
+            "INSERT INTO links(id, url, collection_id) VALUES(1, 'https://ex.com/served', 1), "
+            "(2, 'https://ex.com/dumped', 77)"
+        )
+    assert detect_saved(settings, ["https://ex.com/served", "https://ex.com/dumped"]) == 1
+    with connection(settings) as conn:
+        assert conn.execute("SELECT url FROM feedback WHERE axis = 'saved'").fetchone()[0] == (
+            "ex.com/served"
+        )
+
+
+def test_archive_button_on_every_card_and_in_the_reader(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from discover_app import app as app_mod
+    from discover_app.ui import render_reader
+
+    settings = _settings(tmp_path).model_copy(update={"linkwarden_token": ""})  # saves stay local
+    init_db(settings)
+    set_topic(settings, "Science", True)
+    with connection(settings) as conn:
+        _add_candidate(conn, 1, "https://ex.com/a", "a", [1.0, 0, 0, 0])
+        _add_candidate(conn, 2, "https://ex.com/b", "b", [0, 1.0, 0, 0])
+        conn.execute(
+            "INSERT INTO feed_items(rank, section, candidate_id, score, reason, cycle_ts) "
+            "VALUES(0, 'curated', 1, 0.9, '', 't1'), (0, 'broad', 2, 0.0, '', 't1')"
+        )
+        conn.execute("INSERT INTO meta(key, value) VALUES('last_cycle_ts', 't1')")
+        conn.execute(
+            "INSERT INTO articles(candidate_id, lang, body, title_tr, body_tr) "
+            "VALUES(1, 'en', '<p>Text.</p>', NULL, NULL)"
+        )
+    monkeypatch.setattr("discover_app.db.get_settings", lambda: settings)
+    monkeypatch.setattr(app_mod, "get_settings", lambda: settings)
+    client = TestClient(app_mod.create_app())
+    assert client.post("/feed/1/archive", json={"discussion": []}).json()["status"] == "archived"
+    assert client.post("/feed/99/archive").status_code == 404
+    assert client.post("/feed/1/hold").status_code == 404  # Save for later is gone
+    page = client.get("/ui").text
+    assert 'data-panel="held"' not in page and "Bookmarks" not in page
+    card1 = page[page.index('id="c1"') : page.index("</article>", page.index('id="c1"'))]
+    card2 = page[page.index('id="c2"') : page.index("</article>", page.index('id="c2"'))]
+    assert 'class="vote archive on"' in card1 and 'class="save on"' in card1
+    assert 'class="vote archive"' in card2 and "hold(this)" not in page
+    assert "Archived, no effect on your feed" in card1
+    reader = client.get("/read/1").text
+    assert 'class="vote archive on"' in reader
+    assert 'class="vote archive"' in render_reader(
+        {"id": 2, "url": "https://ex.com/b", "title": "b"},
+        "<p>text</p>",
+        saved=False,
+        interest=None,
+        linkwarden=False,
+        explored=False,
+    )
+    # the Saved list carries archived stories too; a second tap on Save undoes
+    assert "ex.com" in page[page.index('id="saved"') :]
+    assert client.delete("/feed/1/save").json()["status"] == "unsaved"
+    with connection(settings) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM saves").fetchone()[0] == 0
 
 
 async def test_the_tab_decides_not_an_earlier_serve(tmp_path):
@@ -4776,102 +4944,6 @@ async def test_links_are_embedded_again_when_a_wall_appears(tmp_path):
     assert not any("Cookies" in t for t in llm.texts)
 
 
-# ── Save for later (holds) ──────────────────────────────────────
-
-
-def _held_client(tmp_path, monkeypatch):
-    from fastapi.testclient import TestClient
-
-    from discover_app import app as app_mod
-
-    settings = _no_linkwarden(tmp_path)
-    init_db(settings)
-    with connection(settings) as conn:
-        _add_candidate(conn, 1, "https://ex.com/a", "Held story", [1.0, 0, 0, 0])
-        _add_candidate(conn, 2, "https://ex.com/b", "Other story", [0, 1.0, 0, 0])
-        conn.execute(
-            "INSERT INTO feed_items(rank, section, candidate_id, score, reason, cycle_ts) "
-            "VALUES(0, 'curated', 1, 0.9, '', 't1'), (1, 'curated', 2, 0.5, '', 't1')"
-        )
-        conn.execute("INSERT INTO meta(key, value) VALUES('last_cycle_ts', 't1')")
-    monkeypatch.setattr(app_mod, "get_settings", lambda: settings)
-    monkeypatch.setattr("discover_app.db.get_settings", lambda: settings)
-    return settings, TestClient(app_mod.create_app())
-
-
-def test_hold_is_no_signal_and_shows_in_the_bookmarks_tab(tmp_path, monkeypatch):
-    from discover_app.ui import render_reader
-
-    settings, client = _held_client(tmp_path, monkeypatch)
-    assert client.post("/feed/1/hold").json()["status"] == "held"
-    assert client.post("/feed/1/hold").json()["status"] == "held"  # idempotent
-    assert client.post("/feed/99/hold").status_code == 404
-    with connection(settings) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM holds").fetchone()[0] == 1
-        for table in ("feedback", "ratings", "saves"):
-            assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0  # noqa: S608
-
-    page = client.get("/ui").text
-    assert 'data-panel="held"' in page and 'aria-label="Bookmarks"' in page
-    assert "Bookmarks · 1" in page and 'id="h1"' in page and "14 days left" in page
-    card1 = page[page.index('id="c1"') : page.index('id="c2"')]
-    assert 'class="vote hold on"' in card1 and 'aria-label="Saved for later"' in card1
-    card2 = page[page.index('id="c2"') :]
-    assert 'class="vote hold"' in card2
-    reader = render_reader(
-        {"id": 1, "url": "https://ex.com/a", "title": "Held story"},
-        "<p>text</p>",
-        saved=False,
-        interest=None,
-        linkwarden=False,
-        explored=False,
-        held=True,
-    )
-    assert 'class="vote hold on"' in reader
-
-    assert client.delete("/feed/1/hold").json()["status"] == "released"
-    assert client.delete("/feed/1/hold").json()["status"] == "released"  # idempotent
-    assert "Bookmarks · 0" in client.get("/ui").text
-
-
-def test_save_releases_a_hold_and_a_saved_story_is_not_held(tmp_path, monkeypatch):
-    settings, client = _held_client(tmp_path, monkeypatch)
-    client.post("/feed/1/hold")
-    assert client.post("/feed/1/save").json()["status"] == "saved"
-    with connection(settings) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM holds").fetchone()[0] == 0
-    assert client.post("/feed/1/hold").json()["status"] == "already_saved"
-    with connection(settings) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM holds").fetchone()[0] == 0
-
-
-def test_prune_keeps_held_candidates_until_the_hold_expires(tmp_path):
-    from discover_app.pipeline.holds import hold_candidate, list_holds
-
-    settings = _settings(tmp_path)
-    init_db(settings)
-    with connection(settings) as conn:
-        _add_candidate(conn, 1, "https://ex.com/old", "old held", [1.0, 0, 0, 0])
-        _add_candidate(conn, 2, "https://ex.com/old2", "old unheld", [0, 1.0, 0, 0])
-        conn.execute("UPDATE candidates SET fetched_at = '2000-01-01 00:00:00'")
-    hold_candidate(settings, 1)
-    assert prune_candidates(settings) == 1  # only the unheld one goes
-    with connection(settings) as conn:
-        assert [r[0] for r in conn.execute("SELECT id FROM candidates")] == [1]
-        conn.execute("UPDATE holds SET held_at = datetime('now', '-13 days', '-1 hours')")
-        assert list_holds(conn, settings)[0]["days_left"] == 1  # the last day
-        conn.execute("UPDATE holds SET held_at = datetime('now', '-15 days')")
-        assert list_holds(conn, settings) == []  # expired holds leave the tab at once
-    hold_candidate(settings, 1)  # holding again restarts an expired hold
-    with connection(settings) as conn:
-        assert list_holds(conn, settings)[0]["days_left"] == 14
-        conn.execute("UPDATE holds SET held_at = datetime('now', '-15 days')")
-    assert prune_candidates(settings) == 1  # GC drops the hold, then the candidate goes
-    with connection(settings) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM holds").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM candidates").fetchone()[0] == 0
-
-
 # ── Diagrams as SVG ─────────────────────────────────────────────
 
 
@@ -5617,3 +5689,216 @@ def test_browser_drops_only_closed_browser_noise():
     for exc in (closed, other, ValueError("bug")):
         browser._quiet_closed(Loop(), {"exception": exc})
     assert [str(e) for e in logged] == ["Timeout 5000ms exceeded", "bug"]
+
+
+# --- held stories (Save for later, 0.7.0) become Archive links on upgrade ---
+
+
+def _old_holds_table(conn) -> None:
+    """The ``holds`` table as 0.7.0 created it."""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS holds ("
+        "candidate_id INTEGER PRIMARY KEY REFERENCES candidates(id), "
+        "held_at TEXT NOT NULL DEFAULT (datetime('now')))"
+    )
+
+
+def _has_holds_table(conn) -> bool:
+    return bool(conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'holds'").fetchone())
+
+
+class _FakeLinkwardenNumbered(_FakeLinkwardenCollections):
+    """Numbers each created link; after ``fail_after`` creates, the next one
+    raises ``error``."""
+
+    def __init__(self, fail_after: int | None = None, error: Exception | None = None) -> None:
+        super().__init__()
+        self.fail_after = fail_after
+        self.error = error or httpx.ConnectError("Linkwarden down")
+
+    async def create_link(self, url, name, collection_id, tags=None):
+        if self.fail_after is not None and len(self.created) >= self.fail_after:
+            raise self.error
+        await super().create_link(url, name, collection_id, tags)
+        link_id = 100 + len(self.created)
+        self.created[-1]["id"] = link_id
+        return {"id": link_id, "url": url}
+
+
+async def test_migrate_holds_files_every_held_story_in_archive(tmp_path):
+    from discover_app.pipeline.migrate_holds import migrate_holds
+
+    settings = _settings(tmp_path, linkwarden_collection_id=17)
+    init_db(settings)
+    with connection(settings) as conn:
+        _old_holds_table(conn)
+        _add_candidate(conn, 1, "https://ex.com/newer", "newer", [1.0, 0, 0, 0])
+        _add_candidate(conn, 2, "https://ex.com/older", "older", [0, 1.0, 0, 0])
+        _add_candidate(conn, 3, "https://ex.com/unheld", "unheld", [0, 0, 1.0, 0])
+        for cid in (1, 2, 3):
+            _serve(conn, cid, "curated")
+        conn.execute("INSERT INTO holds VALUES(1, '2026-10-12 08:00:00')")
+        conn.execute("INSERT INTO holds VALUES(2, '2026-10-07 08:00:00')")
+    fake = _FakeLinkwardenNumbered()
+    assert await migrate_holds(settings, linkwarden=fake) == 2
+    # oldest hold first, every link in the Archive collection, no vote
+    assert [(c["url"], c["collection_id"]) for c in fake.created] == [
+        ("https://ex.com/older", 77),
+        ("https://ex.com/newer", 77),
+    ]
+    with connection(settings) as conn:
+        assert dict(conn.execute("SELECT url_key, section FROM saves").fetchall()) == {
+            "ex.com/older": "archive",
+            "ex.com/newer": "archive",
+        }
+        assert dict(conn.execute("SELECT url_key, linkwarden_id FROM saves").fetchall()) == {
+            "ex.com/older": 101,
+            "ex.com/newer": 102,
+        }
+        assert {r[0] for r in conn.execute("SELECT axis FROM feedback")} == {"saved"}
+        assert not _has_holds_table(conn)
+    # done once: a start without the table is a no-op
+    assert await migrate_holds(settings, linkwarden=fake) == 0
+    assert len(fake.created) == 2
+
+
+async def test_migrate_holds_keeps_the_rest_when_linkwarden_is_down(tmp_path, caplog):
+    from discover_app.pipeline.migrate_holds import migrate_holds
+
+    settings = _settings(tmp_path, linkwarden_collection_id=17)
+    init_db(settings)
+    with connection(settings) as conn:
+        _old_holds_table(conn)
+        for cid in (1, 2, 3):
+            _add_candidate(conn, cid, f"https://ex.com/{cid}", str(cid), [1.0, 0, 0, 0])
+            _serve(conn, cid, "curated")
+            conn.execute("INSERT INTO holds VALUES(?, ?)", (cid, f"2026-10-0{cid} 08:00:00"))
+    fake = _FakeLinkwardenNumbered(fail_after=1)
+    with caplog.at_level(logging.ERROR):
+        assert await migrate_holds(settings, linkwarden=fake) == 1
+    assert "Linkwarden down" in caplog.text
+    with connection(settings) as conn:
+        assert _has_holds_table(conn)
+        assert [r[0] for r in conn.execute("SELECT candidate_id FROM holds ORDER BY 1")] == [2, 3]
+        assert conn.execute("SELECT COUNT(*) FROM saves").fetchone()[0] == 1
+    # the next start finishes the job
+    fake.fail_after = None
+    assert await migrate_holds(settings, linkwarden=fake) == 2
+    assert [c["url"] for c in fake.created] == [f"https://ex.com/{cid}" for cid in (1, 2, 3)]
+    with connection(settings) as conn:
+        assert not _has_holds_table(conn)
+
+
+async def test_migrate_holds_survives_any_error_from_one_story(tmp_path, caplog):
+    """A broken Linkwarden answer must not keep the app from starting."""
+    from discover_app.pipeline.migrate_holds import migrate_holds
+
+    settings = _settings(tmp_path, linkwarden_collection_id=17)
+    init_db(settings)
+    with connection(settings) as conn:
+        _old_holds_table(conn)
+        for cid in (1, 2, 3):
+            _add_candidate(conn, cid, f"https://ex.com/{cid}", str(cid), [1.0, 0, 0, 0])
+            _serve(conn, cid, "curated")
+            conn.execute("INSERT INTO holds VALUES(?, ?)", (cid, f"2026-10-0{cid} 08:00:00"))
+    fake = _FakeLinkwardenNumbered(fail_after=1, error=KeyError("id"))
+    with caplog.at_level(logging.ERROR):
+        assert await migrate_holds(settings, linkwarden=fake) == 1
+    record = next(r for r in caplog.records if "the rest waits for the next start" in r.message)
+    assert record.levelno == logging.ERROR and record.exc_info[0] is KeyError
+    # the second story failed; the third was never tried, both wait
+    assert [c["url"] for c in fake.created] == ["https://ex.com/1"]
+    with connection(settings) as conn:
+        assert _has_holds_table(conn)
+        assert [r[0] for r in conn.execute("SELECT candidate_id FROM holds ORDER BY 1")] == [2, 3]
+
+
+async def test_migrate_holds_moves_a_held_bookmark_like_the_archive_button(tmp_path):
+    """A held story that is already a Linkwarden bookmark is moved to
+    Archive, not created again; the hold goes with it."""
+    from discover_app.pipeline.migrate_holds import migrate_holds
+
+    settings = _settings(tmp_path, linkwarden_collection_id=17)
+    init_db(settings)
+    with connection(settings) as conn:
+        _old_holds_table(conn)
+        _add_candidate(conn, 1, "https://ex.com/a", "a", [1.0, 0, 0, 0])
+        _serve(conn, 1, "curated")
+        conn.execute("INSERT INTO holds(candidate_id) VALUES(1)")
+        conn.execute(
+            "INSERT INTO links(id, url, name, collection_id) "
+            "VALUES(4711, 'https://ex.com/a/', 'a', 17)"
+        )
+    fake = _FakeLinkwardenMovable()
+    fake.link = {"id": 4711, "url": "https://ex.com/a/", "collectionId": 17, "tags": []}
+    assert await migrate_holds(settings, linkwarden=fake) == 1
+    assert fake.created == [] and fake.updated[-1]["collectionId"] == 77
+    with connection(settings) as conn:
+        assert conn.execute("SELECT collection_id FROM links").fetchone()[0] == 77
+        assert not _has_holds_table(conn)
+
+
+def test_prune_keeps_held_candidates_until_they_are_filed(tmp_path):
+    settings = _settings(tmp_path, candidate_max_age_days=1)
+    init_db(settings)
+    with connection(settings) as conn:
+        _old_holds_table(conn)
+        for cid in (1, 2):
+            _add_candidate(conn, cid, f"https://ex.com/{cid}", str(cid), [1.0, 0, 0, 0])
+        conn.execute("UPDATE candidates SET fetched_at = '2020-01-01 00:00:00'")
+        conn.execute("INSERT INTO holds(candidate_id) VALUES(1)")
+    assert prune_candidates(settings) == 1
+    with connection(settings) as conn:
+        assert [r[0] for r in conn.execute("SELECT id FROM candidates")] == [1]
+        conn.execute("DROP TABLE holds")
+    assert prune_candidates(settings) == 1
+
+
+async def test_migrate_holds_without_linkwarden_keeps_local_archive_saves(tmp_path):
+    from discover_app.pipeline.migrate_holds import migrate_holds
+
+    settings = Settings(_env_file=None, data_dir=tmp_path, embed_dim=4, linkwarden_token="")
+    assert not settings.linkwarden_enabled
+    init_db(settings)
+    with connection(settings) as conn:
+        _old_holds_table(conn)
+        _add_candidate(conn, 1, "https://ex.com/a", "a", [1.0, 0, 0, 0])
+        _serve(conn, 1, "curated")
+        conn.execute("INSERT INTO holds(candidate_id) VALUES(1)")
+    assert await migrate_holds(settings) == 1
+    with connection(settings) as conn:
+        assert tuple(conn.execute("SELECT section, linkwarden_id FROM saves").fetchone()) == (
+            "archive",
+            None,
+        )
+        assert not _has_holds_table(conn)
+
+
+def test_startup_runs_the_holds_migration(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from discover_app import app as app_mod
+
+    settings = _settings(tmp_path)
+    monkeypatch.setattr(app_mod, "get_settings", lambda: settings)
+    monkeypatch.setattr(app_mod, "init_db", lambda s: None)
+    monkeypatch.setattr(app_mod, "hide_reads_from_access_log", lambda: None)
+
+    class _Scheduler:
+        def start(self):
+            pass
+
+        def shutdown(self, wait=False):
+            pass
+
+    monkeypatch.setattr(app_mod, "build_scheduler", lambda s: _Scheduler())
+    ran: list[Settings] = []
+
+    async def _migrate(s, linkwarden=None):
+        ran.append(s)
+        return 0
+
+    monkeypatch.setattr(app_mod, "migrate_holds", _migrate)
+    with TestClient(app_mod.create_app()):
+        pass
+    assert ran == [settings]

@@ -69,6 +69,9 @@ class Settings(BaseSettings):
     # Exploring saves land here instead, kept out of the interest profile.
     # Unset: a collection named "Exploring" is found or created on first use.
     linkwarden_explore_collection_id: int | None = None
+    # Archive: a save that never shapes the feed. Unset: a collection named
+    # "Archive" is found or created on first use.
+    linkwarden_archive_collection_id: int | None = None
 
     # --- candidate sources ---
     miniflux_url: str = "http://miniflux:8080"
@@ -159,9 +162,6 @@ class Settings(BaseSettings):
     # least this high (0..1); stories it never scored are kept.
     min_relevance: float = Field(default=0.3, ge=0.0, le=1.0)
     candidate_max_age_days: int = Field(default=14, ge=1)  # prune + freshness window
-    # "Save for later": a held story stays in the Bookmarks tab this long,
-    # counted from the hold; its candidate is kept from the prune meanwhile.
-    hold_days: int = Field(default=14, ge=1)
     # Exponential age-decay half-life for feedback signals in the centroid
     # weight recompute (online re-weighting with decay, no retraining).
     feedback_half_life_days: float = Field(default=30.0, gt=0.0)

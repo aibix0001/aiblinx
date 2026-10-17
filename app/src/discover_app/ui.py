@@ -74,11 +74,6 @@ _ICON_SAVE = (
     '<path d="M6 3h12a1 1 0 0 1 1 1v17l-7-4-7 4V4a1 1 0 0 1 1-1z"/><path d="M12 7v6M9 10h6"/>'
     "</svg>"
 )
-_ICON_REMOVE = (
-    '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
-    'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
-    '<path d="M6 6l12 12M18 6L6 18"/></svg>'
-)
 _ICON_UP = (
     '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
     'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
@@ -113,10 +108,10 @@ _ICON_PROMOTE = (  # two roofs: lift this story up into the main interests
 )
 
 
-_ICON_HOLD = (  # a sheet of paper: save for later, in the Bookmarks tab
+_ICON_ARCHIVE = (  # a box with a lid: keep it in Archive, no effect on the feed
     '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
     'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
-    '<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4M9 12h6M9 16h6"/></svg>'
+    '<path d="M3 5h18v4H3zM5 9v11h14V9M10 13h4"/></svg>'
 )
 
 
@@ -132,14 +127,14 @@ def _actions(
     interest: str | None,
     promoted: bool | None = None,
     explored: bool | None = None,
-    held: bool = False,
+    archived: bool = False,
 ) -> str:
     """Five equal icon buttons: Save, one button that files the story on the
-    other side, Save for later, more, less. Exploring items get Promote (make
-    it a main interest, when ``promoted`` is not None), "For you" items get
-    Save to Exploring (keep it as a distraction, less like it here, when
-    ``explored`` is not None). Save for later holds the story in the
-    Bookmarks tab without any signal."""
+    other side, Archive, more, less. Exploring items get Promote (make it a
+    main interest, when ``promoted`` is not None), "For you" items get Save
+    to Exploring (keep it as a distraction, less like it here, when
+    ``explored`` is not None). Archive saves the story into the Archive
+    collection, where it has no effect on the feed."""
     other = ""
     if promoted is not None:
         other = f"""
@@ -153,15 +148,17 @@ def _actions(
           title="Save to Exploring, less like this here"
           aria-pressed="{"true" if explored else "false"}">{_ICON_EXPLORE}</button>"""
     save_label = "Saved" if saved else "Save"
-    hold_label = "Saved for later" if held else "Save for later"
+    archive_label = (
+        "Archived, no effect on your feed" if archived else "Archive, no effect on your feed"
+    )
     return f"""\
 <div class="actions">
         <button class="save{" on" if saved else ""}" onclick="save(this)"
           aria-label="{save_label}" title="{save_label}"
           aria-pressed="{"true" if saved else "false"}">{_ICON_SAVE}</button>{other}
-        <button class="vote hold{" on" if held else ""}" onclick="hold(this)"
-          aria-label="{hold_label}" title="{hold_label}"
-          aria-pressed="{"true" if held else "false"}">{_ICON_HOLD}</button>
+        <button class="vote archive{" on" if archived else ""}" onclick="archive(this)"
+          aria-label="{archive_label}" title="{archive_label}"
+          aria-pressed="{"true" if archived else "false"}">{_ICON_ARCHIVE}</button>
         <button class="vote{" on" if interest == "up" else ""}" onclick="vote(this, 'up')"
           aria-label="More like this" aria-pressed="{"true" if interest == "up" else "false"}">\
 {_ICON_UP}</button>
@@ -217,7 +214,7 @@ def _card(item: dict, new_tab: bool, explore: bool = False) -> str:
             interest,
             promoted=bool(item.get("promoted")) if explore else None,
             explored=None if explore else bool(item.get("explored")),
-            held=bool(item.get("held")),
+            archived=bool(item.get("archived")),
         )
     }
     </div>
@@ -242,41 +239,6 @@ def _saved_row(save: dict, new_tab: bool) -> str:
     )
 
 
-def _days_left(days: int) -> str:
-    return "last day" if days <= 1 else f"{days} days left"
-
-
-def _held_row(item: dict, new_tab: bool) -> str:
-    """A held story in the Bookmarks tab: opens in the reader; Save files it
-    for good, Remove lets it go."""
-    cid = int(item["candidate_id"])
-    url = f"/read/{cid}" if _http(item.get("url")) else "#"
-    host = (urlsplit(item.get("url") or "").hostname or "").removeprefix("www.")
-    title = html.escape(_plain(item.get("title")) or item.get("url") or "")
-    target = ' target="_blank"' if new_tab else ""
-    image = _http(item.get("image_url"))
-    thumb = (
-        f'<img class="thumb" src="{html.escape(image, quote=True)}" alt="" loading="lazy" '
-        'referrerpolicy="no-referrer" onerror="this.remove()">'
-        if image
-        else ""
-    )
-    left = item.get("days_left", 1)
-    return f"""\
-<article class="card held-row" id="h{cid}" data-id="{cid}">
-  <div class="held-top">{thumb}
-    <div class="held-text">
-      <a href="{html.escape(url, quote=True)}" rel="noreferrer"{target}>{title}</a>
-      <span{' class="soon"' if left <= 1 else ""}>{html.escape(host)} · {_days_left(left)}</span>
-    </div>
-  </div>
-  <div class="held-actions">
-    <button onclick="heldSave(this)">{_ICON_SAVE}<span>Save</span></button>
-    <button class="ghost" onclick="heldRemove(this)">{_ICON_REMOVE}<span>Remove</span></button>
-  </div>
-</article>"""
-
-
 def render_page(
     items: list[dict],
     topics: list[dict] | None = None,
@@ -286,7 +248,6 @@ def render_page(
     linkwarden: bool = False,
     has_profile: bool = True,
     cycle: str = "",
-    holds: list[dict] | None = None,
 ) -> str:
     """items/broad: current-cycle rows (candidate_id, url, title, snippet,
     description, image_url, reason, source, published_at) plus the viewer's
@@ -294,15 +255,12 @@ def render_page(
     topics: dicts with name, selected (the exploring-section picker).
     new_tab: open article links in a new tab instead of the feed's own.
     saves: the local Saved list, newest first (url, title).
-    holds: the Bookmarks tab, stories held for later, newest first
-    (candidate_id, url, title, image_url, days_left).
     linkwarden: whether saves also go to Linkwarden (labels and hints).
     has_profile: False until something is saved, upvoted or bookmarked — the
     "For you" section then explains how it starts instead of looking broken."""
     broad = broad or []
     topics = topics or []
     saves = saves or []
-    holds = holds or []
     selected = sum(1 for t in topics if t["selected"])
     if has_profile:
         curated_empty = (
@@ -353,9 +311,6 @@ def render_page(
         if saves
         else '<p class="empty">Nothing saved yet. Tap Save on a story to keep it here.</p>'
     )
-    held_list = "\n".join(_held_row(x, new_tab) for x in holds) or (
-        '<p class="empty">Nothing held. Tap the paper on a story to keep it here for later.</p>'
-    )
     return (
         # a JS string literal; entities mean nothing inside <script>
         _PAGE.replace("__CYCLE__", json.dumps(cycle).replace("</", "<\\/"))
@@ -371,8 +326,6 @@ def render_page(
         .replace("__SAVED_NOTE__", saved_note)
         .replace("__SAVED_COUNT__", str(len(saves)))
         .replace("__SAVED__", saved_list)
-        .replace("__HELD_COUNT__", str(len(holds)))
-        .replace("__HELD__", held_list)
         .replace(
             "__CURATED__",
             "\n".join(_card(i, new_tab) for i in items) or curated_empty,
@@ -396,7 +349,7 @@ def render_reader(
     explored: bool | None = None,
     translation: dict | None = None,
     chat: bool = False,
-    held: bool = False,
+    archived: bool = False,
     learn: bool = False,
 ) -> str:
     """The reader page: an article's extracted text, then save / more / less.
@@ -407,6 +360,7 @@ def render_reader(
     is already a main interest (adds the Promote button).
     explored: None for Exploring items; for "For you" items whether the story
     is already saved to Exploring (adds the Save to Exploring button).
+    archived: whether the story's save is in Archive (no effect on the feed).
     translation: {"lang", "title", "body"} with ``lang`` the article's own
     language ("de" / "en"): both versions go into the page and a DE / EN
     toggle swaps them. The article always opens in its own language.
@@ -453,7 +407,7 @@ def render_reader(
         .replace("__THEMEBTN__", THEME_BUTTON)
         .replace("__ID__", str(int(item["id"])))
         .replace("__SECTION__", "curated" if promoted is None else "broad")
-        .replace("__ACTIONBAR__", _actions(saved, interest, promoted, explored, held))
+        .replace("__ACTIONBAR__", _actions(saved, interest, promoted, explored, archived))
         .replace("__URL__", html.escape(url, quote=True))
         .replace("__META__", _meta(item))
         .replace("__FIGURE__", figure)
@@ -514,7 +468,7 @@ THEME_CSS = """\
   --bg: #D5DAE3; --bar: rgba(213, 218, 227, 0.88); --card: #FFFFFF; --ink: #1B2A4A;
   --muted: #64748B; --line: #D1D5DB; --chip: #D5DAE3; --btn: #D5DAE3; --btn-ink: #1B2A4A;
   --on: #1B2A4A; --on-ink: #FFFFFF; --save-on: #1A7A82; --save-on-ink: #FFFFFF;
-  --img: #D1D5DB; --accent: #2B9EA5; --soon: #B45309;
+  --img: #D1D5DB; --accent: #2B9EA5;
   --font-body: Calibri, Carlito, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-head: "Trebuchet MS", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
 }
@@ -522,13 +476,13 @@ THEME_CSS = """\
   :root:not([data-theme="light"]) {
     --bg: #1B2A4A; --bar: rgba(27, 42, 74, 0.88); --card: #1E293B; --ink: #FFFFFF;
     --muted: #D1D5DB; --line: #334155; --chip: #334155; --btn: #334155; --btn-ink: #FFFFFF;
-    --on: #FFFFFF; --on-ink: #1B2A4A; --img: #334155; --soon: #FBBF24;
+    --on: #FFFFFF; --on-ink: #1B2A4A; --img: #334155;
   }
 }
 :root[data-theme="dark"] {
   --bg: #1B2A4A; --bar: rgba(27, 42, 74, 0.88); --card: #1E293B; --ink: #FFFFFF;
   --muted: #D1D5DB; --line: #334155; --chip: #334155; --btn: #334155; --btn-ink: #FFFFFF;
-  --on: #FFFFFF; --on-ink: #1B2A4A; --img: #334155; --soon: #FBBF24;
+  --on: #FFFFFF; --on-ink: #1B2A4A; --img: #334155;
 }
 h1, h2, h3, .wordmark { font-family: var(--font-head); }
 /* the wordmark: "aib" (the maker's prefix) + "linx" on the teal highlight */
@@ -657,32 +611,25 @@ function press(btn, on, label) {
   btn.classList.toggle('on', on); btn.setAttribute('aria-pressed', on);
   if (label) { btn.setAttribute('aria-label', label); btn.title = label; }
 }
-// a saved story is no longer held: every copy of its card shows that
+// every copy of a saved story's card shows the save
 function markSaved(id) {
   document.querySelectorAll(`[data-id="${id}"] .save`).forEach(b => press(b, true, 'Saved'));
-  document.querySelectorAll(`[data-id="${id}"] .hold`)
-    .forEach(b => press(b, false, 'Save for later'));
 }
-async function hold(btn) {
-  const id = btn.closest('.card').dataset.id;
-  const on = !btn.classList.contains('on');
-  btn.disabled = true;
-  try {
-    const resp = await fetch(`/feed/${id}/hold`, {method: on ? 'POST' : 'DELETE'});
-    if (!resp.ok) throw new Error(resp.status);
-    if ((await resp.json()).status === 'already_saved') { toast('Already saved'); return; }
-    document.querySelectorAll(`[data-id="${id}"] .hold`)
-      .forEach(b => press(b, on, on ? 'Saved for later' : 'Save for later'));
-    window.holdsChanged = true;
-    toast(on ? 'Kept in Bookmarks for later' : 'Removed from Bookmarks');
-  } catch (e) { toast('Could not update: ' + e.message); }
-  finally { btn.disabled = false; }
+// a story filed on one side (promote, explore, archive) leaves the others
+function markFiled(id, cls) {
+  document.querySelectorAll(`[data-id="${id}"] .promote, [data-id="${id}"] .explore`)
+    .forEach(b => press(b, b.classList.contains(cls)));
+  document.querySelectorAll(`[data-id="${id}"] .archive`).forEach(b => press(b, cls === 'archive',
+    (cls === 'archive' ? 'Archived' : 'Archive') + ', no effect on your feed'));
+  markSaved(id);
 }
-// un-saved: Promote and Save to Exploring filed the save, so they go with it
+// un-saved: Promote, Save to Exploring and Archive filed the save, so they go with it
 function markUnsaved(id) {
   document.querySelectorAll(`[data-id="${id}"] .save`).forEach(b => press(b, false, 'Save'));
   document.querySelectorAll(`[data-id="${id}"] .promote, [data-id="${id}"] .explore`)
     .forEach(b => press(b, false));
+  document.querySelectorAll(`[data-id="${id}"] .archive`)
+    .forEach(b => press(b, false, 'Archive, no effect on your feed'));
 }
 async function save(btn) {
   const card = btn.closest('.card');
@@ -712,8 +659,7 @@ async function promote(btn) {
   btn.disabled = true;
   try {
     await post(card.dataset.id, 'promote');
-    press(btn, true);
-    markSaved(card.dataset.id);
+    markFiled(card.dataset.id, 'promote');
     if (typeof saved === 'function') saved({});
     toast('Now one of your main interests');
   } catch (e) { toast('Could not promote: ' + e.message); }
@@ -725,11 +671,24 @@ async function explore(btn) {
   btn.disabled = true;
   try {
     await post(card.dataset.id, 'explore');
-    press(btn, true);
-    markSaved(card.dataset.id);
+    markFiled(card.dataset.id, 'explore');
     if (typeof saved === 'function') saved({});
     toast('Saved to Exploring, less like this here');
   } catch (e) { toast('Could not save to Exploring: ' + e.message); }
+  finally { btn.disabled = false; }
+}
+async function archive(btn) {
+  if (btn.classList.contains('on')) return;
+  const card = btn.closest('.card');
+  btn.disabled = true;
+  try {
+    // the reader chat's discussion goes along, as a PDF for Linkwarden
+    const body = typeof saveBody === 'function' ? saveBody() : undefined;
+    const result = await post(card.dataset.id, 'archive', body);
+    markFiled(card.dataset.id, 'archive');
+    if (typeof saved === 'function') saved(result);
+    toast('Archived, no effect on your feed');
+  } catch (e) { toast('Could not archive: ' + e.message); }
   finally { btn.disabled = false; }
 }
 async function vote(btn, value) {
@@ -1010,7 +969,7 @@ __HEAD__
 <script>
 // before first paint: a tab remembered in the fragment is shown straight
 // away (CSS below), instead of flashing "For you" until the body script runs
-if (['broad', 'held', 'saved'].includes(location.hash.slice(1))) {
+if (['broad', 'saved'].includes(location.hash.slice(1))) {
   document.documentElement.dataset.tab = location.hash.slice(1);
 }
 // in <head>: a cached image can fire onload/onerror before the body script runs
@@ -1048,11 +1007,9 @@ main {
 .panel { display: flex; flex-direction: column; gap: 14px; }
 .panel[hidden] { display: none; }
 :root[data-tab] #curated { display: none; }
-:root[data-tab="broad"] #broad, :root[data-tab="held"] #held,
-:root[data-tab="saved"] #saved { display: flex; }
+:root[data-tab="broad"] #broad, :root[data-tab="saved"] #saved { display: flex; }
 :root[data-tab] .tabs button[data-panel="curated"] { background: transparent; color: var(--muted); }
 :root[data-tab="broad"] .tabs button[data-panel="broad"],
-:root[data-tab="held"] .tabs button[data-panel="held"],
 :root[data-tab="saved"] .icon-btn[data-panel="saved"] {
   background: var(--on); color: var(--on-ink);
 }
@@ -1091,27 +1048,6 @@ label.topic {
   color: var(--ink); font-weight: 600; font-size: 16px; line-height: 1.3; text-decoration: none;
 }
 .saved-list span { color: var(--muted); font-size: 13px; }
-.held-row { padding: 12px; display: flex; flex-direction: column; gap: 10px; }
-.held-top { display: flex; gap: 12px; align-items: flex-start; }
-.held-row .thumb {
-  width: 72px; height: 72px; flex-shrink: 0; border-radius: 14px; object-fit: cover;
-  background: var(--img);
-}
-.held-text { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
-.held-text a {
-  color: var(--ink); font-family: var(--font-head); font-weight: 700; font-size: 17px;
-  line-height: 1.2; text-decoration: none; overflow-wrap: anywhere;
-}
-.held-text span { color: var(--muted); font-size: 13px; }
-.held-text span.soon { color: var(--soon); font-weight: 700; }
-.held-actions { display: flex; gap: 8px; }
-.held-actions button {
-  flex: 1 1 0; height: 44px; border: 0; border-radius: 14px; font: inherit; font-size: 15px;
-  display: flex; align-items: center; justify-content: center; gap: 8px; cursor: pointer;
-  background: var(--btn); color: var(--btn-ink);
-}
-.held-actions button.ghost { background: transparent; border: 1.5px solid var(--line); }
-.held-actions button:disabled { opacity: 0.6; }
 @media (min-width: 700px) { main { padding-top: 16px; } .panel { gap: 20px; } }
 </style>
 </head>
@@ -1132,11 +1068,6 @@ C19.5 15.4 12 20 12 20z"/></svg></button>
 stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">\
 <circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.6 2.6 3.8 5.6 3.8 9s-1.2 6.4-3.8 9\
 M12 3c-2.6 2.6-3.8 5.6-3.8 9s1.2 6.4 3.8 9"/></svg></button>
-      <button role="tab" aria-selected="false" data-panel="held" onclick="tab(this)"
-        aria-label="Bookmarks" title="Bookmarks">\
-<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" \
-stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">\
-<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4M9 12h6M9 16h6"/></svg></button>
     </div>
     <button class="icon-btn" data-panel="saved" aria-selected="false" onclick="tab(this)"
       aria-label="Saved stories">\
@@ -1157,11 +1088,6 @@ __BROAD__
   <p>Selected topics feed this section. Pick a few outside your usual interests.</p>
   __TOPICS__
 </details>
-</section>
-<section class="panel" id="held" hidden>
-<div class="saved-head"><h2>Bookmarks · __HELD_COUNT__</h2>\
-<p>Kept for later, not ranked and not sent to Linkwarden.</p></div>
-__HELD__
 </section>
 <section class="panel" id="saved" hidden>
 <div class="saved-head"><h2>Saved · __SAVED_COUNT__</h2><p>__SAVED_NOTE__</p></div>
@@ -1212,13 +1138,6 @@ if (navigator.standalone || matchMedia('(display-mode: standalone)').matches) {
   });
 }
 function tab(btn, restoring) {
-  // the Bookmarks tab is rendered by the server: after a hold changed, load
-  // it fresh (the fragment keeps the tab across the reload)
-  if (btn.dataset.panel === 'held' && window.holdsChanged && !restoring) {
-    history.replaceState(null, '', '#held');
-    location.reload();
-    return;
-  }
   document.querySelectorAll('[data-panel]').forEach(b => {
     const on = b === btn;
     b.setAttribute('aria-selected', on);
@@ -1231,35 +1150,8 @@ function tab(btn, restoring) {
   history.replaceState(null, '', panel === 'curated' ? location.pathname : '#' + panel);
   if (!restoring) window.scrollTo(0, 0);
 }
-if (['broad', 'held', 'saved'].includes(location.hash.slice(1))) {
+if (['broad', 'saved'].includes(location.hash.slice(1))) {
   tab(document.querySelector(`[data-panel="${location.hash.slice(1)}"]`), true);
-}
-function heldDone(row, msg) {
-  row.remove();
-  const head = document.querySelector('#held h2');
-  head.textContent = 'Bookmarks · ' + document.querySelectorAll('#held .held-row').length;
-  window.holdsChanged = true;
-  toast(msg);
-}
-async function heldSave(btn) {
-  const row = btn.closest('.card');
-  btn.disabled = true;
-  try {
-    await post(row.dataset.id, 'save');  // also releases the hold
-    markSaved(row.dataset.id);
-    heldDone(row, 'Saved');
-  } catch (e) { toast('Could not save: ' + e.message); btn.disabled = false; }
-}
-async function heldRemove(btn) {
-  const row = btn.closest('.card');
-  btn.disabled = true;
-  try {
-    const resp = await fetch(`/feed/${row.dataset.id}/hold`, {method: 'DELETE'});
-    if (!resp.ok) throw new Error(resp.status);
-    document.querySelectorAll(`[data-id="${row.dataset.id}"] .hold`)
-      .forEach(b => press(b, false, 'Save for later'));
-    heldDone(row, 'Removed from Bookmarks');
-  } catch (e) { toast('Could not remove: ' + e.message); btn.disabled = false; }
 }
 async function topic(box) {
   box.disabled = true;

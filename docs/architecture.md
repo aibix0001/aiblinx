@@ -227,6 +227,7 @@ app, restore the copy and set the old model again.
 | POST | `/feed/{id}/interest` | `{value: up\|down, section}` |
 | POST | `/feed/{id}/promote` | file an Exploring story as a main interest |
 | POST | `/feed/{id}/explore` | file a "For you" story under Exploring, and less like it |
+| POST | `/feed/{id}/archive` | file a story under Archive, with no effect on the feed; optional `{discussion}` as with Save |
 | GET | `/read/{id}` | reader view (or a redirect to the original) |
 | POST | `/read/{id}/opened` | `?section=`: the reader page's report that its text was read (with `READER_LEARN`) |
 | POST | `/read/{id}/chat` | `{messages, lang}`: one chat answer about the story, as server-sent events; the first event is the job id |
@@ -256,6 +257,7 @@ values count as unset.
 | `LINKWARDEN_BASE_URL` / `LINKWARDEN_TOKEN` | — | optional; empty token = saves stay local |
 | `LINKWARDEN_COLLECTION_ID` | `1` | where saves land (an id, not a name) |
 | `LINKWARDEN_EXPLORE_COLLECTION_ID` | *(empty)* | where Exploring saves land; empty = a collection named "Exploring", created if missing |
+| `LINKWARDEN_ARCHIVE_COLLECTION_ID` | *(empty)* | where Archive saves land, with no effect on the feed; empty = a collection named "Archive", created if missing |
 | `MINIFLUX_URL` / `MINIFLUX_TOKEN` | `http://miniflux:8080` / — | optional; without a token the built-in reader is used |
 | `MINIFLUX_ADMIN_USER` / `MINIFLUX_ADMIN_PASSWORD` | — | lets the app create its own Miniflux API key |
 | `SEARXNG_URL` | — | empty = Exploring off |
@@ -268,7 +270,6 @@ values count as unset.
 | `MIN_RELEVANCE` | `0.3` | chat model score a story needs; below it the slot stays empty |
 | `FEEDBACK_HALF_LIFE_DAYS` | `30` | decay of taps |
 | `CANDIDATE_MAX_AGE_DAYS` | `14` | freshness window, by listing date and by the page's own date |
-| `HOLD_DAYS` | `14` | days a story saved for later stays in the Bookmarks tab |
 | `AD_FILTER_PATTERNS` | `anzeige:`, `advertorial`, `sponsored` | title substrings dropped |
 | `POLL_CRON` / `CYCLE_CRON` | `7-59/15 * * * *` / `0 6 * * *` | UTC |
 | `LINK_TARGET` | `same` | `new` opens articles in a new tab |

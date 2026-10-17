@@ -31,7 +31,7 @@ from ..config import Settings, get_settings
 from ..db import connection
 from ..urls import norm_url
 from .embedding import link_texts
-from .feedback import known_explore_collection
+from .feedback import ignored_collections
 
 log = logging.getLogger(__name__)
 
@@ -56,16 +56,16 @@ _WEIGHT_FLOOR = 0.25
 
 
 def load_kept_pages(
-    conn, dim: int, explore_collection: int | None = None
+    conn, dim: int, ignored: set[int] | None = None
 ) -> tuple[list[str], np.ndarray]:
     """The pages the user keeps, one per page, as ``(titles, vectors)``:
     Linkwarden bookmarks (when connected), the local Saved list, pages
     imported on the setup page, and pages the user upvoted (latest vote per
     page). Linkwarden is optional, so an install without it builds its
     profile from saves and upvotes alone. Vectors from a previous embedder
-    (other dimension) are skipped. Exploring saves and upvotes, and links in
-    the Exploring collection, are not interests. A page without a title is
-    named by its URL."""
+    (other dimension) are skipped. Exploring and Archive saves, Exploring
+    upvotes, and links in the ``ignored`` collections (Exploring, Archive)
+    are not interests. A page without a title is named by its URL."""
     seen: set[str] = set()
     titles: list[str] = []
     vectors: list[np.ndarray] = []
@@ -86,9 +86,7 @@ def load_kept_pages(
     ).fetchall()
     own_text = link_texts(links)[0]
     for row in links:
-        if row["embedding"] is not None and (
-            explore_collection is None or row["collection_id"] != explore_collection
-        ):
+        if row["embedding"] is not None and row["collection_id"] not in (ignored or ()):
             add(norm_url(row["url"]), own_text[row["id"]], row["embedding"])
     for row in conn.execute(
         "SELECT url_key, title, embedding FROM saves "
@@ -111,9 +109,9 @@ def load_kept_pages(
     return titles, np.vstack(vectors)
 
 
-def _load_profile_vectors(conn, dim: int, explore_collection: int | None = None) -> np.ndarray:
+def _load_profile_vectors(conn, dim: int, ignored: set[int] | None = None) -> np.ndarray:
     """The points the interest clusters are built from: the kept pages."""
-    return load_kept_pages(conn, dim, explore_collection)[1]
+    return load_kept_pages(conn, dim, ignored)[1]
 
 
 def _centroid_weights(
@@ -223,7 +221,7 @@ def rebuild_profile(settings: Settings | None = None) -> int:
     settings = settings or get_settings()
     with connection(settings) as conn:
         vectors = _load_profile_vectors(
-            conn, settings.embed_dim, known_explore_collection(conn, settings)
+            conn, settings.embed_dim, ignored_collections(conn, settings)
         )
         if len(vectors) == 0:
             conn.execute("DELETE FROM profile")

@@ -63,6 +63,7 @@ from .models import (
 )
 from .pipeline.cycle import run_cycle
 from .pipeline.feedback import (
+    archive_candidate,
     capture_candidate,
     explore_candidate,
     facet_query,
@@ -75,7 +76,7 @@ from .pipeline.feedback import (
     unsave_candidate,
 )
 from .pipeline.feeds import add_feed, list_feeds, remove_feed
-from .pipeline.holds import held_ids, hold_candidate, list_holds, release_hold
+from .pipeline.migrate_holds import migrate_holds
 from .pipeline.miniflux_key import ensure_miniflux_token, miniflux_configured
 from .pipeline.output import current_items, render_atom, render_markdown
 from .reader import (
@@ -112,6 +113,11 @@ async def _page(settings: Settings, item: dict) -> Page | None:
 async def lifespan(app: FastAPI):
     settings = get_settings()
     init_db(settings)
+    try:
+        await migrate_holds(settings)
+    except Exception:
+        # the migration must never keep the app from starting
+        log.exception("migrate_holds failed; held stories wait for the next start")
     hide_reads_from_access_log()
     scheduler = build_scheduler(settings)
     scheduler.start()
@@ -227,6 +233,10 @@ def create_app() -> FastAPI:
             explored = {
                 row[0] for row in conn.execute("SELECT url_key FROM saves WHERE section = 'broad'")
             }
+            archived = {
+                row[0]
+                for row in conn.execute("SELECT url_key FROM saves WHERE section = 'archive'")
+            }
             interest = {
                 row["url"]: row["value"]
                 for row in conn.execute(
@@ -243,22 +253,19 @@ def create_app() -> FastAPI:
             has_profile = conn.execute("SELECT COUNT(*) FROM profile").fetchone()[0] > 0
             cycle = get_meta(conn, "last_cycle_ts") or ""
             settings = get_settings()
-            held = held_ids(conn, settings)
-            holds = list_holds(conn, settings)
         for item in curated + broad:
-            item["held"] = item["candidate_id"] in held
             key = norm_url(item["url"] or "")
             item["saved"] = key in saved
             item["interest"] = interest.get(key)
             item["promoted"] = key in promoted
             item["explored"] = key in explored
+            item["archived"] = key in archived
         page = render_page(
             curated,
             list_topics(settings),
             broad=broad,
             new_tab=settings.link_target == "new",
             saves=saves,
-            holds=holds,
             linkwarden=settings.linkwarden_enabled,
             has_profile=has_profile,
             cycle=cycle,
@@ -527,7 +534,7 @@ def create_app() -> FastAPI:
                 promoted, explored = bool(filed and filed[0] == "curated"), None
             else:
                 promoted, explored = None, bool(filed and filed[0] == "broad")
-            held = candidate_id in held_ids(conn, settings)
+            archived = bool(filed and filed[0] == "archive")
             prepared = conn.execute(
                 "SELECT lang, body, title_tr, body_tr FROM articles WHERE candidate_id = ?",
                 (candidate_id,),
@@ -574,7 +581,7 @@ def create_app() -> FastAPI:
                 linkwarden=settings.linkwarden_enabled,
                 promoted=promoted,
                 explored=explored,
-                held=held,
+                archived=archived,
                 translation=translation,
                 chat=settings.chat_enabled,
                 learn=settings.reader_learn and text,
@@ -721,21 +728,25 @@ def create_app() -> FastAPI:
             ) from exc
         return CaptureResponse(**result)
 
-    @app.post("/feed/{candidate_id}/hold")
-    def feed_hold(candidate_id: int) -> dict:
-        """Save for later: keep the story in the Bookmarks tab for
-        ``hold_days``. No signal and no Linkwarden (idempotent)."""
+    @app.post("/feed/{candidate_id}/archive", response_model=CaptureResponse)
+    async def feed_archive(candidate_id: int, body: SaveRequest | None = None) -> CaptureResponse:
+        """Keep a story without any effect on the feed: saved into (or moved
+        to) the Archive collection. A discussion from the reader chat goes to
+        the link as a PDF, like Save."""
+        settings = get_settings()
         try:
-            status = hold_candidate(get_settings(), candidate_id)
+            result = await archive_candidate(settings, candidate_id)
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-        return {"status": status, "candidate_id": candidate_id}
-
-    @app.delete("/feed/{candidate_id}/hold")
-    def feed_release(candidate_id: int) -> dict:
-        """Remove a story from the Bookmarks tab (idempotent)."""
-        release_hold(get_settings(), candidate_id)
-        return {"status": "released", "candidate_id": candidate_id}
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=502, detail=f"Linkwarden rejected the save: {exc}"
+            ) from exc
+        if body and body.discussion and settings.linkwarden_enabled:
+            result["attached"] = await attach_discussion(
+                settings, candidate_id, body.discussion, link_id=result.get("linkwarden_id")
+            )
+        return CaptureResponse(**result)
 
     @app.post("/feed/{candidate_id}/interest", response_model=FeedbackResponse)
     async def feed_interest(candidate_id: int, body: FeedbackRequest) -> FeedbackResponse:

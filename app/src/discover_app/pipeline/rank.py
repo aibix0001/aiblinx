@@ -31,7 +31,7 @@ from ..urls import norm_url
 from .articles import _NO_THINKING
 from .broad import pick_broad_items
 from .dedup import duplicates, served_stories
-from .feedback import known_explore_collection
+from .feedback import ignored_collections
 from .profile import load_kept_pages
 from .readable import check_pages, is_stale, site_of, site_penalties
 
@@ -278,7 +278,7 @@ async def _select_curated(
         centroids = np.vstack([_blob_to_unit_vec(row["vector"]) for row in profile])
         weights = np.array([float(row["weight"]) for row in profile])
         kept_titles, kept = load_kept_pages(
-            conn, settings.embed_dim, known_explore_collection(conn, settings)
+            conn, settings.embed_dim, ignored_collections(conn, settings)
         )
         kept = _unit_rows(kept)
         rejected_titles, rejected = _rejected(conn, settings.embed_dim)

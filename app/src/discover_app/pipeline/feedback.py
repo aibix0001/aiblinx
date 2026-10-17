@@ -18,7 +18,9 @@ page has a save or an interest vote.
 
 Every signal also records the section its item was served in. Exploring
 (``broad``) feedback steers only Exploring: it never enters the interest
-profile, and Exploring saves go to their own Linkwarden collection.
+profile, and Exploring saves go to their own Linkwarden collection. An
+``archive`` save goes to the Archive collection and steers nothing: it is a
+link the user keeps without any effect on the feed.
 """
 
 from __future__ import annotations
@@ -31,7 +33,6 @@ from ..clients.linkwarden import LinkwardenClient
 from ..config import Settings
 from ..db import connection, get_meta, set_meta
 from ..urls import norm_url
-from .holds import release_hold
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +50,8 @@ VALID_RATINGS: set[float] = {-1.0, -0.5, 0.0, 0.5, 1.0}
 
 EXPLORE_COLLECTION_NAME = "Exploring"
 _EXPLORE_COLLECTION_KEY = "linkwarden_explore_collection_id"
+ARCHIVE_COLLECTION_NAME = "Archive"
+_ARCHIVE_COLLECTION_KEY = "linkwarden_archive_collection_id"
 
 
 def served_section(conn, candidate_id: int) -> str:
@@ -62,30 +65,76 @@ def served_section(conn, candidate_id: int) -> str:
     return "broad" if row and row[0] == "broad" else "curated"
 
 
+def _known_collection(conn, configured: int | None, key: str) -> int | None:
+    if configured is not None:
+        return configured
+    stored = get_meta(conn, key)
+    return int(stored) if stored else None
+
+
 def known_explore_collection(conn, settings: Settings) -> int | None:
     """The Exploring collection's id if configured or already created."""
-    if settings.linkwarden_explore_collection_id is not None:
-        return settings.linkwarden_explore_collection_id
-    stored = get_meta(conn, _EXPLORE_COLLECTION_KEY)
-    return int(stored) if stored else None
+    return _known_collection(
+        conn, settings.linkwarden_explore_collection_id, _EXPLORE_COLLECTION_KEY
+    )
+
+
+def known_archive_collection(conn, settings: Settings) -> int | None:
+    """The Archive collection's id if configured or already created."""
+    return _known_collection(
+        conn, settings.linkwarden_archive_collection_id, _ARCHIVE_COLLECTION_KEY
+    )
+
+
+def ignored_collections(conn, settings: Settings) -> set[int]:
+    """Linkwarden collections whose links are no interests: Exploring and
+    Archive, as far as they are known."""
+    known = (known_explore_collection(conn, settings), known_archive_collection(conn, settings))
+    return {c for c in known if c is not None}
+
+
+async def _own_collection(
+    settings: Settings, linkwarden: LinkwardenClient, configured: int | None, key: str, name: str
+) -> int:
+    """A collection of ours: configured, remembered, or found/created by name."""
+    with connection(settings) as conn:
+        known = _known_collection(conn, configured, key)
+    if known is not None:
+        return known
+    collection_id = await linkwarden.find_or_create_collection(name)
+    with connection(settings) as conn:
+        set_meta(conn, key, str(collection_id))
+    log.info("%s saves go to Linkwarden collection %d", name, collection_id)
+    return collection_id
 
 
 async def explore_collection(settings: Settings, linkwarden: LinkwardenClient) -> int:
     """The Exploring collection's id: configured, remembered, or found/created."""
-    with connection(settings) as conn:
-        known = known_explore_collection(conn, settings)
-    if known is not None:
-        return known
-    collection_id = await linkwarden.find_or_create_collection(EXPLORE_COLLECTION_NAME)
-    with connection(settings) as conn:
-        set_meta(conn, _EXPLORE_COLLECTION_KEY, str(collection_id))
-    log.info("Exploring saves go to Linkwarden collection %d", collection_id)
-    return collection_id
+    return await _own_collection(
+        settings,
+        linkwarden,
+        settings.linkwarden_explore_collection_id,
+        _EXPLORE_COLLECTION_KEY,
+        EXPLORE_COLLECTION_NAME,
+    )
+
+
+async def archive_collection(settings: Settings, linkwarden: LinkwardenClient) -> int:
+    """The Archive collection's id: configured, remembered, or found/created."""
+    return await _own_collection(
+        settings,
+        linkwarden,
+        settings.linkwarden_archive_collection_id,
+        _ARCHIVE_COLLECTION_KEY,
+        ARCHIVE_COLLECTION_NAME,
+    )
 
 
 async def _collection_for(settings: Settings, linkwarden: LinkwardenClient, section: str) -> int:
     if section == "broad":
         return await explore_collection(settings, linkwarden)
+    if section == "archive":
+        return await archive_collection(settings, linkwarden)
     return settings.linkwarden_collection_id
 
 
@@ -212,9 +261,7 @@ async def capture_candidate(
     state written (retry is safe).
     """
     async with _capture_lock:
-        result = await _capture(settings, candidate_id, linkwarden, section=section)
-    release_hold(settings, candidate_id)  # saved now: no longer held for later
-    return result
+        return await _capture(settings, candidate_id, linkwarden, section=section)
 
 
 async def promote_candidate(
@@ -228,7 +275,6 @@ async def promote_candidate(
     """
     async with _capture_lock:
         link_id = await _file_as(settings, candidate_id, "curated", linkwarden)
-    release_hold(settings, candidate_id)
     log.info("promote: candidate %d filed under the main interests", candidate_id)
     return {"status": "promoted", "linkwarden_id": link_id}
 
@@ -244,10 +290,25 @@ async def explore_candidate(
     """
     async with _capture_lock:
         link_id = await _file_as(settings, candidate_id, "broad", linkwarden)
-    release_hold(settings, candidate_id)
     record_feedback(settings, candidate_id, "interest", "down", section="curated")
     log.info("explore: candidate %d filed under Exploring", candidate_id)
     return {"status": "saved_to_exploring", "linkwarden_id": link_id}
+
+
+async def archive_candidate(
+    settings: Settings,
+    candidate_id: int,
+    linkwarden: LinkwardenClient | None = None,
+) -> dict:
+    """Archive: keep a story without any effect on the feed. It is saved as
+    ``archive`` into the Archive collection (moved there if it was saved
+    elsewhere). The save keeps it from being served again; profile, ranking
+    and the Exploring picker never read it. Idempotent.
+    """
+    async with _capture_lock:
+        link_id = await _file_as(settings, candidate_id, "archive", linkwarden)
+    log.info("archive: candidate %d filed under Archive", candidate_id)
+    return {"status": "archived", "linkwarden_id": link_id}
 
 
 async def _file_as(
@@ -470,6 +531,15 @@ def detect_saved(settings: Settings, new_link_urls: list[str]) -> int:
     new_keys = {norm_url(u) for u in new_link_urls if u}
     events = 0
     with connection(settings) as conn:
+        # A link filed in Archive is kept without any effect on the feed.
+        archive = known_archive_collection(conn, settings)
+        if archive is not None:
+            new_keys -= {
+                norm_url(url)
+                for (url,) in conn.execute(
+                    "SELECT url FROM links WHERE collection_id = ?", (archive,)
+                )
+            }
         # Any served section counts: a save from the broad section is exactly
         # the Exploring bandit's reward signal, not just curated saves.
         served = conn.execute(

@@ -29,7 +29,7 @@ from ..config import Settings, get_settings
 from ..db import connection
 from ..urls import norm_url
 from .enrich import PAGE_HEADERS
-from .feedback import known_explore_collection
+from .feedback import ignored_collections
 
 log = logging.getLogger(__name__)
 
@@ -42,13 +42,13 @@ def pending_domains(settings: Settings) -> list[str]:
         # Every page the user keeps counts once: bookmarks, local saves not
         # (yet) in Linkwarden, and upvoted pages. Feedback URLs are stored
         # normalized ("host/path"), so they are read as scheme-less.
-        # Exploring saves and votes are distractions, not sites to follow.
+        # Exploring saves and votes are distractions, Archive links a dump:
+        # neither names a site to follow.
+        ignored = ignored_collections(conn, settings)
         pages = {
             norm_url(url): url
-            for (url,) in conn.execute(
-                "SELECT url FROM links WHERE :explore IS NULL OR collection_id IS NOT :explore",
-                {"explore": known_explore_collection(conn, settings)},
-            )
+            for (url, collection_id) in conn.execute("SELECT url, collection_id FROM links")
+            if collection_id not in ignored
         }
         for (url,) in conn.execute(
             "SELECT url FROM saves WHERE section = 'curated' UNION ALL SELECT url FROM imports"
