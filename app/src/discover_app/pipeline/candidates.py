@@ -66,6 +66,10 @@ def prune_candidates(settings: Settings) -> int:
                 f"DELETE FROM page_checks WHERE candidate_id IN ({placeholders})",  # noqa: S608
                 ids,
             )
+            conn.execute(
+                f"DELETE FROM highlights WHERE candidate_id IN ({placeholders})",  # noqa: S608
+                ids,
+            )
             conn.execute(f"DELETE FROM candidates WHERE id IN ({placeholders})", ids)  # noqa: S608
     if ids:
         log.info("prune_candidates: dropped %d candidates older than %s", len(ids), cutoff)

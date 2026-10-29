@@ -123,6 +123,11 @@ class Settings(BaseSettings):
     browser_ws_url: str = ""
     browser_concurrency: int = Field(default=3, ge=1)
     browser_timeout_s: float = Field(default=30.0, gt=0.0)
+    # The PDF Save puts into the Linkwarden link (reader view with highlights,
+    # then the discussion), printed in that browser. Over this size it is
+    # printed again without images; Linkwarden's own upload limit
+    # (NEXT_PUBLIC_MAX_FILE_BUFFER) defaults to 10 MB as well.
+    pdf_max_mb: float = Field(default=10.0, gt=0.0)
     # DuckDuckGo autoconsent's playwright bundle and rules (the Dockerfile
     # puts them here); without them the chat model alone handles banners
     autoconsent_dir: str = "/app/autoconsent"

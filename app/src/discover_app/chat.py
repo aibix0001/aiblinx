@@ -5,7 +5,9 @@ Every message sends the whole history, the server adds the context and
 writes the answer as a background job the page follows: a page that goes
 away mid-answer fetches it again when it comes back. The answer is held in
 memory only, for an hour after it is done; a discussion reaches the server's
-storage only as the PDF that Save attaches to the Linkwarden link.
+storage only as the PDF that Save attaches to the Linkwarden link (with the
+article and its highlights, ``print_pdf``). The database keeps how many turns
+that PDF holds, never their text.
 
 The context is built here from the database, never taken from the page: the
 whole article as the reader shows it (in the language on screen), the card
@@ -38,9 +40,10 @@ from .clients.llm import LLMClient
 from .clients.searxng import SearxngClient
 from .config import Settings
 from .db import connection
-from .discussion_pdf import render_discussion
+from .highlights import Variant, load_marks
 from .html_text import card_summary, strip_html
 from .pipeline.enrich import PAGE_HEADERS
+from .print_pdf import make_pdf
 from .reader import extract_article
 from .urls import norm_url
 
@@ -113,10 +116,12 @@ class ChatRequest(BaseModel):
 
 
 class SaveRequest(BaseModel):
-    """Save's optional body: the discussion to attach to the Linkwarden link,
-    and the tab Save was pressed in."""
+    """Save's optional body: the discussion for the Linkwarden link's PDF,
+    the text on screen (whose highlights the PDF shows), and the tab Save
+    was pressed in."""
 
     discussion: list[ChatTurn] = Field(default=[], max_length=MAX_TURNS)
+    variant: Variant | None = None
     section: Literal["curated", "broad"] | None = None  # the tab Save was pressed in
 
 
@@ -153,28 +158,37 @@ def story(settings: Settings, candidate_id: int) -> dict:
     return item
 
 
-async def article_text(
+async def article_body(
     settings: Settings, item: dict, lang: str | None, llm: LLMClient | None = None
-) -> str:
-    """The article as the reader shows it: the prepared text, or its
-    translation when that is on screen; else fetched and extracted now, the
-    way the reader does it, and not stored."""
+) -> str | None:
+    """The article as the reader shows it, as safe reader HTML: the prepared
+    text, or its translation when ``lang`` is the other language; else
+    fetched and extracted now, the way the reader does it, and not stored.
+    None when there is no article text."""
     with connection(settings) as conn:
         prepared = conn.execute(
             "SELECT lang, body, body_tr FROM articles WHERE candidate_id = ?", (item["id"],)
         ).fetchone()
     if prepared and prepared["body"]:
-        shown = prepared["body"]
         if lang and prepared["lang"] and lang != prepared["lang"] and prepared["body_tr"]:
-            shown = prepared["body_tr"]
-        return plain_text(shown)
+            return prepared["body_tr"]
+        return prepared["body"]
     try:
         page = await get_page(settings, item["url"], item["title"], llm)
     except Unreachable:
         page = None
     if not page or not page.article:
-        return ""
-    body = await asyncio.to_thread(extract_article, page.html, item["url"], item["title"])
+        return None
+    return await asyncio.to_thread(
+        extract_article, page.html, item["url"], item["title"], item.get("image_url")
+    )
+
+
+async def article_text(
+    settings: Settings, item: dict, lang: str | None, llm: LLMClient | None = None
+) -> str:
+    """The article as the reader shows it, as plain text for the prompt."""
+    body = await article_body(settings, item, lang, llm)
     return plain_text(body) if body else ""
 
 
@@ -431,39 +445,85 @@ def _link_id(settings: Settings, url: str) -> int | None:
     return None
 
 
-async def attach_discussion(
+def _variant_lang(settings: Settings, candidate_id: int, variant: str) -> str | None:
+    """The language of a text: the translation is the prepared article's
+    other language."""
+    if variant != "tr":
+        return None
+    with connection(settings) as conn:
+        row = conn.execute(
+            "SELECT lang FROM articles WHERE candidate_id = ? AND body_tr IS NOT NULL",
+            (candidate_id,),
+        ).fetchone()
+    if not row or not row["lang"]:
+        return None
+    return "en" if row["lang"] == "de" else "de"
+
+
+async def attach_pdf(
     settings: Settings,
     candidate_id: int,
     turns: list[ChatTurn],
+    variant: Variant | None = None,
     link_id: int | None = None,
     linkwarden: LinkwardenClient | None = None,
-) -> bool:
-    """Render the discussion as a PDF and put it into the story's Linkwarden
-    link, replacing the page PDF there. False when there is no link or the
-    upload fails; the PDF is not kept for a retry."""
+) -> bool | None:
+    """Print the story's PDF (reader view with its highlights, then the
+    discussion) and put it into its Linkwarden link, replacing the page PDF
+    there. ``variant``: the text on screen; without it the one that has
+    marks. None when there is nothing to add to the link (no discussion, no
+    marks), False when there is no link or the PDF could not be made or
+    uploaded; the PDF is not kept for a retry. From the reader (``variant``
+    given), a PDF of ours whose marks were all erased is printed again."""
+    marks = load_marks(settings, candidate_id)
     item = story(settings, candidate_id)
+    stale = False
+    if variant is None:
+        variant = "tr" if marks["tr"] and not marks["orig"] else "orig"
+    else:
+        with connection(settings) as conn:
+            stale = (
+                conn.execute(
+                    "SELECT 1 FROM saves WHERE url_key = ? AND pdf_turns IS NOT NULL "
+                    "AND pdf_stale = 1",
+                    (norm_url(item["url"]),),
+                ).fetchone()
+                is not None
+            )
+    if not turns and not marks[variant] and not stale:
+        return None
     link_id = link_id or _link_id(settings, item["url"])
     if link_id is None:
-        log.warning("reader chat: candidate %d has no Linkwarden link to attach to", candidate_id)
+        log.warning("pdf: candidate %d has no Linkwarden link to attach to", candidate_id)
         return False
-    pdf = await asyncio.to_thread(
-        render_discussion,
-        item,
-        item["summary"],
-        item["why"],
-        [turn.model_dump() for turn in turns],
-    )
+    llm = LLMClient(settings) if settings.llm_chat_model else None
+    try:
+        body = await article_body(
+            settings, item, _variant_lang(settings, candidate_id, variant), llm
+        )
+    finally:
+        if llm is not None:
+            await llm.aclose()
+    dumped = [turn.model_dump() for turn in turns]
+    pdf, with_marks = await make_pdf(settings, item, body, marks[variant], dumped)
+    if pdf is None:
+        return False
     owns_client = linkwarden is None
     linkwarden = linkwarden or LinkwardenClient(settings)
     try:
-        await linkwarden.upload_pdf(link_id, pdf, "aiblinx-discussion.pdf")
+        await linkwarden.upload_pdf(link_id, pdf, "aiblinx.pdf")
     except httpx.HTTPError as exc:
-        log.warning("reader chat: attaching to link %d failed: %s", link_id, exc)
+        log.warning("pdf: attaching to link %d failed: %s", link_id, exc)
         return False
     finally:
         if owns_client:
             await linkwarden.aclose()
-    log.info("reader chat: discussion attached to Linkwarden link %d", link_id)
+    with connection(settings) as conn:
+        conn.execute(
+            "UPDATE saves SET pdf_turns = ?, pdf_stale = ? WHERE url_key = ?",
+            (len(turns), 0 if with_marks else 1, norm_url(item["url"])),
+        )
+    log.info("pdf: attached to Linkwarden link %d", link_id)
     _in_background(attach_preview(settings, link_id, item.get("image_url")))
     return True
 

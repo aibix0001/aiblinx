@@ -351,6 +351,8 @@ def render_reader(
     chat: bool = False,
     archived: bool = False,
     learn: bool = False,
+    highlights: dict | None = None,
+    pdf: dict | None = None,
 ) -> str:
     """The reader page: an article's extracted text, then save / more / less.
 
@@ -366,7 +368,11 @@ def render_reader(
     toggle swaps them. The article always opens in its own language.
     chat: whether the chat about the story sits under the text; with
     ``linkwarden`` a discussion goes to the saved link as a PDF.
-    learn: whether the page reports a read of the text (``LEARN_JS``)."""
+    learn: whether the page reports a read of the text (``LEARN_JS``).
+    highlights: the story's marks by text (``{"orig": [...], "tr": [...]}``)
+    for the highlighter; None = no highlighter (a video).
+    pdf: with ``linkwarden``, the saved link's PDF of ours: ``{"turns": n or
+    None, "stale": bool}``, for "Update PDF"."""
     url = _http(item.get("url")) or "#"
     image = _http(item.get("image_url"))
     figure = (
@@ -380,7 +386,7 @@ def render_reader(
     title = html.escape(_plain(item.get("title")) or item.get("url") or "")
     headline, article, lang_button = (
         f"<h1>{title}</h1>",
-        f'<div class="article">\n{body}\n</div>',
+        f'<div class="article" data-variant="orig">\n{body}\n</div>',
         "",
     )
     if translation:
@@ -391,16 +397,27 @@ def render_reader(
             f'<h1 lang="{dst}" data-lang="{dst}" hidden>{html.escape(translation["title"])}</h1>'
         )
         article = (
-            f'<div class="article" lang="{src}" data-lang="{src}">\n{body}\n</div>\n'
-            f'<div class="article" lang="{dst}" data-lang="{dst}" hidden>\n'
+            f'<div class="article" lang="{src}" data-lang="{src}" data-variant="orig">\n'
+            f"{body}\n</div>\n"
+            f'<div class="article" lang="{dst}" data-lang="{dst}" data-variant="tr" hidden>\n'
             f"{translation['body']}\n</div>"
         )
         lang_button = (
             f'<button class="icon-btn size" onclick="switchLang(this)" '
             f'aria-label="{_READ_IN[dst]}">{dst.upper()}</button>'
         )
+    data, attach = "", ""
+    if highlights is not None:
+        data += json_script("hl-data", highlights)
+    if linkwarden:
+        data += json_script("pdf-data", pdf or {"turns": None, "stale": False})
+        attach = (
+            '<button class="attach" id="attach" hidden onclick="attach(this)">'
+            "Update the PDF in Linkwarden</button>"
+        )
     return (
         _READER.replace("__HEAD__", HEAD_TAGS)
+        .replace("__MARKCSS__", MARK_CSS)
         .replace("__THEME__", THEME_CSS)
         .replace("__CARD__", CARD_CSS)
         .replace("__ACTIONS__", ACTIONS_JS)
@@ -415,11 +432,42 @@ def render_reader(
         .replace("__HEADLINE__", headline)
         .replace("__TITLE__", title)
         .replace("__CHAT__", _chat(linkwarden) if chat else "")
-        .replace("__CHATJS__", CHAT_JS if chat else "")
+        .replace("__CHATJS__", FORMAT_JS + CHAT_JS if chat else "")
         .replace("__LEARNJS__", LEARN_JS if learn else "")
+        .replace("__HLBAR__", _HLBAR if highlights is not None else "")
+        .replace("__LINKSJS__", LINKS_JS)
+        .replace("__HLJS__", MARKS_JS + HIGHLIGHT_JS if highlights is not None else "")
+        .replace("__PDFJS__", PDF_JS if linkwarden else "")
+        .replace("__ATTACH__", attach)
+        .replace("__DATA__", data)  # its JSON holds no "__": never scanned again
         .replace("__BODY__", article)  # last: article text is never scanned for placeholders
     )
 
+
+def json_script(element_id: str, value) -> str:
+    """``value`` as a JSON data block. ``<`` is escaped so the text can't end
+    the script, ``_`` so it can't hold a template placeholder."""
+    text = json.dumps(value, ensure_ascii=False).replace("<", "\\u003c").replace("_", "\\u005f")
+    return f'<script type="application/json" id="{element_id}">{text}</script>\n'
+
+
+_ICON_ERASE = (
+    '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+    'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+    '<path d="M6 6l12 12M18 6L6 18"/></svg>'
+)
+_HLBAR = (
+    '<div class="hlbar" id="hlbar" hidden role="toolbar" aria-label="Highlight">'
+    + "".join(
+        f'<button class="hl-{color}" aria-label="Highlight in {color}" '
+        f"onpointerdown=\"hlPress(event, '{color}')\" onclick=\"hlPress(event, '{color}')\">"
+        "</button>"
+        for color in ("yellow", "green", "red")
+    )
+    + '<button class="erase" aria-label="Remove the highlight" '
+    'onpointerdown="hlPress(event, null)" onclick="hlPress(event, null)">'
+    f"{_ICON_ERASE}</button></div>"
+)
 
 _READ_IN = {"de": "Read in German", "en": "Read in English"}
 
@@ -432,18 +480,13 @@ _ICON_SEND = (
 
 def _chat(linkwarden: bool) -> str:
     """The chat under the article. The conversation stays on the device for
-    30 days; with Linkwarden, Save also attaches it to the link as a PDF."""
+    30 days; with Linkwarden, Save also puts it into the link's PDF."""
     note = (
-        "The conversation stays on this device for 30 days. Save attaches it to the "
-        "Linkwarden link as a PDF, in place of the page PDF."
+        "The conversation stays on this device for 30 days. Save puts it into the "
+        "Linkwarden link as a PDF, after the article and your highlights, in place "
+        "of the page PDF."
         if linkwarden
         else "The conversation stays on this device for 30 days."
-    )
-    attach = (
-        '\n  <button class="attach" id="attach" hidden onclick="attach(this)">'
-        "Attach this discussion to Linkwarden</button>"
-        if linkwarden
-        else ""
     )
     return f"""\
 <section class="chat" id="chat" data-linkwarden="{"1" if linkwarden else ""}">
@@ -455,7 +498,7 @@ def _chat(linkwarden: bool) -> str:
       onkeydown="askKey(event)"></textarea>
     <button type="submit" id="send" aria-label="Send"
       onmousedown="event.preventDefault()">{_ICON_SEND}</button>
-  </form>{attach}
+  </form>
   <p class="chat-note">{note}</p>
 </section>"""
 
@@ -611,76 +654,70 @@ function press(btn, on, label) {
   btn.classList.toggle('on', on); btn.setAttribute('aria-pressed', on);
   if (label) { btn.setAttribute('aria-label', label); btn.title = label; }
 }
-// every copy of a saved story's card shows the save
-function markSaved(id) {
-  document.querySelectorAll(`[data-id="${id}"] .save`).forEach(b => press(b, true, 'Saved'));
+// every copy of the story's card lights the one button of the collection the
+// story is in (curated, broad or archive), or none (null)
+function markFiled(id, section) {
+  document.querySelectorAll(`.card[data-id="${id}"]`).forEach(card => {
+    const own = card.dataset.section;
+    card.querySelectorAll('.save')
+      .forEach(b => press(b, section === own, section === own ? 'Saved' : 'Save'));
+    card.querySelectorAll('.promote').forEach(b => press(b, section === 'curated'));
+    card.querySelectorAll('.explore').forEach(b => press(b, section === 'broad'));
+    card.querySelectorAll('.archive').forEach(b => press(b, section === 'archive',
+      (section === 'archive' ? 'Archived' : 'Archive') + ', no effect on your feed'));
+  });
 }
-// a story filed on one side (promote, explore, archive) leaves the others
-function markFiled(id, cls) {
-  document.querySelectorAll(`[data-id="${id}"] .promote, [data-id="${id}"] .explore`)
-    .forEach(b => press(b, b.classList.contains(cls)));
-  document.querySelectorAll(`[data-id="${id}"] .archive`).forEach(b => press(b, cls === 'archive',
-    (cls === 'archive' ? 'Archived' : 'Archive') + ', no effect on your feed'));
-  markSaved(id);
-}
-// un-saved: Promote, Save to Exploring and Archive filed the save, so they go with it
-function markUnsaved(id) {
-  document.querySelectorAll(`[data-id="${id}"] .save`).forEach(b => press(b, false, 'Save'));
-  document.querySelectorAll(`[data-id="${id}"] .promote, [data-id="${id}"] .explore`)
-    .forEach(b => press(b, false));
-  document.querySelectorAll(`[data-id="${id}"] .archive`)
-    .forEach(b => press(b, false, 'Archive, no effect on your feed'));
+// a tap on any lit button undoes the save: its link leaves Linkwarden
+async function unsave(card) {
+  try {
+    await post(card.dataset.id, 'save', undefined, 'DELETE');
+    markFiled(card.dataset.id, null);
+    if (typeof updateAttach === 'function') updateAttach();
+    toast('Save undone');
+  } catch (e) { toast('Could not undo the save: ' + e.message); }
 }
 async function save(btn) {
   const card = btn.closest('.card');
-  const undo = btn.classList.contains('on');
   btn.disabled = true;
+  if (btn.classList.contains('on')) { await unsave(card); btn.disabled = false; return; }
   try {
-    if (undo) {
-      // a second tap undoes the save: its link leaves Linkwarden
-      await post(card.dataset.id, 'save', undefined, 'DELETE');
-      markUnsaved(card.dataset.id);
-      if (typeof updateAttach === 'function') updateAttach();
-      toast('Save undone');
-      return;
-    }
     // the reader chat's discussion goes along, as a PDF for Linkwarden
     const body = typeof saveBody === 'function' ? saveBody() : undefined;
     // the tab Save was pressed in decides the collection
     const result = await post(card.dataset.id, 'save', {...body, section: card.dataset.section});
-    markSaved(card.dataset.id);
+    markFiled(card.dataset.id, card.dataset.section);
     if (typeof saved === 'function') saved(result);
-  } catch (e) { toast((undo ? 'Could not undo the save: ' : 'Could not save: ') + e.message); }
+  } catch (e) { toast('Could not save: ' + e.message); }
   finally { btn.disabled = false; }
 }
 async function promote(btn) {
-  if (btn.classList.contains('on')) return;
   const card = btn.closest('.card');
   btn.disabled = true;
+  if (btn.classList.contains('on')) { await unsave(card); btn.disabled = false; return; }
   try {
     await post(card.dataset.id, 'promote');
-    markFiled(card.dataset.id, 'promote');
+    markFiled(card.dataset.id, 'curated');
     if (typeof saved === 'function') saved({});
     toast('Now one of your main interests');
   } catch (e) { toast('Could not promote: ' + e.message); }
   finally { btn.disabled = false; }
 }
 async function explore(btn) {
-  if (btn.classList.contains('on')) return;
   const card = btn.closest('.card');
   btn.disabled = true;
+  if (btn.classList.contains('on')) { await unsave(card); btn.disabled = false; return; }
   try {
     await post(card.dataset.id, 'explore');
-    markFiled(card.dataset.id, 'explore');
+    markFiled(card.dataset.id, 'broad');
     if (typeof saved === 'function') saved({});
     toast('Saved to Exploring, less like this here');
   } catch (e) { toast('Could not save to Exploring: ' + e.message); }
   finally { btn.disabled = false; }
 }
 async function archive(btn) {
-  if (btn.classList.contains('on')) return;
   const card = btn.closest('.card');
   btn.disabled = true;
+  if (btn.classList.contains('on')) { await unsave(card); btn.disabled = false; return; }
   try {
     // the reader chat's discussion goes along, as a PDF for Linkwarden
     const body = typeof saveBody === 'function' ? saveBody() : undefined;
@@ -740,39 +777,36 @@ LEARN_JS = r"""
 })();
 """
 
-CHAT_JS = r"""
-const turns = [];
-let attachedTurns = 0;
-const chatId = document.querySelector('.end .card').dataset.id;
-const chatLinkwarden = document.getElementById('chat').dataset.linkwarden === '1';
-const CHAT_KEY = 'chat:' + chatId, CHAT_DAYS = 30, CHAT_KEEP = 50;
-let pending = null;  // {question, job}: the answer the server is writing
-function store() {
-  try {
-    if (turns.length || pending) {
-      localStorage.setItem(CHAT_KEY,
-        JSON.stringify({turns, attachedTurns, pending, at: Date.now()}));
-    } else localStorage.removeItem(CHAT_KEY);
-  } catch (e) {}
+# The model's Markdown as HTML, escaped before its few tags: the reader chat
+# and the printed PDF both show answers with it.
+LINKS_JS = r"""
+// the original link, copied or handed to the share sheet (Reminders and the like)
+async function copyLink(ev) {
+  ev.preventDefault();
+  const url = ev.currentTarget.getAttribute('href');
+  try { await navigator.clipboard.writeText(url); } catch (e) {
+    // plain HTTP has no clipboard API: copy from a hidden field
+    const box = document.createElement('textarea');
+    box.value = url; box.readOnly = true;
+    box.style.position = 'fixed'; box.style.opacity = '0';
+    document.body.append(box); box.select(); box.setSelectionRange(0, url.length);
+    const copied = document.execCommand('copy'); box.remove();
+    if (!copied) { toast('Could not copy the link'); return; }
+  }
+  toast('Link copied');
 }
-// discussions older than CHAT_DAYS go, and all but the newest CHAT_KEEP
-function pruneChats() {
-  try {
-    const chats = [];
-    for (let i = 0; i < localStorage.length; i++) {
-      const key = localStorage.key(i);
-      if (!key.startsWith('chat:')) continue;
-      let at = 0;
-      try { at = JSON.parse(localStorage.getItem(key)).at || 0; } catch (e) {}
-      chats.push([at, key]);
-    }
-    chats.sort((a, b) => b[0] - a[0]);
-    const old = Date.now() - CHAT_DAYS * 864e5;
-    chats.forEach(([at, key], i) => {
-      if (i >= CHAT_KEEP || at < old) localStorage.removeItem(key);
-    });
-  } catch (e) {}
+// a button, not a link: iOS closes the sheet again after a tap on a link
+async function shareLink(ev) {
+  const h1 = document.querySelector('h1:not([hidden])');
+  const url = ev.currentTarget.dataset.url;
+  try { await navigator.share({title: h1 ? h1.textContent : document.title, url}); } catch (e) {
+    if (e.name !== 'AbortError') toast('Could not share the link');
+  }
 }
+if (navigator.share) document.getElementById('share').hidden = false;
+"""
+
+FORMAT_JS = r"""
 function esc(s) {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
@@ -795,6 +829,266 @@ function fmt(text) {
     }
     return '<p>' + lines.map(l => inline(l.replace(/^#{1,6}\s+/, ''))).join('<br>') + '</p>';
   }).join('');
+}
+"""
+
+# Marker colours: see-through, so they read on the light and the dark theme
+# and print like a highlighter pen on paper.
+MARK_CSS = """\
+mark.hl {
+  color: inherit; border-radius: 3px; padding: 0.05em 0;
+  -webkit-box-decoration-break: clone; box-decoration-break: clone;
+  print-color-adjust: exact; -webkit-print-color-adjust: exact;
+}
+.hl-yellow { background: rgba(250, 204, 21, 0.45); }
+.hl-green { background: rgba(74, 222, 128, 0.42); }
+.hl-red { background: rgba(248, 113, 113, 0.45); }
+"""
+
+# Highlighter marks, shared by the reader and the printed PDF. A mark is
+# {color, start, end, quote, prefix, suffix}; offsets count characters of the
+# article's text without its figures (a picture that fails to load takes its
+# caption along). A mark whose offsets no longer hold the quote is searched
+# by its context, then by the quote alone if that is unique, else it is not
+# drawn.
+MARKS_JS = r"""
+const HL_CONTEXT = 32;
+function hlNodes(root) {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
+    acceptNode: n => n.nodeName === 'FIGURE' ? NodeFilter.FILTER_REJECT
+      : n.nodeType === Node.TEXT_NODE ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP});
+  const nodes = [];
+  for (let n; (n = walker.nextNode());) nodes.push(n);
+  return nodes;
+}
+function hlText(root) { return hlNodes(root).map(n => n.data).join(''); }
+// the text offset of a selection boundary (node, offset)
+function hlOffset(root, node, offset) {
+  const at = document.createRange();
+  at.setStart(node, offset);
+  let pos = 0;
+  for (const n of hlNodes(root)) {
+    if (n === node) return pos + offset;
+    if (at.comparePoint(n, 0) >= 0) return pos;
+    pos += n.data.length;
+  }
+  return pos;
+}
+function hlLocate(text, m) {
+  if (text.slice(m.start, m.end) === m.quote) return [m.start, m.end];
+  let at = text.indexOf(m.prefix + m.quote + m.suffix);
+  if (at >= 0) { at += m.prefix.length; return [at, at + m.quote.length]; }
+  at = text.indexOf(m.quote);
+  return at >= 0 && text.indexOf(m.quote, at + 1) < 0 ? [at, at + m.quote.length] : null;
+}
+function hlMake(text, color, start, end) {
+  return {color, start, end, quote: text.slice(start, end),
+    prefix: text.slice(Math.max(0, start - HL_CONTEXT), start),
+    suffix: text.slice(end, end + HL_CONTEXT)};
+}
+// the marks with [start, end) cut out of them, plus a new mark there in color
+function hlCut(text, marks, start, end, color) {
+  const out = [];
+  for (const m of marks) {
+    if (m.end <= start || m.start >= end) { out.push(m); continue; }
+    if (m.start < start) out.push(hlMake(text, m.color, m.start, start));
+    if (m.end > end) out.push(hlMake(text, m.color, end, m.end));
+  }
+  if (color) out.push(hlMake(text, color, start, end));
+  return out.sort((a, b) => a.start - b.start);
+}
+// the marks found in the text, and those that are not (kept, not drawn)
+function hlFind(text, marks) {
+  const found = [], lost = [];
+  for (const m of marks) {
+    const at = hlLocate(text, m);
+    if (at && !found.some(f => f.start < at[1] && at[0] < f.end)) {
+      found.push(hlMake(text, m.color, at[0], at[1]));
+    } else lost.push(m);
+  }
+  return [found.sort((a, b) => a.start - b.start), lost];
+}
+function hlDraw(root, marks) {
+  root.querySelectorAll('mark.hl').forEach(el => el.replaceWith(...el.childNodes));
+  root.normalize();
+  marks.forEach((m, i) => {
+    const hits = [];
+    let pos = 0;
+    for (const n of hlNodes(root)) {
+      const a = pos;
+      pos += n.data.length;
+      if (pos > m.start && a < m.end) {
+        hits.push([n, Math.max(m.start - a, 0), Math.min(m.end, pos) - a]);
+      }
+    }
+    for (const [n, s, e] of hits) {
+      if (!n.data.slice(s, e).trim()) continue;  // the space between two blocks
+      let node = n;
+      if (s > 0) node = node.splitText(s);
+      if (e - s < node.data.length) node.splitText(e - s);
+      const mark = document.createElement('mark');
+      mark.className = 'hl hl-' + m.color; mark.dataset.i = i;
+      node.replaceWith(mark); mark.append(node);
+    }
+  });
+}
+"""
+
+# The highlighter in the reader: select text, pick a colour (or the eraser)
+# in the bar under the selection; a tap on a mark selects that mark. The
+# marks of each text go to the server as a whole after every change.
+HIGHLIGHT_JS = r"""
+const hlStory = document.querySelector('.end .card').dataset.id;
+const hlTexts = {};  // variant: {root, marks, lost}
+{
+  const kept = JSON.parse(document.getElementById('hl-data').textContent);
+  document.querySelectorAll('.article[data-variant]').forEach(root => {
+    const [marks, lost] = hlFind(hlText(root), kept[root.dataset.variant] || []);
+    hlTexts[root.dataset.variant] = {root, marks, lost};
+    hlDraw(root, marks);
+  });
+}
+const hlBar = document.getElementById('hlbar');
+let hlSel = null;  // {v, start, end}: what the bar acts on
+function hlShow(rect) {
+  hlBar.hidden = false;
+  const w = hlBar.offsetWidth, h = hlBar.offsetHeight;
+  // under the selection: the phone's own menu sits above it
+  let top = rect.bottom + 10;
+  if (top + h > innerHeight - 8) top = Math.max(8, rect.top - h - 10);
+  hlBar.style.top = top + 'px';
+  const left = Math.max(8, rect.left + rect.width / 2 - w / 2);
+  hlBar.style.left = Math.min(left, innerWidth - w - 8) + 'px';
+}
+function hlHide() { hlBar.hidden = true; hlSel = null; }
+document.addEventListener('selectionchange', () => {
+  const sel = getSelection();
+  if (!sel.rangeCount || sel.isCollapsed) { if (hlSel && !hlSel.tap) hlHide(); return; }
+  const range = sel.getRangeAt(0);
+  const t = Object.entries(hlTexts).find(([, t]) => !t.root.hidden
+    && t.root.contains(range.startContainer) && t.root.contains(range.endContainer));
+  if (!t) { hlHide(); return; }
+  const [v, {root}] = t, text = hlText(root);
+  let start = hlOffset(root, range.startContainer, range.startOffset);
+  let end = hlOffset(root, range.endContainer, range.endOffset);
+  while (start < end && /\s/.test(text[start])) start++;
+  while (end > start && /\s/.test(text[end - 1])) end--;
+  if (start === end) { hlHide(); return; }
+  hlSel = {v, start, end};
+  hlShow(range.getBoundingClientRect());
+});
+document.addEventListener('click', ev => {
+  const mark = ev.target.closest && ev.target.closest('mark.hl');
+  if (!mark || !getSelection().isCollapsed) return;
+  const v = mark.closest('.article').dataset.variant, m = hlTexts[v].marks[+mark.dataset.i];
+  hlSel = {v, start: m.start, end: m.end, tap: true};
+  hlShow(mark.getBoundingClientRect());
+});
+document.addEventListener('pointerdown', ev => {
+  if (hlSel && hlSel.tap && !hlBar.contains(ev.target)) hlHide();
+});
+// the bar follows a selection; a tapped mark's bar goes
+addEventListener('scroll', () => {
+  if (hlBar.hidden) return;
+  const sel = getSelection();
+  if (hlSel && !hlSel.tap && sel.rangeCount && !sel.isCollapsed) {
+    hlShow(sel.getRangeAt(0).getBoundingClientRect());
+  } else hlHide();
+}, {passive: true});
+// pointerdown, before the tap can take the selection away; click for keys
+function hlPress(ev, color) {
+  if (ev.type === 'click' && ev.detail !== 0) return;
+  ev.preventDefault();
+  if (!hlSel) return;
+  const {v, start, end} = hlSel, t = hlTexts[v];
+  t.marks = hlCut(hlText(t.root), t.marks, start, end, color);
+  hlDraw(t.root, t.marks);
+  getSelection().removeAllRanges();
+  hlHide();
+  hlStore(v);
+}
+async function hlStore(v) {
+  const t = hlTexts[v];
+  try {
+    const resp = await fetch(`/read/${hlStory}/highlights`, {
+      method: 'PUT', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({variant: v, marks: [...t.marks, ...t.lost]})});
+    if (!resp.ok) throw new Error(resp.status);
+    if (typeof pdfChanged === 'function') pdfChanged();
+  } catch (e) { toast('Could not keep the highlight: ' + e.message); }
+}
+"""
+
+# With Linkwarden: Save sends the discussion and the text on screen along,
+# and the server prints the PDF of the reader view with its highlights.
+# "Update PDF" offers a new print of a saved story whose highlights changed
+# or whose discussion grew since its PDF.
+PDF_JS = r"""
+const pdfState = JSON.parse(document.getElementById('pdf-data').textContent);
+const pdfStory = document.querySelector('.end .card').dataset.id;
+function chatTurns() { return typeof turns === 'undefined' ? [] : turns; }
+function shownVariant() {
+  const shown = document.querySelector('.article[data-variant]:not([hidden])');
+  return shown ? shown.dataset.variant : 'orig';
+}
+function isSaved() { return document.querySelector('.end .save').classList.contains('on'); }
+function updateAttach() {
+  const btn = document.getElementById('attach');
+  btn.hidden = !(isSaved() && (pdfState.stale || chatTurns().length > (pdfState.turns || 0)));
+}
+function pdfChanged() { pdfState.stale = true; updateAttach(); }
+function saveBody() { return {discussion: chatTurns(), variant: shownVariant()}; }
+function pdfAttached() { pdfState.turns = chatTurns().length; pdfState.stale = false; }
+function saved(result) {
+  if (result.attached === true) { pdfAttached(); toast('Saved, with a PDF in Linkwarden'); }
+  else if (result.attached === false) toast('Saved, but the PDF could not be attached');
+  updateAttach();
+}
+async function attach(btn) {
+  // the discussion lives on the device that had it: don't drop it unasked
+  if (chatTurns().length < (pdfState.turns || 0) && !confirm(
+    'The PDF in Linkwarden holds a discussion that is not on this device. '
+    + 'Update it without that discussion?')) return;
+  btn.disabled = true;
+  try {
+    const result = await post(pdfStory, 'save', saveBody());
+    if (result.attached) { pdfAttached(); toast('PDF updated in Linkwarden'); }
+    else toast('Could not update the PDF');
+  } catch (e) { toast('Could not update the PDF: ' + e.message); }
+  finally { btn.disabled = false; updateAttach(); }
+}
+"""
+
+CHAT_JS = r"""
+const turns = [];
+const chatId = document.querySelector('.end .card').dataset.id;
+const CHAT_KEY = 'chat:' + chatId, CHAT_DAYS = 30, CHAT_KEEP = 50;
+let pending = null;  // {question, job}: the answer the server is writing
+function store() {
+  try {
+    if (turns.length || pending) {
+      localStorage.setItem(CHAT_KEY,
+        JSON.stringify({turns, pending, at: Date.now()}));
+    } else localStorage.removeItem(CHAT_KEY);
+  } catch (e) {}
+}
+// discussions older than CHAT_DAYS go, and all but the newest CHAT_KEEP
+function pruneChats() {
+  try {
+    const chats = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (!key.startsWith('chat:')) continue;
+      let at = 0;
+      try { at = JSON.parse(localStorage.getItem(key)).at || 0; } catch (e) {}
+      chats.push([at, key]);
+    }
+    chats.sort((a, b) => b[0] - a[0]);
+    const old = Date.now() - CHAT_DAYS * 864e5;
+    chats.forEach(([at, key], i) => {
+      if (i >= CHAT_KEEP || at < old) localStorage.removeItem(key);
+    });
+  } catch (e) {}
 }
 function addTurn(cls) {
   const el = document.createElement('div');
@@ -821,31 +1115,6 @@ function showSearch(el, search) {
 function chatLang() {
   const shown = document.querySelector('.article[data-lang]:not([hidden])');
   return shown ? shown.dataset.lang : null;
-}
-function isSaved() { return document.querySelector('.end .save').classList.contains('on'); }
-function updateAttach() {
-  const btn = document.getElementById('attach');
-  if (btn) btn.hidden = !(isSaved() && turns.length > attachedTurns);
-}
-// Save sends the discussion along; after it, only a changed one is offered again
-function saveBody() { return chatLinkwarden && turns.length ? {discussion: turns} : undefined; }
-function saved(result) {
-  if (result.attached === true) {
-    attachedTurns = turns.length; store(); toast('Saved, with the discussion as PDF');
-  } else if (result.attached === false) {
-    toast('Saved, but the discussion could not be attached');
-  }
-  updateAttach();
-}
-async function attach(btn) {
-  btn.disabled = true;
-  try {
-    const result = await post(chatId, 'save', {discussion: turns});
-    if (result.attached) {
-      attachedTurns = turns.length; store(); toast('Discussion attached to Linkwarden');
-    } else toast('Could not attach the discussion');
-  } catch (e) { toast('Could not attach: ' + e.message); }
-  finally { btn.disabled = false; updateAttach(); }
 }
 function askKey(ev) {
   // Enter sends on a keyboard; on a phone it is a new line
@@ -917,7 +1186,7 @@ async function answer(request, retry = true) {
   if (done && !failed && reply.content.trim()) {
     turns.push({role: 'user', content: question}, reply);
     pending = null;
-    updateAttach();
+    if (typeof updateAttach === 'function') updateAttach();
   } else {
     text.innerHTML = '<p class="failed">No answer came back. Ask again?</p>';
     if (!box.value) box.value = question;
@@ -932,7 +1201,6 @@ function restoreChat() {
   let kept = null;
   try { kept = JSON.parse(localStorage.getItem(CHAT_KEY)); } catch (e) {}
   if (!kept) return;
-  attachedTurns = kept.attachedTurns || 0;
   for (const turn of kept.turns || []) {
     turns.push(turn);
     const el = addTurn(turn.role === 'user' ? 'user' : 'bot');
@@ -941,7 +1209,7 @@ function restoreChat() {
     text.className = 'text'; text.innerHTML = fmt(turn.content); el.append(text);
     for (const search of turn.searches || []) showSearch(el, search);
   }
-  updateAttach();
+  if (typeof updateAttach === 'function') updateAttach();
   pending = kept.pending || null;
   if (pending && pending.job) {
     addTurn('user').textContent = pending.question;
@@ -1314,17 +1582,32 @@ main > .meta .chip { background: var(--card); }  /* on the page, not a card */
   /* iOS zooms into a field with text under 16 px */
   font: inherit; font-size: max(16px, var(--reader-size, 19px)); line-height: 1.4;
 }
-.ask button, .chat .attach {
+.ask button, .attach {
   height: 48px; border: 0; border-radius: 16px; background: var(--btn); color: var(--btn-ink);
   cursor: pointer; font: inherit; font-size: 15px;
 }
 .ask button { width: 56px; flex-shrink: 0; display: grid; place-items: center; }
-.ask button:disabled, .chat .attach:disabled { opacity: 0.6; }
-.chat .attach { background: var(--save-on); color: var(--save-on-ink); padding: 0 16px; }
+.ask button:disabled, .attach:disabled { opacity: 0.6; }
+.attach { background: var(--save-on); color: var(--save-on-ink); padding: 0 16px; }
+__MARKCSS__.hlbar {
+  position: fixed; z-index: 5; display: flex; gap: 8px; padding: 8px; border-radius: 999px;
+  background: var(--card); box-shadow: 0 6px 24px rgba(0, 0, 0, 0.22);
+}
+.hlbar[hidden] { display: none; }
+.hlbar button {
+  width: 36px; height: 36px; border-radius: 999px; border: 2px solid var(--line);
+  cursor: pointer; display: grid; place-items: center; color: var(--ink);
+}
+.hlbar .erase { background: var(--bg); }
 .chat-note { margin: 0; font-size: 13px; color: var(--muted); }
 .end { margin-top: 28px; display: flex; flex-direction: column; gap: 14px; }
 .end .card .actions { padding: 12px; }
 .original { color: var(--muted); font-size: 15px; margin: 0 6px; }
+.links { display: flex; flex-wrap: wrap; gap: 10px 18px; }
+button.original {
+  background: none; border: 0; padding: 0; font: inherit; font-size: 15px;
+  text-decoration: underline; cursor: pointer;
+}
 </style>
 </head>
 <body>
@@ -1350,16 +1633,27 @@ __FIGURE__
 __BODY__
 __CHAT__
 <div class="end">
+  __ATTACH__
   <article class="card" data-id="__ID__" data-section="__SECTION__">
     <div class="gone">Less like this, noted.</div>
     <div class="body">__ACTIONBAR__</div>
   </article>
-  <a class="original" href="__URL__" rel="noreferrer">Open the original page ↗</a>
+  <div class="links">
+    <a class="original" href="__URL__" rel="noreferrer">Open the original page ↗</a>
+    <a class="original" href="__URL__" onclick="copyLink(event)">Copy the link</a>
+    <button type="button" class="original" data-url="__URL__" id="share" \
+onclick="shareLink(event)" hidden>Share…</button>
+  </div>
 </div>
 </main>
 <div id="toast" role="status" aria-live="polite"></div>
+__HLBAR__
+__DATA__
 <script>
 __ACTIONS__sizeButtons();
+__LINKSJS__
+__HLJS__
+__PDFJS__
 __CHATJS__
 __LEARNJS__
 </script>

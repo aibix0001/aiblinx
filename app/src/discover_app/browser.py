@@ -31,6 +31,7 @@ from functools import cache
 from pathlib import Path
 
 from playwright.async_api import (
+    Browser,
     BrowserContext,
     Frame,
     Page,
@@ -44,7 +45,7 @@ from .config import Settings
 
 log = logging.getLogger(__name__)
 
-__all__ = ["PlaywrightError", "Tab", "open_tab"]
+__all__ = ["PlaywrightError", "Tab", "open_tab", "print_pdf"]
 
 # How long to wait for autoconsent to find a banner, then to finish with it
 _DETECT_S = 4.0
@@ -258,10 +259,9 @@ def _user_agent(version: str) -> str:
 
 
 @asynccontextmanager
-async def open_tab(settings: Settings, url: str) -> AsyncIterator[Tab]:
-    """``url`` loaded in a browser of its own, its consent banner accepted
-    when autoconsent knows how. Raises ``PlaywrightError`` when the browser
-    or the page can't be reached."""
+async def _browser(settings: Settings) -> AsyncIterator[Browser]:
+    """A browser of its own on the Playwright server, one of
+    ``BROWSER_CONCURRENCY`` at a time."""
     global _playwright, _slots
     if _slots is None:
         _slots = asyncio.Semaphore(settings.browser_concurrency)
@@ -273,12 +273,54 @@ async def open_tab(settings: Settings, url: str) -> AsyncIterator[Tab]:
             settings.browser_ws_url, timeout=settings.browser_timeout_s * 1000, headers=_LAUNCH
         )
         try:
-            context = await browser.new_context(user_agent=_user_agent(browser.version))
-            await context.route("**/*", _skip_heavy)
-            tab = Tab(context, await context.new_page(), settings.browser_timeout_s)
-            await tab._autoconsent(settings.autoconsent_dir)
-            await tab._load(url)
-            yield tab
+            yield browser
         finally:
             # disconnecting makes the server kill that browser, busy or not
             await browser.close()
+
+
+@asynccontextmanager
+async def open_tab(settings: Settings, url: str) -> AsyncIterator[Tab]:
+    """``url`` loaded in a browser of its own, its consent banner accepted
+    when autoconsent knows how. Raises ``PlaywrightError`` when the browser
+    or the page can't be reached."""
+    async with _browser(settings) as browser:
+        context = await browser.new_context(user_agent=_user_agent(browser.version))
+        await context.route("**/*", _skip_heavy)
+        tab = Tab(context, await context.new_page(), settings.browser_timeout_s)
+        await tab._autoconsent(settings.autoconsent_dir)
+        await tab._load(url)
+        yield tab
+
+
+async def _images_only(route: Route) -> None:
+    """The print page is set as content: what it may still load is its
+    pictures, from the publisher. Nothing else leaves the browser."""
+    try:
+        if route.request.resource_type == "image":
+            await route.continue_()
+        else:
+            await route.abort()
+    except PlaywrightError:
+        pass  # the page or browser closed meanwhile
+
+
+async def print_pdf(settings: Settings, page_html: str) -> bytes:
+    """``page_html`` printed to an A4 PDF, with its background colours (the
+    highlights). Pictures that have not loaded within the time limit are
+    left out. Raises ``PlaywrightError`` when the browser can't be reached."""
+    timeout_ms = settings.browser_timeout_s * 1000
+    async with _browser(settings) as browser:
+        context = await browser.new_context(user_agent=_user_agent(browser.version))
+        await context.route("**/*", _images_only)
+        page = await context.new_page()
+        await page.set_content(page_html, wait_until="domcontentloaded", timeout=timeout_ms)
+        try:
+            await page.wait_for_load_state("load", timeout=timeout_ms)
+        except PlaywrightError:
+            pass  # a slow picture: print without it
+        return await page.pdf(
+            format="A4",
+            print_background=True,
+            margin={"top": "18mm", "bottom": "18mm", "left": "16mm", "right": "16mm"},
+        )

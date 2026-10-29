@@ -1668,6 +1668,10 @@ def test_ui_cards_image_summary_and_restored_state(tmp_path, monkeypatch):
             "INSERT INTO feedback(candidate_id, url, axis, value) "
             "VALUES(1, 'ex.com/a', 'saved', 'true')"
         )
+        conn.execute(
+            "INSERT INTO saves(url, url_key, title, section) "
+            "VALUES('https://ex.com/a', 'ex.com/a', 'Saved and upvoted', 'curated')"
+        )
     record_feedback(settings, 1, "interest", "down")
     record_feedback(settings, 1, "interest", "up")  # latest vote wins
     record_feedback(settings, 2, "interest", "down")
@@ -3768,6 +3772,37 @@ def test_detect_saved_skips_links_filed_in_the_archive(tmp_path):
         )
 
 
+def test_save_moves_an_archived_story_and_lights_alone(tmp_path, monkeypatch):
+    """Save on a story filed elsewhere moves it into Save's collection."""
+    from fastapi.testclient import TestClient
+
+    from discover_app import app as app_mod
+
+    settings = _settings(tmp_path).model_copy(update={"linkwarden_token": ""})
+    init_db(settings)
+    with connection(settings) as conn:
+        _add_candidate(conn, 1, "https://ex.com/a", "a", [1.0, 0, 0, 0])
+        conn.execute(
+            "INSERT INTO feed_items(rank, section, candidate_id, score, reason, cycle_ts) "
+            "VALUES(0, 'curated', 1, 0.9, '', 't1')"
+        )
+        conn.execute("INSERT INTO meta(key, value) VALUES('last_cycle_ts', 't1')")
+    monkeypatch.setattr("discover_app.db.get_settings", lambda: settings)
+    monkeypatch.setattr(app_mod, "get_settings", lambda: settings)
+    client = TestClient(app_mod.create_app())
+    client.post("/feed/1/archive")
+    assert client.post("/feed/1/save", json={"section": "curated"}).json()["status"] == "saved"
+    with connection(settings) as conn:
+        assert [r[0] for r in conn.execute("SELECT section FROM saves")] == ["curated"]
+    card = client.get("/ui").text
+    card = card[card.index('id="c1"') : card.index("</article>", card.index('id="c1"'))]
+    assert 'class="save on"' in card and 'class="vote archive on"' not in card
+    # a second Save is idempotent
+    assert client.post("/feed/1/save", json={"section": "curated"}).json()["status"] == (
+        "already_saved"
+    )
+
+
 def test_archive_button_on_every_card_and_in_the_reader(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
 
@@ -3799,11 +3834,12 @@ def test_archive_button_on_every_card_and_in_the_reader(tmp_path, monkeypatch):
     assert 'data-panel="held"' not in page and "Bookmarks" not in page
     card1 = page[page.index('id="c1"') : page.index("</article>", page.index('id="c1"'))]
     card2 = page[page.index('id="c2"') : page.index("</article>", page.index('id="c2"'))]
-    assert 'class="vote archive on"' in card1 and 'class="save on"' in card1
+    # only the collection the story is in lights: Archive, not Save
+    assert 'class="vote archive on"' in card1 and 'class="save on"' not in card1
     assert 'class="vote archive"' in card2 and "hold(this)" not in page
     assert "Archived, no effect on your feed" in card1
     reader = client.get("/read/1").text
-    assert 'class="vote archive on"' in reader
+    assert 'class="vote archive on"' in reader and 'class="save on"' not in reader
     assert 'class="vote archive"' in render_reader(
         {"id": 2, "url": "https://ex.com/b", "title": "b"},
         "<p>text</p>",
@@ -4126,8 +4162,14 @@ def test_reader_serves_the_prepared_article_with_a_language_toggle(tmp_path, mon
     page = client.get("/read/1").text
     assert '<h1 lang="en" data-lang="en">An article</h1>' in page
     assert '<h1 lang="de" data-lang="de" hidden>Ein Artikel</h1>' in page
-    assert '<div class="article" lang="en" data-lang="en">\n<p>English text.</p>' in page
-    assert '<div class="article" lang="de" data-lang="de" hidden>\n<p>Deutscher Text.</p>' in page
+    assert (
+        '<div class="article" lang="en" data-lang="en" data-variant="orig">\n<p>English text.</p>'
+        in page
+    )
+    assert (
+        '<div class="article" lang="de" data-lang="de" data-variant="tr" hidden>\n'
+        "<p>Deutscher Text.</p>" in page
+    )
     assert 'onclick="switchLang(this)" aria-label="Read in German">DE</button>' in page
     assert (
         "localStorage" not in page.split("function switchLang", 1)[1].split("function back", 1)[0]
@@ -4472,6 +4514,39 @@ def test_reader_page_has_the_chat(tmp_path, monkeypatch):
     assert "__CHAT" not in page
 
 
+def test_reader_page_defines_every_function_it_calls(tmp_path, monkeypatch):
+    """A function moved between script blocks stays on the page that calls it."""
+    from discover_app import ui
+
+    blocks = (ui.ACTIONS_JS, ui.LINKS_JS, ui.LEARN_JS, ui.FORMAT_JS, ui.MARKS_JS)
+    ours = {
+        name
+        for block in (*blocks, ui.HIGHLIGHT_JS, ui.PDF_JS, ui.CHAT_JS)
+        for name in re.findall(r"^(?:async )?function (\w+)\(", block, re.M)
+    }
+    _, client = _chat_app(tmp_path, monkeypatch, _ChatLLM([]))
+    page = client.get("/read/1").text
+    assert "function fmt(" in page
+    defined = set(re.findall(r"^(?:async )?function (\w+)\(", page, re.M))
+    # updateAttach is called behind a typeof guard, for pages without Linkwarden
+    called = {n for n in ours if re.search(rf"(?<![\w.]){n}\(", page)} - {"updateAttach"}
+    assert called <= defined, called - defined
+
+
+def test_reader_page_copies_and_shares_the_original_link():
+    from discover_app.ui import render_reader
+
+    item = {"id": 1, "url": "https://ex.com/a?b=1&c=2", "title": "T"}
+    page = render_reader(item, "<p>x</p>", False, None, False)
+    href = 'href="https://ex.com/a?b=1&amp;c=2"'
+    assert f'<a class="original" {href} onclick="copyLink(event)">Copy the link</a>' in page
+    # the share sheet only where the browser has one
+    share = 'data-url="https://ex.com/a?b=1&amp;c=2" id="share" onclick="shareLink(event)" hidden>'
+    assert f'<button type="button" class="original" {share}Share…</button>' in page
+    assert "function copyLink(" in page and "function shareLink(" in page
+    assert "__LINKSJS__" not in page
+
+
 def test_reader_page_without_chat_or_linkwarden(tmp_path, monkeypatch):
     from discover_app.ui import render_reader
 
@@ -4526,7 +4601,7 @@ def test_save_attaches_the_discussion_as_pdf(tmp_path, monkeypatch):
     assert resp.status_code == 200
     assert resp.json() == {"status": "saved", "linkwarden_id": 4711, "attached": True}
     link_id, pdf, filename = fake.uploads[0]
-    assert link_id == 4711 and filename == "aiblinx-discussion.pdf"
+    assert link_id == 4711 and filename == "aiblinx.pdf"
     assert pdf.startswith(b"%PDF")
     # the PDF upload drops the link's preview: a new one follows
     assert previews == [(4711, None)]
@@ -4570,19 +4645,262 @@ def test_discussion_pdf_without_dejavu_falls_back(monkeypatch, tmp_path):
     assert with_font.startswith(b"%PDF") and without.startswith(b"%PDF")
 
 
+_MARK = {
+    "color": "yellow",
+    "start": 4,
+    "end": 12,
+    "quote": "deutsche",
+    "prefix": "Der ",
+    "suffix": "",
+}
+
+
+def _printer(monkeypatch, sizes=None, fail=False):
+    """Record the pages sent to the browser; answer with PDFs of ``sizes``."""
+    from discover_app import print_pdf as print_mod
+    from discover_app.browser import PlaywrightError
+
+    pages: list[str] = []
+    sizes = list(sizes or [100])
+
+    async def fake_print(settings, page_html):
+        pages.append(page_html)
+        if fail:
+            raise PlaywrightError("browser gone")
+        return b"%PDF" + b"x" * (sizes.pop(0) if len(sizes) > 1 else sizes[0])
+
+    monkeypatch.setattr(print_mod, "print_pdf", fake_print)
+    return pages
+
+
+def _pdf_app(tmp_path, monkeypatch, **overrides):
+    from discover_app import chat as chat_mod
+    from discover_app.pipeline import feedback as feedback_mod
+
+    fake = _AttachLinkwarden()
+    monkeypatch.setattr(feedback_mod, "LinkwardenClient", lambda s: fake)
+    monkeypatch.setattr(chat_mod, "LinkwardenClient", lambda s: fake)
+
+    async def no_preview(settings, link_id, image_url):
+        pass
+
+    monkeypatch.setattr(chat_mod, "attach_preview", no_preview)
+    overrides.setdefault("browser_ws_url", "ws://browser.test/")
+    settings, client = _chat_app(tmp_path, monkeypatch, _ChatLLM([]), **overrides)
+    return settings, client, fake
+
+
+def test_highlights_are_kept_per_text(tmp_path, monkeypatch):
+    import json
+
+    settings, client, _ = _pdf_app(tmp_path, monkeypatch)
+    resp = client.put("/read/1/highlights", json={"variant": "orig", "marks": [_MARK]})
+    assert resp.status_code == 204
+    other = {**_MARK, "color": "red", "quote": "English", "prefix": "The ", "suffix": " text."}
+    client.put("/read/1/highlights", json={"variant": "tr", "marks": [other]})
+    page = client.get("/read/1").text
+    data = page.split('<script type="application/json" id="hl-data">')[1].split("</script>")[0]
+    assert json.loads(data) == {"orig": [_MARK], "tr": [other]}
+    assert 'id="hlbar"' in page and "function hlPress(" in page
+    # the whole set of one text is replaced, the other text keeps its marks
+    client.put("/read/1/highlights", json={"variant": "orig", "marks": []})
+    from discover_app.highlights import load_marks
+
+    assert load_marks(settings, 1) == {"orig": [], "tr": [other]}
+    bad = {**_MARK, "end": 4}
+    assert client.put("/read/1/highlights", json={"marks": [bad]}).status_code == 422
+    assert (
+        client.put("/read/1/highlights", json={"marks": [{**_MARK, "color": "blue"}]}).status_code
+        == 422
+    )
+    assert client.put("/read/99/highlights", json={"marks": []}).status_code == 404
+
+
+def test_highlight_data_cannot_end_the_script_or_hold_a_placeholder(tmp_path, monkeypatch):
+    _, client, _ = _pdf_app(tmp_path, monkeypatch)
+    quote = "</script><script>alert(1)</script> __BODY__"
+    client.put("/read/1/highlights", json={"marks": [{**_MARK, "quote": quote}]})
+    page = client.get("/read/1").text
+    assert "<script>alert(1)" not in page and "__BODY__" not in page.split('id="hl-data"')[1]
+
+
+def test_save_prints_the_reader_view_with_its_highlights(tmp_path, monkeypatch):
+    settings, client, fake = _pdf_app(tmp_path, monkeypatch)
+    pages = _printer(monkeypatch)
+    client.put("/read/1/highlights", json={"variant": "orig", "marks": [_MARK]})
+    resp = client.post("/feed/1/save", json={"variant": "orig"})
+    assert resp.json()["attached"] is True
+    page = pages[0]
+    assert "<p>Der deutsche Text.</p>" in page and "&quot;deutsche&quot;" not in page
+    assert '"quote": "deutsche"' in page and "function hlDraw(" in page
+    assert "The card summary of the story." in page and "You read about this." in page
+    assert 'class="discussion"' not in page  # no discussion: no discussion part
+    assert fake.uploads[0][1].startswith(b"%PDF")
+    with connection(settings) as conn:
+        row = conn.execute("SELECT pdf_turns, pdf_stale FROM saves").fetchone()
+    assert (row["pdf_turns"], row["pdf_stale"]) == (0, 0)
+    # the marks erased on the saved story: the PDF is stale, the reader offers an update
+    client.put("/read/1/highlights", json={"variant": "orig", "marks": []})
+    page = client.get("/read/1").text
+    assert '{"turns": 0, "stale": true}' in page and 'id="attach"' in page
+    # and the update prints again, without them, though nothing is left to add
+    assert client.post("/feed/1/save", json={"variant": "orig"}).json()["attached"] is True
+    assert '"quote"' not in pages[1] and len(fake.uploads) == 2
+
+
+def test_save_prints_the_translation_on_screen_with_the_discussion(tmp_path, monkeypatch):
+    _, client, _ = _pdf_app(tmp_path, monkeypatch)
+    pages = _printer(monkeypatch)
+    resp = client.post("/feed/1/save", json={"discussion": _DISCUSSION, "variant": "tr"})
+    assert resp.json()["attached"] is True
+    assert "<p>The English text.</p>" in pages[0] and "Der deutsche Text" not in pages[0]
+    assert 'class="discussion"' in pages[0] and "Was heißt das für" in pages[0]
+
+
+def test_a_card_save_prints_the_text_that_has_marks(tmp_path, monkeypatch):
+    _, client, _ = _pdf_app(tmp_path, monkeypatch)
+    pages = _printer(monkeypatch)
+    mark = {**_MARK, "start": 4, "end": 11, "quote": "English", "prefix": "The "}
+    client.put("/read/1/highlights", json={"variant": "tr", "marks": [mark]})
+    assert client.post("/feed/1/save").json()["attached"] is True
+    assert "<p>The English text.</p>" in pages[0]
+
+
+def test_a_too_big_pdf_is_printed_again_without_pictures(tmp_path, monkeypatch):
+    settings, client, fake = _pdf_app(tmp_path, monkeypatch, pdf_max_mb=0.001)
+    pages = _printer(monkeypatch, sizes=[5000, 100])
+    assert client.post("/feed/1/save", json={"discussion": _DISCUSSION}).json()["attached"]
+    assert len(pages) == 2 and "img, figure { display: none" in pages[1]
+    assert "display: none !important" not in pages[0]
+    assert len(fake.uploads) == 1
+
+
+def test_a_pdf_too_big_without_pictures_is_not_attached(tmp_path, monkeypatch):
+    _, client, fake = _pdf_app(tmp_path, monkeypatch, pdf_max_mb=0.001)
+    _printer(monkeypatch, sizes=[5000])
+    resp = client.post("/feed/1/save", json={"discussion": _DISCUSSION})
+    assert resp.json()["status"] == "saved" and resp.json()["attached"] is False
+    assert fake.uploads == []
+
+
+def test_without_the_browser_only_a_discussion_goes(tmp_path, monkeypatch):
+    settings, client, fake = _pdf_app(tmp_path, monkeypatch, browser_ws_url="")
+    client.put("/read/1/highlights", json={"marks": [_MARK]})
+    # marks alone: nothing can print them
+    assert client.post("/feed/1/save").json()["attached"] is False
+    assert fake.uploads == []
+    # with a discussion: the text PDF, and the marks still wait for a print
+    assert client.post("/feed/1/save", json={"discussion": _DISCUSSION}).json()["attached"]
+    with connection(settings) as conn:
+        row = conn.execute("SELECT pdf_turns, pdf_stale FROM saves").fetchone()
+    assert (row["pdf_turns"], row["pdf_stale"]) == (2, 1)
+
+
+def test_a_failing_browser_falls_back_to_the_discussion_pdf(tmp_path, monkeypatch):
+    _, client, fake = _pdf_app(tmp_path, monkeypatch)
+    _printer(monkeypatch, fail=True)
+    assert client.post("/feed/1/save", json={"discussion": _DISCUSSION}).json()["attached"]
+    assert fake.uploads[0][1].startswith(b"%PDF")
+
+
+def test_prune_drops_the_highlights_with_the_story(tmp_path):
+    from discover_app.highlights import Mark, load_marks, store_marks
+    from discover_app.pipeline.candidates import prune_candidates
+
+    settings = _settings(tmp_path, candidate_max_age_days=1)
+    init_db(settings)
+    with connection(settings) as conn:
+        _add_candidate(conn, 1, "https://ex.com/a", "old", [1.0, 0, 0, 0])
+        conn.execute("UPDATE candidates SET fetched_at = '2020-01-01 00:00:00'")
+    store_marks(settings, 1, "orig", [Mark(**_MARK)], "https://ex.com/a")
+    prune_candidates(settings)
+    assert load_marks(settings, 1) == {"orig": [], "tr": []}
+
+
+def test_reader_page_highlighter_and_update_button():
+    from discover_app.ui import render_reader
+
+    item = {"id": 1, "url": "https://ex.com/a", "title": "T"}
+    video = render_reader(item, "<p>x</p>", False, None, True)
+    assert 'id="hlbar"' not in video and "hlPress" not in video
+    page = render_reader(item, "<p>x</p>", True, None, True, highlights={"orig": [], "tr": []})
+    assert 'id="hlbar"' in page and 'id="attach"' in page
+    assert '<script type="application/json" id="pdf-data">{"turns": null, "stale": false}' in page
+    # without Linkwarden there is no PDF and no update button
+    local = render_reader(item, "<p>x</p>", True, None, False, highlights={"orig": [], "tr": []})
+    assert 'id="hlbar"' in local and 'id="attach"' not in local and "pdfState" not in local
+
+
+def test_marks_are_found_again_and_cut(tmp_path):
+    """The page's mark logic: found by offsets, by context, by a unique
+    quote, else kept but not drawn; a new mark or the eraser cuts the
+    marks it overlaps."""
+    import json
+    import re
+    import shutil
+    import subprocess
+
+    from discover_app.ui import MARKS_JS
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    functions = "\n".join(
+        re.search(rf"^function {name}\(.*?^}}$", MARKS_JS, re.S | re.M)[0]
+        for name in ("hlLocate", "hlMake", "hlCut", "hlFind")
+    )
+    script = tmp_path / "marks.js"
+    script.write_text(
+        "const HL_CONTEXT = 32;\n"
+        + functions
+        + r"""
+const text = 'One two three. One two three. Four five.';
+const out = {};
+const at = (s, e, color = 'yellow') => hlMake(text, color, s, e);
+out.exact = hlFind(text, [at(4, 7)])[0].map(m => [m.start, m.end]);
+// the text moved: found by its context
+const moved = 'Intro. ' + text;
+out.context = hlFind(moved, [at(19, 22)])[0].map(m => [m.start, m.end]);
+// no context, but a unique quote
+out.unique = hlFind(moved, [{...at(30, 34), prefix: 'zz', suffix: 'zz'}])[0].map(m => m.quote);
+// a quote that is not there, or twice without context: kept, not drawn
+const [found, lost] = hlFind(moved, [{...at(0, 3), prefix: 'zz', suffix: 'zz'},
+  {color: 'red', start: 99, end: 104, quote: 'Gone!', prefix: '', suffix: ''}]);
+out.lost = [found.length, lost.length];
+// a green mark over the middle of a yellow one splits it; the eraser cuts
+let marks = hlCut(text, [at(0, 13)], 4, 7, 'green');
+out.split = marks.map(m => [m.color, m.quote]);
+marks = hlCut(text, marks, 0, 8, null);
+out.erased = marks.map(m => [m.color, m.quote]);
+process.stdout.write(JSON.stringify(out));
+"""
+    )
+    out = json.loads(
+        subprocess.run(  # noqa: S603 - our own script, node from PATH
+            [node, str(script)], capture_output=True, text=True, check=True
+        ).stdout
+    )
+    assert out["exact"] == [[4, 7]]
+    assert out["context"] == [[26, 29]]
+    assert out["unique"] == ["Four"]
+    assert out["lost"] == [0, 2]
+    assert out["split"] == [["yellow", "One "], ["green", "two"], ["yellow", " three"]]
+    assert out["erased"] == [["yellow", "three"]]
+
+
 def test_chat_markdown_is_escaped_in_the_page(tmp_path):
     """The page's formatter escapes model text before its few tags."""
     import re
     import shutil
     import subprocess
 
-    from discover_app.ui import CHAT_JS
+    from discover_app.ui import FORMAT_JS
 
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is not installed")
     functions = "\n".join(
-        re.search(rf"^function {name}\(.*?^}}$", CHAT_JS, re.S | re.M)[0]
+        re.search(rf"^function {name}\(.*?^}}$", FORMAT_JS, re.S | re.M)[0]
         for name in ("esc", "inline", "fmt")
     )
     text = (

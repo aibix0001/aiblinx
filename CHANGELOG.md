@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.9.0
+
+- **Buttons light only what is the case:** Save, Save to Exploring, Promote
+  and Archive each light only when the story is in their collection; an
+  archived story no longer shows Save lit. Save on a story filed elsewhere
+  moves it into Save's collection, and a tap on any lit button undoes the
+  save.
+- **Highlighter in the reader:** select text and mark it yellow, green or
+  red; tap a mark to recolour or erase it. Marks are kept per story, on
+  every device.
+- **One PDF with the article:** a story saved with a discussion or marks
+  gets one PDF in Linkwarden: the article as the reader shows it with its
+  marks, then the discussion. Before, the PDF held only the discussion.
+  "Update the PDF in Linkwarden" prints it again after new marks or turns.
+  `PDF_MAX_MB` (default 10) is the size limit; a bigger PDF is printed
+  again without pictures.
+- **Copy and share the link:** under "Open the original page", "Copy the
+  link" copies the story's URL, and "Share…" opens the phone's share sheet,
+  for example to add the story to Apple Reminders. Share shows only where
+  the browser has a share sheet.
+
 ## 0.8.0
 
 - **Archive:** the box button on every card and in the reader saves a story

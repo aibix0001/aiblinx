@@ -28,7 +28,7 @@ from .chat import (
     ChatRequest,
     SaveRequest,
     article_text,
-    attach_discussion,
+    attach_pdf,
     find_job,
     start_job,
     story,
@@ -40,6 +40,7 @@ from .clients.rss import subscribe
 from .clients.searxng import SearxngClient
 from .config import Settings, get_settings
 from .db import connection, get_meta, init_db
+from .highlights import MarksRequest, load_marks, store_marks
 from .html_text import card_summary, strip_html
 from .icons import ICONS, MANIFEST
 from .importers import import_bookmarks, import_urls, opml_feed_count, opml_feed_urls
@@ -223,9 +224,8 @@ def create_app() -> FastAPI:
         with connection() as conn:
             curated = [dict(row) for row in current_items(conn)]
             broad = [dict(row) for row in current_items(conn, section="broad")]
-            saved = {
-                row[0] for row in conn.execute("SELECT url FROM feedback WHERE axis = 'saved'")
-            }
+            # each button lights for its own collection only
+            filed = dict(conn.execute("SELECT url_key, section FROM saves"))
             promoted = {
                 row[0]
                 for row in conn.execute("SELECT url_key FROM saves WHERE section = 'curated'")
@@ -255,7 +255,7 @@ def create_app() -> FastAPI:
             settings = get_settings()
         for item in curated + broad:
             key = norm_url(item["url"] or "")
-            item["saved"] = key in saved
+            item["saved"] = filed.get(key) == ("broad" if item in broad else "curated")
             item["interest"] = interest.get(key)
             item["promoted"] = key in promoted
             item["explored"] = key in explored
@@ -520,20 +520,23 @@ def create_app() -> FastAPI:
             if row is None or not row["url"].startswith(("http://", "https://")):
                 raise HTTPException(status_code=404, detail="no such item")
             key = norm_url(row["url"])
-            saved = conn.execute(
-                "SELECT 1 FROM feedback WHERE axis = 'saved' AND url = ?", (key,)
-            ).fetchone()
             interest = conn.execute(
                 "SELECT value FROM feedback WHERE axis = 'interest' AND url = ? "
                 "ORDER BY id DESC LIMIT 1",
                 (key,),
             ).fetchone()
             # the one button that files the story on the other side
-            filed = conn.execute("SELECT section FROM saves WHERE url_key = ?", (key,)).fetchone()
-            if (section or served_section(conn, candidate_id)) == "broad":
+            filed = conn.execute(
+                "SELECT section, pdf_turns, pdf_stale FROM saves WHERE url_key = ?", (key,)
+            ).fetchone()
+            own = (
+                "broad" if (section or served_section(conn, candidate_id)) == "broad" else "curated"
+            )
+            if own == "broad":
                 promoted, explored = bool(filed and filed[0] == "curated"), None
             else:
                 promoted, explored = None, bool(filed and filed[0] == "broad")
+            saved = bool(filed and filed[0] == own)
             archived = bool(filed and filed[0] == "archive")
             prepared = conn.execute(
                 "SELECT lang, body, title_tr, body_tr FROM articles WHERE candidate_id = ?",
@@ -576,7 +579,7 @@ def create_app() -> FastAPI:
             render_reader(
                 item,
                 body,
-                saved=saved is not None,
+                saved=saved,
                 interest=interest[0] if interest else None,
                 linkwarden=settings.linkwarden_enabled,
                 promoted=promoted,
@@ -585,6 +588,11 @@ def create_app() -> FastAPI:
                 translation=translation,
                 chat=settings.chat_enabled,
                 learn=settings.reader_learn and text,
+                highlights=load_marks(settings, candidate_id) if text else None,
+                pdf={
+                    "turns": filed["pdf_turns"] if filed else None,
+                    "stale": bool(filed and filed["pdf_stale"]),
+                },
             ),
             headers={"Referrer-Policy": "no-referrer", "Cache-Control": "no-store"},
         )
@@ -601,6 +609,20 @@ def create_app() -> FastAPI:
             media_type="text/event-stream",
             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
         )
+
+    @app.put("/read/{candidate_id}/highlights", status_code=204, include_in_schema=False)
+    async def read_highlights(candidate_id: int, body: MarksRequest) -> Response:
+        """Keep the highlighter marks of one text of the story (the page
+        sends them all after every change)."""
+        settings = get_settings()
+        with connection(settings) as conn:
+            row = conn.execute(
+                "SELECT url FROM candidates WHERE id = ?", (candidate_id,)
+            ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="no such item")
+        store_marks(settings, candidate_id, body.variant, body.marks, row["url"])
+        return Response(status_code=204)
 
     @app.post("/read/{candidate_id}/opened", status_code=204, include_in_schema=False)
     def read_opened(
@@ -666,8 +688,8 @@ def create_app() -> FastAPI:
     @app.post("/feed/{candidate_id}/save", response_model=CaptureResponse)
     async def feed_save(candidate_id: int, body: SaveRequest | None = None) -> CaptureResponse:
         """ "+" capture: save this suggestion into Linkwarden (idempotent).
-        A discussion from the reader chat goes to the link as a PDF, also
-        when the story was saved before."""
+        A discussion from the reader chat or highlights go to the link as a
+        PDF, also when the story was saved before ("Update PDF")."""
         settings = get_settings()
         try:
             result = await capture_candidate(
@@ -680,9 +702,13 @@ def create_app() -> FastAPI:
             raise HTTPException(
                 status_code=502, detail=f"Linkwarden rejected the save: {exc}"
             ) from exc
-        if body and body.discussion and settings.linkwarden_enabled:
-            result["attached"] = await attach_discussion(
-                settings, candidate_id, body.discussion, link_id=result.get("linkwarden_id")
+        if settings.linkwarden_enabled:
+            result["attached"] = await attach_pdf(
+                settings,
+                candidate_id,
+                body.discussion if body else [],
+                body.variant if body else None,
+                link_id=result.get("linkwarden_id"),
             )
         return CaptureResponse(**result)
 
@@ -731,8 +757,8 @@ def create_app() -> FastAPI:
     @app.post("/feed/{candidate_id}/archive", response_model=CaptureResponse)
     async def feed_archive(candidate_id: int, body: SaveRequest | None = None) -> CaptureResponse:
         """Keep a story without any effect on the feed: saved into (or moved
-        to) the Archive collection. A discussion from the reader chat goes to
-        the link as a PDF, like Save."""
+        to) the Archive collection. A discussion from the reader chat or
+        highlights go to the link as a PDF, like Save."""
         settings = get_settings()
         try:
             result = await archive_candidate(settings, candidate_id)
@@ -742,9 +768,13 @@ def create_app() -> FastAPI:
             raise HTTPException(
                 status_code=502, detail=f"Linkwarden rejected the save: {exc}"
             ) from exc
-        if body and body.discussion and settings.linkwarden_enabled:
-            result["attached"] = await attach_discussion(
-                settings, candidate_id, body.discussion, link_id=result.get("linkwarden_id")
+        if settings.linkwarden_enabled:
+            result["attached"] = await attach_pdf(
+                settings,
+                candidate_id,
+                body.discussion if body else [],
+                body.variant if body else None,
+                link_id=result.get("linkwarden_id"),
             )
         return CaptureResponse(**result)
 

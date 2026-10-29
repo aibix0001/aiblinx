@@ -172,10 +172,32 @@ CREATE TABLE IF NOT EXISTS saves (
     embedding     BLOB,
     linkwarden_id INTEGER,
     created_at    TEXT NOT NULL DEFAULT (datetime('now')),
-    section       TEXT NOT NULL DEFAULT 'curated' -- 'broad': Exploring save, own
+    section       TEXT NOT NULL DEFAULT 'curated', -- 'broad': Exploring save, own
                                                   -- collection; 'archive': kept
                                                   -- without any effect on the feed
+    -- the PDF aiblinx put into the Linkwarden link: how many discussion
+    -- turns it holds (never their text; NULL = no PDF of ours), and whether
+    -- the highlights changed since
+    pdf_turns     INTEGER,
+    pdf_stale     INTEGER NOT NULL DEFAULT 0
 );
+
+-- Highlighter marks in the reader, per story and per text they were made on
+-- ('orig' or the translation 'tr'). Offsets count characters of the article
+-- text; quote, prefix and suffix find a mark again when the text moved.
+CREATE TABLE IF NOT EXISTS highlights (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    candidate_id INTEGER NOT NULL,
+    variant      TEXT NOT NULL CHECK (variant IN ('orig', 'tr')),
+    color        TEXT NOT NULL CHECK (color IN ('yellow', 'green', 'red')),
+    start        INTEGER NOT NULL,
+    end          INTEGER NOT NULL,
+    quote        TEXT NOT NULL,
+    prefix       TEXT NOT NULL DEFAULT '',
+    suffix       TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS highlights_candidate ON highlights(candidate_id, variant);
 
 -- Pages imported on the setup page (browser bookmarks export, pasted URLs):
 -- profile points like bookmarks, for installs without Linkwarden. They are
@@ -265,6 +287,8 @@ def init_db(settings: Settings | None = None) -> None:
             ("links", "collection_id INTEGER"),
             ("feedback", "section TEXT NOT NULL DEFAULT 'curated'"),
             ("saves", "section TEXT NOT NULL DEFAULT 'curated'"),
+            ("saves", "pdf_turns INTEGER"),
+            ("saves", "pdf_stale INTEGER NOT NULL DEFAULT 0"),
             ("page_checks", "published TEXT"),
         ):
             try:

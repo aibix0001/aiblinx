@@ -28,8 +28,10 @@ own server, and your reading profile is one SQLite file.
   translated in advance, so one tap switches the language. Nothing about what
   you open is recorded, and publishers never see where you came from.
 - **Talks about it.** Ask about a story under its text. The model knows the
-  article and can search the web through SearXNG. Save attaches the
-  conversation to the Linkwarden link as a PDF.
+  article and can search the web through SearXNG.
+- **Marks what matters.** Highlight words or lines in yellow, green or red.
+  Save puts one PDF into the Linkwarden link: the article with your marks,
+  then the conversation.
 - **Keeps a window open.** An *Exploring* section reserves 30% of the feed for
   topics outside your profile. What you save or vote there teaches Exploring
   which distractions you like, without changing your main feed, and Exploring

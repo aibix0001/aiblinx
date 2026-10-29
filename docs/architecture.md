@@ -181,21 +181,46 @@ answer is done, and nothing about the conversation is logged or written to
 the database. The page keeps the conversation on the device (`localStorage`,
 key `chat:<story id>`) for 30 days and at most 50 stories, so you can come
 back to a story later, see the answer that came in meanwhile and go on
-talking. When Linkwarden is connected, **Save** sends the
-conversation along. aiblinx renders one PDF (the story, the summary, the
-why-line, then the conversation with its searches) and uploads it into the
-Linkwarden link's PDF slot. A link has one PDF, so this one replaces the page
-PDF Linkwarden would make; the page stays preserved as a screenshot, a
-single-file HTML copy and readable text. The upload clears the link's preview
-picture, so aiblinx sets it again the way Linkwarden picks one: the story's
-title image, else Linkwarden's own screenshot of the page once it exists
-(within two minutes). For a story saved earlier, **Attach this discussion** sends
-the PDF again and replaces the previous one. If the upload fails, the save
-still counts and the page says so. Without Linkwarden there is nowhere to
-attach it, and the conversation stays only on the device.
+talking. The PDF that Save puts into Linkwarden is described under
+"Highlights and the saved PDF" below.
 
 The chat keeps the model's reasoning on and its own sampling settings, with a
 presence penalty against loops and no cap on the reply length.
+
+### Highlights and the saved PDF
+
+Selecting text in the article shows a bar under the selection with three
+marker colours (yellow, green, red) and an eraser; tapping a mark selects it
+again. Marks go over words or whole lines and are kept in the database per
+story and per text (`highlights`, the original and the translation apart),
+so they are there on the next visit and on other devices. The page sends all
+marks of a text with `PUT /read/{id}/highlights` after every change. A mark
+is stored by its character offsets in the article text (figures left out)
+and by its quote with 32 characters of context, so it is found again when a
+page that is extracted live changes a little. Marks go when the story is
+pruned (`CANDIDATE_MAX_AGE_DAYS`); a saved story keeps them in its PDF.
+
+When Linkwarden is connected and the story has a discussion or marks,
+**Save** (and **Archive**) prints one PDF in the browser service: the story,
+the summary and the why-line, the article as the reader shows it (the
+language on screen) with its marks in colour, then the conversation with its
+searches. It goes into the Linkwarden link's PDF slot. A link has one PDF, so
+this one replaces the page PDF Linkwarden would make; the page stays
+preserved as a screenshot, a single-file HTML copy and readable text. A save
+with neither marks nor a discussion uploads nothing and keeps Linkwarden's
+page PDF. A PDF over `PDF_MAX_MB` is printed again without pictures. Without
+the browser service, or when printing fails, only a discussion can still go,
+as a text PDF without the article.
+
+The upload clears the link's preview picture, so aiblinx sets it again the
+way Linkwarden picks one: the story's title image, else Linkwarden's own
+screenshot of the page once it exists (within two minutes). For a saved story
+whose marks changed or whose discussion grew, **Update the PDF in
+Linkwarden** prints it again and replaces the previous one. The database
+keeps how many discussion turns the PDF holds (never their text): a device
+without the discussion asks before an update would drop it. If the upload
+fails, the save still counts and the page says so. Without Linkwarden the
+marks stay in aiblinx and the conversation only on the device.
 
 ## Data
 
@@ -278,9 +303,10 @@ values count as unset.
 | `DIAGRAM_LLM_EFFORT` | empty | OpenRouter `reasoning.effort` for that model; empty = its default. `low` for Claude Haiku 5.5 |
 | `BROWSER_WS_URL` | `ws://browser:3000/` in compose, else empty | Playwright server for pages the plain fetch can't read; empty = off |
 | `BROWSER_CONCURRENCY` / `BROWSER_TIMEOUT_S` | `3` / `30` | pages rendered at once / page load timeout |
+| `PDF_MAX_MB` | `10` | largest PDF Save puts into Linkwarden; a bigger one is printed again without pictures |
 | `READER_LEARN` | `true` | a story read in the reader is a small positive signal |
 | `READER_OPEN_WEIGHT` | `0.1` | what a read counts, where a save or an upvote counts 1 (0–1) |
-| `READER_CHAT` | `true` | chat about a story in the reader; web search with `SEARXNG_URL`; the chat goes to Linkwarden as PDF on save |
+| `READER_CHAT` | `true` | chat about a story in the reader; web search with `SEARXNG_URL`; the chat goes into the Linkwarden PDF on save |
 | `APP_PASSWORD` | — | optional login |
 | `ADMIN_TOKEN` | — | protects `POST /admin/run-cycle` |
 | `PUBLIC_BASE_URL` | `http://localhost:8000` | used in the Atom feed |

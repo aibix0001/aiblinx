@@ -261,7 +261,22 @@ async def capture_candidate(
     state written (retry is safe).
     """
     async with _capture_lock:
-        return await _capture(settings, candidate_id, linkwarden, section=section)
+        result = await _capture(settings, candidate_id, linkwarden, section=section)
+        if result["status"] != "already_saved":
+            return result
+        # saved in another collection: Save moves it into its own
+        with connection(settings) as conn:
+            (url,) = conn.execute(
+                "SELECT url FROM candidates WHERE id = ?", (candidate_id,)
+            ).fetchone()
+            filed = conn.execute(
+                "SELECT section FROM saves WHERE url_key = ?", (norm_url(url),)
+            ).fetchone()
+            own = section or served_section(conn, candidate_id)
+        if filed is None or filed[0] == own:
+            return result
+        link_id = await _file_as(settings, candidate_id, own, linkwarden)
+    return {"status": "saved", "linkwarden_id": link_id}
 
 
 async def promote_candidate(
