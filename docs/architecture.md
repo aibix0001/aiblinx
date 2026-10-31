@@ -187,6 +187,44 @@ talking. The PDF that Save puts into Linkwarden is described under
 The chat keeps the model's reasoning on and its own sampling settings, with a
 presence penalty against loops and no cap on the reply length.
 
+### A second opinion
+
+The local model sometimes misreads a question or answers wrong. The setup
+page's "Second opinion" section sets up a second model on any
+OpenAI-compatible endpoint: an address, a token and a model, picked from the
+endpoint's `/models` list. With one set up, the chat shows "Check answers"
+under an answer. It sends the conversation to `POST /read/{id}/check`, and
+the server gives the second model what the local model had: the story's
+details, the article text in the language on screen and the conversation
+with its searches. The second model gives each answer a verdict (Correct,
+Partly correct or Wrong), says when a question was misread, and corrects
+the answers that are not right. With SearXNG it has the same `web_search`
+tool, and it keeps its own sampling settings. Its reply streams and is
+followed like a chat answer; its first event names the model.
+
+The reply becomes a turn labelled "Second opinion · <model>". The local
+model reads it with the questions that follow, as a message from your side,
+and Save puts it into the PDF with that label. transcribix gets it as a
+plain assistant turn: contract v1 has no field for the model.
+
+Two limits are set on the same page:
+
+- **Article text** (default 0: all of it). The local model gets the first
+  40,000 characters; when the article is longer, the prompt says so, and
+  the second model does not hold missing later facts against it.
+- **Longest answer** (default 8,000 characters, from 1,000 to 16,000). The
+  local model reads the reply with every later question, and a chat turn may
+  hold at most 16,000 characters. The prompt asks for a matching number of
+  words, and the server cuts the reply at the limit, marked with "[…]".
+  8,000 characters (about 2,000 tokens) leaves room for a verdict and
+  corrections on several answers.
+
+The settings live in the database (`meta`, keys `second_opinion_*`), not in
+the environment. The token never goes back to a page; a field left empty
+keeps the stored token, for the address it was entered for only. Pressing
+the button sends the article and the conversation to that provider;
+nothing about them is logged.
+
 ### Highlights and the saved PDF
 
 Selecting text in the article shows a bar under the selection with three
@@ -221,6 +259,34 @@ keeps how many discussion turns the PDF holds (never their text): a device
 without the discussion asks before an update would drop it. If the upload
 fails, the save still counts and the page says so. Without Linkwarden the
 marks stay in aiblinx and the conversation only on the device.
+
+### Views sent to transcribix
+
+With `TRANSCRIBIX_URL` and `TRANSCRIBIX_PUSH_TOKEN` set, aiblinx sends what
+it knows about each saved story to transcribix. It sends one record per
+Linkwarden link: the highlights of both texts, the interest vote, the section
+and collection, the source and the language. Stories that were never saved
+are never sent.
+
+- **Triggers.** A highlight change sends the record 10 minutes after the last
+  change. Save, Archive, Update PDF, a move between collections and an
+  interest vote send it within a minute. Unsave sends a delete.
+- **Discussions.** A discussion goes along only when Save, Archive or Update
+  PDF carries it from the page. The server keeps it in the outbox row until
+  transcribix has it, then deletes it.
+- **Outbox.** `link_view_outbox` holds one row per link, so triggers merge
+  and a later record always carries the newest discussion. A job sends due
+  rows every minute. It retries network errors, 5xx and 429 with backoff up
+  to an hour. Any other refusal marks the row failed. A row that changed
+  while its request was in flight is kept for the next run.
+- **Backfill.** Stories saved before the push was set up are queued once
+  with the command below. They go without discussions, because the server
+  holds none from the past; Update PDF sends one. `--again` queues every
+  save once more.
+
+  ```bash
+  docker compose exec -u app discover-app /app/.venv/bin/python -m discover_app.linkviews
+  ```
 
 ## Data
 
@@ -257,9 +323,13 @@ app, restore the copy and set the old model again.
 | POST | `/read/{id}/opened` | `?section=`: the reader page's report that its text was read (with `READER_LEARN`) |
 | POST | `/read/{id}/chat` | `{messages, lang}`: one chat answer about the story, as server-sent events; the first event is the job id |
 | GET | `/read/{id}/chat/{job}` | the same answer again from its first event, until an hour after it is done |
+| POST | `/read/{id}/check` | `{messages, lang}`: the second model's verdict on the chat's answers, followed like a chat answer |
+| POST | `/setup/second-opinion/models` | `{url, token}`: the second-opinion endpoint's model ids |
+| PUT / DELETE | `/setup/second-opinion` | keep (`{url, token, model, article_chars, answer_chars}`) or forget the second model |
 | GET | `/feed/version` | the current cycle, so an open feed page reloads when a newer one exists |
 | GET / POST / DELETE | `/feeds`, `/feeds/{id}` | list, add (`{url}`) and remove subscribed feeds |
 | GET / POST | `/topics`, `/topics/{name}` | Exploring topics |
+| GET | `/api/signals` | `?linkwarden_ids=1,2`: reading signals per Linkwarden link for transcribix (bearer `TRANSCRIBIX_SIGNALS_TOKEN`; outside the `APP_PASSWORD` login) |
 | GET / POST | `/login` | optional login |
 | GET | `/healthz` | status and counts |
 | POST | `/admin/run-cycle` | run a full cycle now (`X-Admin-Token`) |
@@ -309,5 +379,7 @@ values count as unset.
 | `READER_CHAT` | `true` | chat about a story in the reader; web search with `SEARXNG_URL`; the chat goes into the Linkwarden PDF on save |
 | `APP_PASSWORD` | — | optional login |
 | `ADMIN_TOKEN` | — | protects `POST /admin/run-cycle` |
+| `TRANSCRIBIX_SIGNALS_TOKEN` | — | bearer token for `GET /api/signals`; empty = the route is off |
+| `TRANSCRIBIX_URL`, `TRANSCRIBIX_PUSH_TOKEN` | — | push the views of saved stories to transcribix; both empty = off |
 | `PUBLIC_BASE_URL` | `http://localhost:8000` | used in the Atom feed |
 | `DATA_DIR` | `./data` (`/data` in the image) | database location |

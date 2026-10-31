@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+import pathlib
 import re
 import sqlite3
+import time
 from datetime import UTC, datetime
 
 import httpx
@@ -4509,7 +4511,8 @@ def test_reader_learns_nothing_when_off(tmp_path, monkeypatch):
 def test_reader_page_has_the_chat(tmp_path, monkeypatch):
     _, client = _chat_app(tmp_path, monkeypatch, _ChatLLM([]))
     page = client.get("/read/1").text
-    assert '<section class="chat" id="chat" data-linkwarden="1">' in page
+    assert '<section class="chat" id="chat" data-linkwarden="1" data-second="">' in page
+    assert 'id="check" hidden' in page
     assert 'id="attach"' in page and "in place of the page PDF" in page
     assert "__CHAT" not in page
 
@@ -6220,3 +6223,529 @@ def test_startup_runs_the_holds_migration(tmp_path, monkeypatch):
     with TestClient(app_mod.create_app()):
         pass
     assert ran == [settings]
+
+
+def test_api_signals_contract(tmp_path, monkeypatch):
+    """GET /api/signals (transcribix contract v1): off without its token,
+    401 on a wrong one, aiblinx vs hand links, unknown ids left out, and
+    open to the bearer token even behind APP_PASSWORD."""
+    token = "s3cret"  # noqa: S105 - test value
+    off = _no_linkwarden(tmp_path)
+    init_db(off)
+    _, client = _app_client(monkeypatch, off)
+    assert client.get("/api/signals?linkwarden_ids=1").status_code == 404
+
+    settings = _no_linkwarden(
+        tmp_path,
+        transcribix_signals_token=token,
+        app_password="hunter2",  # noqa: S106 - test value
+        linkwarden_archive_collection_id=31,
+    )
+    with connection(settings) as conn:
+        _add_candidate(conn, 1, "https://www.ex.com/a/", "A", [1, 0, 0, 0])
+        conn.execute(
+            "INSERT INTO saves(url, url_key, title, linkwarden_id, section, pdf_turns) "
+            "VALUES('https://www.ex.com/a/', 'ex.com/a', 'A', 1074, 'archive', 6)"
+        )
+        conn.execute("INSERT INTO links(id, url, embedded) VALUES(2000, 'https://hand.ex/b', 1)")
+        conn.execute(
+            "INSERT INTO links(id, url, embedded, collection_id) "
+            "VALUES(2001, 'https://hand.ex/c', 1, 17)"
+        )
+        conn.execute(
+            "INSERT INTO opens(candidate_id, url, section) VALUES(1, 'ex.com/a', 'curated')"
+        )
+        for start in (0, 10, 20):
+            conn.execute(
+                "INSERT INTO highlights(candidate_id, variant, color, start, end, quote) "
+                "VALUES(1, 'orig', 'red', ?, ?, 'q')",
+                (start, start + 5),
+            )
+    record_feedback(settings, 1, "interest", "down")
+    _, client = _app_client(monkeypatch, settings)
+    auth = {"Authorization": f"Bearer {token}"}
+
+    assert client.get("/api/signals?linkwarden_ids=1074").status_code == 401
+    bad = {"Authorization": "Bearer nope"}
+    assert client.get("/api/signals?linkwarden_ids=1074", headers=bad).status_code == 401
+    odd = {"Authorization": "Bearer \u00e9".encode("latin-1")}  # raw non-ASCII header
+    assert client.get("/api/signals?linkwarden_ids=1074", headers=odd).status_code == 401
+    assert client.get("/api/signals?linkwarden_ids=x", headers=auth).status_code == 422
+    too_many = ",".join(str(i) for i in range(201))
+    assert client.get(f"/api/signals?linkwarden_ids={too_many}", headers=auth).status_code == 422
+
+    got = client.get("/api/signals?linkwarden_ids=1074,2000,2001,999,1074", headers=auth)
+    assert got.status_code == 200
+    assert got.json() == [
+        {
+            "linkwarden_id": 1074,
+            "via": "aiblinx",
+            "collection_id": 31,
+            "section": "archive",
+            "interest": "down",
+            "opened": True,
+            "highlights": 3,
+            "discussion_turns": 6,
+        },
+        {
+            "linkwarden_id": 2000,
+            "via": "hand",
+            "collection_id": None,
+            "section": None,
+            "interest": None,
+            "opened": False,
+            "highlights": 0,
+            "discussion_turns": 0,
+        },
+        {
+            "linkwarden_id": 2001,
+            "via": "hand",
+            "collection_id": 17,
+            "section": None,
+            "interest": None,
+            "opened": False,
+            "highlights": 0,
+            "discussion_turns": 0,
+        },
+    ]
+    assert client.get("/api/signals", headers=auth).json() == []
+
+
+# --- link views pushed to transcribix (contract v1) ---
+
+_FIXTURE = pathlib.Path(__file__).parent / "fixtures" / "link_view_v1_example.json"
+
+
+def _push_settings(tmp_path, **overrides) -> Settings:
+    return _no_linkwarden(
+        tmp_path,
+        transcribix_url="https://tx.test",
+        transcribix_push_token="push-secret",  # noqa: S106 - test value
+        linkwarden_collection_id=17,
+        **overrides,
+    )
+
+
+def _saved_story(conn, link_id: int, url: str, cid: int = 1, title: str = "Example") -> None:
+    _add_candidate(conn, cid, url, title, [1, 0, 0, 0])
+    conn.execute(
+        "INSERT INTO saves(url, url_key, title, linkwarden_id, section, created_at) "
+        "VALUES(?, ?, ?, ?, 'curated', '2026-10-29 05:27:29')",
+        (url, norm_url(url), title, link_id),
+    )
+
+
+def _outbox(settings) -> list[dict]:
+    with connection(settings) as conn:
+        return [dict(r) for r in conn.execute("SELECT * FROM link_view_outbox")]
+
+
+def _due_now(settings) -> None:
+    with connection(settings) as conn:
+        conn.execute("UPDATE link_view_outbox SET due_at = 0")
+
+
+def _receiver(answers: list, seen: list):
+    """A fake transcribix: answers in turn (status, or an exception)."""
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        seen.append((request.method, request.url.path, request.headers["authorization"], body))
+        answer = answers.pop(0) if answers else 204
+        if isinstance(answer, Exception):
+            raise answer
+        if callable(answer):
+            return answer()
+        return httpx.Response(answer)
+
+    return httpx.AsyncClient(
+        base_url="https://tx.test",
+        headers={"Authorization": "Bearer push-secret"},
+        transport=httpx.MockTransport(handle),
+    )
+
+
+def test_link_view_payload_matches_contract_fixture(tmp_path):
+    from discover_app.linkviews import build_payload, queue_put
+
+    fixture = json.loads(_FIXTURE.read_text())
+    assert norm_url(fixture["url"]) == fixture["url_key"]
+    settings = _push_settings(tmp_path)
+    init_db(settings)
+    with connection(settings) as conn:
+        _saved_story(conn, 1074, fixture["url"])
+        conn.execute("INSERT INTO articles(candidate_id, lang) VALUES(1, 'en')")
+        conn.execute(
+            "INSERT INTO highlights(candidate_id, variant, color, start, end, quote, prefix, "
+            "suffix) VALUES(1, 'orig', 'red', 0, 7, 'Example', '', ' text')"
+        )
+        conn.execute(
+            "INSERT INTO feedback(candidate_id, url, axis, value, section) "
+            "VALUES(1, ?, 'interest', 'up', 'curated')",
+            (fixture["url_key"],),
+        )
+        queue_put(
+            conn,
+            settings,
+            fixture["url_key"],
+            discussion=fixture["discussion"],
+            now=datetime(2026, 10, 29, 5, 40, tzinfo=UTC),
+        )
+    (row,) = _outbox(settings)
+    assert build_payload(settings, row) == fixture
+
+
+async def test_link_view_outbox_rules(tmp_path):
+    from discover_app.linkviews import queue_delete, queue_put, send_link_views
+
+    off = _no_linkwarden(tmp_path)
+    init_db(off)
+    with connection(off) as conn:
+        _saved_story(conn, 7, "https://ex.com/a")
+        _add_candidate(conn, 2, "https://ex.com/unsaved", "U", [0, 1, 0, 0])
+        queue_put(conn, off, "ex.com/a")  # push not configured: nothing queued
+    assert _outbox(off) == []
+
+    settings = _push_settings(tmp_path)
+    talk = [{"role": "user", "content": "mine", "searches": []}]
+    with connection(settings) as conn:
+        queue_put(conn, settings, "ex.com/unsaved")  # not saved: out of scope
+        queue_put(conn, settings, "ex.com/a", discussion=talk)  # Save with a discussion
+    (row,) = _outbox(settings)
+    assert row["op"] == "put" and json.loads(row["discussion"]) == talk
+
+    # transcribix down: retried, and the discussion waits in the row
+    seen: list = []
+    async with _receiver([503], seen) as client:
+        assert await send_link_views(settings, client) == {"sent": 0, "retry": 1, "failed": 0}
+    (row,) = _outbox(settings)
+    assert row["attempts"] == 1 and row["due_at"] > 0 and row["discussion"]
+    assert seen[0][:3] == ("PUT", "/api/archive/v1/link-views/7", "Bearer push-secret")
+    first_stamp = seen[0][3]["updated_at"]
+
+    # a highlight change meanwhile: no discussion of its own, keeps the waiting one
+    with connection(settings) as conn:
+        queue_put(conn, settings, "ex.com/a", delay_s=600)
+    _due_now(settings)
+    async with _receiver([204], seen) as client:
+        assert (await send_link_views(settings, client))["sent"] == 1
+    body = seen[-1][3]
+    assert body["discussion"] == talk and body["updated_at"] > first_stamp
+    assert _outbox(settings) == []
+
+    # 429 and network errors are retried; other 4xx fail for good, text cleared
+    for answer in (429, httpx.ConnectError("down")):
+        with connection(settings) as conn:
+            queue_put(conn, settings, "ex.com/a")
+        async with _receiver([answer], seen) as client:
+            assert (await send_link_views(settings, client))["retry"] == 1
+        _due_now(settings)
+    with connection(settings) as conn:
+        queue_put(conn, settings, "ex.com/a", discussion=talk)
+    async with _receiver([422], seen) as client:
+        assert (await send_link_views(settings, client))["failed"] == 1
+    (row,) = _outbox(settings)
+    assert row["state"] == "failed" and row["discussion"] is None
+    requests = len(seen)
+    _due_now(settings)
+    async with _receiver([], seen) as client:
+        assert await send_link_views(settings, client) == {"sent": 0, "retry": 0, "failed": 0}
+    assert len(seen) == requests  # a failed row is not sent again
+
+    # a later trigger revives it; DELETE replaces a pending PUT, a re-save the DELETE
+    with connection(settings) as conn:
+        queue_put(conn, settings, "ex.com/a", discussion=talk)
+        queue_delete(conn, settings, 7)
+    (row,) = _outbox(settings)
+    assert (row["op"], row["state"], row["discussion"]) == ("delete", "pending", None)
+    with connection(settings) as conn:
+        queue_put(conn, settings, "ex.com/a")
+    (row,) = _outbox(settings)
+    assert (row["op"], row["discussion"]) == ("put", None)
+
+    # a trigger while the request is in flight: the 2xx must not drop the newer state
+    def upsert_then_ok():
+        with connection(settings) as conn:
+            queue_put(conn, settings, "ex.com/a", discussion=talk)
+        return httpx.Response(204)
+
+    _due_now(settings)
+    async with _receiver([upsert_then_ok], seen) as client:
+        assert (await send_link_views(settings, client))["sent"] == 1
+    (row,) = _outbox(settings)
+    assert row["state"] == "pending" and json.loads(row["discussion"]) == talk
+
+    _due_now(settings)
+    with connection(settings) as conn:
+        queue_delete(conn, settings, 7)
+    async with _receiver([204], seen) as client:
+        assert (await send_link_views(settings, client))["sent"] == 1
+    assert seen[-1][:2] == ("DELETE", "/api/archive/v1/link-views/7") and seen[-1][3] is None
+    assert _outbox(settings) == []
+
+
+async def test_link_view_triggers(tmp_path):
+    from discover_app.highlights import Mark, store_marks
+    from discover_app.pipeline.feedback import unsave_candidate
+    from discover_app.scheduler import build_scheduler
+
+    settings = _push_settings(tmp_path)
+    init_db(settings)
+    with connection(settings) as conn:
+        _saved_story(conn, 7, "https://ex.com/a")
+    store_marks(
+        settings, 1, "orig", [Mark(color="green", start=0, end=4, quote="Exam")], "https://ex.com/a"
+    )
+    (row,) = _outbox(settings)
+    assert row["due_at"] > time.time() + 500  # highlights wait 10 minutes
+
+    record_feedback(settings, 1, "interest", "up")
+    (row,) = _outbox(settings)
+    assert row["due_at"] <= time.time() and row["version"] == 2
+
+    await unsave_candidate(settings, 1)
+    (row,) = _outbox(settings)
+    assert row["op"] == "delete" and row["linkwarden_id"] == 7
+
+    assert "link_views" in {job.id for job in build_scheduler(settings).get_jobs()}
+    assert "link_views" not in {
+        job.id for job in build_scheduler(_no_linkwarden(tmp_path)).get_jobs()
+    }
+
+
+async def test_link_view_bad_row_does_not_block_the_rest(tmp_path):
+    from discover_app.linkviews import queue_put, send_link_views
+
+    settings = _push_settings(tmp_path)
+    init_db(settings)
+    with connection(settings) as conn:
+        _saved_story(conn, 7, "https://ex.com/a")
+        _saved_story(conn, 8, "https://ex.com/b", cid=2)
+        conn.execute("UPDATE saves SET created_at = 'not a date' WHERE linkwarden_id = 7")
+        queue_put(conn, settings, "ex.com/a")
+        queue_put(conn, settings, "ex.com/b")
+    seen: list = []
+    async with _receiver([], seen) as client:
+        assert await send_link_views(settings, client) == {"sent": 1, "retry": 0, "failed": 1}
+    assert [path for _, path, _, _ in seen] == ["/api/archive/v1/link-views/8"]
+    (row,) = _outbox(settings)
+    assert row["linkwarden_id"] == 7 and row["state"] == "failed"
+
+
+def test_link_view_backfill_queues_saved_stories_once(tmp_path):
+    from discover_app.linkviews import backfill_link_views
+
+    off = _no_linkwarden(tmp_path)
+    init_db(off)
+    with connection(off) as conn:
+        _saved_story(conn, 7, "https://ex.com/a")
+        _saved_story(conn, 8, "https://ex.com/b", cid=2)
+        _add_candidate(conn, 3, "https://ex.com/c", "C", [0, 0, 1, 0])
+        _add_candidate(conn, 4, "https://ex.com/d", "D", [0, 0, 0, 1])
+        conn.execute(
+            "INSERT INTO saves(url, url_key, title, linkwarden_id) VALUES"
+            "('https://ex.com/c', 'ex.com/c', 'C', NULL), ('https://ex.com/d', 'ex.com/d', 'D', 0)"
+        )
+    assert backfill_link_views(off) == 0  # push not configured
+    settings = _push_settings(tmp_path)
+    assert backfill_link_views(settings) == 2
+    rows = _outbox(settings)
+    assert sorted(r["linkwarden_id"] for r in rows) == [7, 8]
+    assert all(r["op"] == "put" and r["discussion"] is None for r in rows)
+    assert len({r["updated_at"] for r in rows}) == 1  # one stamp for the batch
+    assert backfill_link_views(settings) == 0  # once
+    assert [r["version"] for r in _outbox(settings)] == [1, 1]
+    assert backfill_link_views(settings, again=True) == 2
+
+
+# --- second opinion ---
+
+
+def _second_app(tmp_path, monkeypatch, local, other, search=None, setup=True, **config):
+    """The chat app with a second model set up: ``LLMClient`` hands out the
+    local fake or the other one by the model it is made for."""
+    from discover_app import app as app_mod
+    from discover_app import secondopinion
+
+    settings, client = _chat_app(tmp_path, monkeypatch, local, search)
+    if setup:
+        secondopinion.store(
+            settings,
+            secondopinion.SecondOpinion(
+                url="https://frontier.test/v1",
+                token="sk-secret",  # noqa: S106 - dummy
+                model="frontier-1",
+                **config,
+            ),
+        )
+    monkeypatch.setattr(
+        app_mod, "LLMClient", lambda s: other if s.llm_chat_model == "frontier-1" else local
+    )
+    return settings, client
+
+
+_CHECKED = [
+    {"role": "user", "content": "Who flies?"},
+    {
+        "role": "assistant",
+        "content": "Five astronauts.",
+        "searches": [
+            {"query": "artemis crew", "results": [{"title": "Crew", "url": "https://sx.example/1"}]}
+        ],
+    },
+]
+
+
+def test_second_opinion_checks_what_the_local_model_had(tmp_path, monkeypatch):
+    local, other = _ChatLLM([]), _ChatLLM([[("text", "Wrong: "), ("text", "four astronauts.")]])
+    settings, client = _second_app(tmp_path, monkeypatch, local, other)
+    before = _counts(settings)
+    resp = client.post("/read/1/check", json={"messages": _CHECKED, "lang": "en"})
+    assert resp.status_code == 200
+    events = _events(resp)
+    assert events[0] == {"type": "by", "model": "frontier-1"}
+    assert "".join(e["text"] for e in events if e["type"] == "text") == "Wrong: four astronauts."
+    assert events[-1] == {"type": "done"}
+    assert local.calls == []  # the local model is not asked
+    call = other.calls[0]
+    assert "presence_penalty" not in call  # the other model keeps its own sampling
+    system, ask = call["messages"]
+    assert system["role"] == "system" and "second opinion" in system["content"]
+    for part in ("The English text.", "The card summary of the story.", "You read about this."):
+        assert part in system["content"]
+    assert "https://ex.com/a" in system["content"]
+    assert ask["role"] == "user"
+    assert "### User\nWho flies?" in ask["content"]
+    assert "### Companion\n[Searched: artemis crew]\n- Crew https://sx.example/1" in ask["content"]
+    assert "Five astronauts." in ask["content"] and "Partly correct" in ask["content"]
+    assert _counts(settings) == before  # nothing about the talk is stored
+
+
+def test_second_opinion_is_off_without_a_model_or_an_answer(tmp_path, monkeypatch):
+    _, client = _second_app(tmp_path, monkeypatch, _ChatLLM([]), _ChatLLM([]), setup=False)
+    assert client.post("/read/1/check", json={"messages": _CHECKED}).status_code == 404
+    _, client = _second_app(tmp_path / "on", monkeypatch, _ChatLLM([]), _ChatLLM([]))
+    question = [{"role": "user", "content": "Who flies?"}]
+    assert client.post("/read/1/check", json={"messages": question}).status_code == 422
+
+
+def test_second_opinion_answer_is_cut_at_its_limit(tmp_path, monkeypatch):
+    other = _ChatLLM([[("text", "a" * 600), ("text", "b" * 600), ("text", "c" * 600)]])
+    _, client = _second_app(tmp_path, monkeypatch, _ChatLLM([]), other, answer_chars=1000)
+    events = _events(client.post("/read/1/check", json={"messages": _CHECKED}))
+    text = "".join(e["text"] for e in events if e["type"] == "text")
+    assert text == "a" * 600 + "b" * 396 + " […]"  # the limit holds the mark too
+    assert len(text) == 1000
+    assert events[-1] == {"type": "done"}
+    assert "at most 142 words" in other.calls[0]["messages"][1]["content"]
+
+
+async def test_second_opinion_cut_keeps_a_reply_a_valid_turn():
+    from discover_app.chat import MAX_MESSAGE_CHARS, ChatTurn
+    from discover_app.secondopinion import capped
+
+    async def reply():
+        yield {"type": "text", "text": "x" * (MAX_MESSAGE_CHARS + 50)}
+
+    text = "".join([e["text"] async for e in capped(reply(), MAX_MESSAGE_CHARS)])
+    ChatTurn(role="assistant", content=text, by="m")  # no validation error
+
+
+def test_second_opinion_article_limit_and_the_local_cut(tmp_path):
+    from discover_app import chat, secondopinion
+
+    item = {"title": "T", "url": "https://ex.com/a"}
+    text = "x" * (chat.CONTEXT_CHARS + 10_000)
+    config = secondopinion.SecondOpinion(url="https://f.test/v1", model="m")
+    whole = secondopinion.system_prompt(item, text, config, search=False)
+    assert text in whole  # 0: all of it
+    assert f"only the first {chat.CONTEXT_CHARS:,} characters" in whole
+    config.article_chars = 45_000
+    cut = secondopinion.system_prompt(item, text, config, search=False)
+    assert "x" * 45_000 + " […]" in cut and "x" * 45_001 not in cut
+    short = secondopinion.system_prompt(item, "short text", config, search=True)
+    assert "only the first" not in short and "web_search" in short
+
+
+def test_second_opinion_reaches_the_local_model_as_the_users(tmp_path, monkeypatch):
+    llm = _ChatLLM([[("text", "Thanks, four then.")]])
+    _, client = _chat_app(tmp_path, monkeypatch, llm)
+    messages = [
+        *_CHECKED,
+        {"role": "assistant", "content": "Wrong: four.", "by": "frontier-1"},
+        {"role": "user", "content": "So how many?"},
+    ]
+    client.post("/read/1/chat", json={"messages": messages})
+    sent = llm.calls[0]["messages"]
+    assert sent[-2] == {
+        "role": "user",
+        "content": "A second opinion from frontier-1 on your answers above:\n\nWrong: four.",
+    }
+    assert sent[-1] == {"role": "user", "content": "So how many?"}
+
+
+def test_second_opinion_settings_keep_the_token_off_the_page(tmp_path, monkeypatch):
+    from discover_app import secondopinion
+
+    settings, client = _second_app(tmp_path, monkeypatch, _ChatLLM([]), _ChatLLM([]), setup=False)
+    page = client.get("/setup").text
+    assert "<h2>Second opinion</h2>" in page and "Off." in page and "__SO_" not in page
+    body = {"url": "https://frontier.test/v1", "token": "sk-secret", "model": "frontier-1"}
+    assert client.put("/setup/second-opinion", json=body).status_code == 204
+    page = client.get("/setup").text
+    assert "sk-secret" not in page
+    assert 'value="https://frontier.test/v1"' in page and "Set. Leave empty to keep it" in page
+    assert 'value="8000"' in page  # the default answer limit
+    # an empty token keeps the stored one, for its own address only
+    client.put("/setup/second-opinion", json=body | {"token": "", "answer_chars": 4000})
+    kept = secondopinion.load(settings)
+    assert kept.token == "sk-secret"  # noqa: S105 - dummy
+    assert kept.answer_chars == 4000
+    client.put("/setup/second-opinion", json=body | {"token": "", "url": "https://evil.test/v1"})
+    assert secondopinion.load(settings).token == ""
+    too_long = body | {"answer_chars": 20_000}
+    assert client.put("/setup/second-opinion", json=too_long).status_code == 422
+    assert client.get("/read/1").text.count('data-second="frontier-1"') == 1
+    assert client.delete("/setup/second-opinion").status_code == 204
+    assert secondopinion.load(settings) is None
+    assert 'data-second=""' in client.get("/read/1").text
+
+
+def test_second_opinion_models_listing(tmp_path, monkeypatch):
+    from discover_app import secondopinion
+
+    seen = []
+
+    def endpoint(request):
+        seen.append((str(request.url), request.headers.get("authorization")))
+        if request.url.host == "down.test":
+            return httpx.Response(401)
+        return httpx.Response(200, json={"data": [{"id": "b-model"}, {"id": "a-model"}]})
+
+    real = secondopinion.list_models
+
+    async def listing(url, token):
+        async with httpx.AsyncClient(transport=httpx.MockTransport(endpoint)) as client:
+            return await real(url, token, client)
+
+    monkeypatch.setattr(secondopinion, "list_models", listing)
+    _, client = _second_app(tmp_path, monkeypatch, _ChatLLM([]), _ChatLLM([]))
+    url = "https://frontier.test/v1"
+    resp = client.post("/setup/second-opinion/models", json={"url": url})
+    assert resp.json() == {"models": ["a-model", "b-model"]}
+    # the stored token, since the address is the stored one
+    assert seen[-1] == ("https://frontier.test/v1/models", "Bearer sk-secret")
+    client.post("/setup/second-opinion/models", json={"url": "https://other.test/v1"})
+    assert seen[-1] == ("https://other.test/v1/models", None)
+    down = client.post("/setup/second-opinion/models", json={"url": "https://down.test/v1"})
+    assert down.status_code == 502 and down.json()["detail"] == "the endpoint answered 401"
+
+
+def test_second_opinion_is_labelled_in_the_pdf_and_left_out_for_transcribix():
+    from discover_app.chat import ChatTurn, dumped_turns
+    from discover_app.print_pdf import _SCRIPT
+
+    turns = [ChatTurn(role="assistant", content="Wrong.", by="frontier-1")]
+    assert dumped_turns(turns)[0]["by"] == "frontier-1"
+    assert "by" not in dumped_turns(turns, by=False)[0]
+    assert "'Second opinion · ' + turn.by" in _SCRIPT

@@ -349,6 +349,7 @@ def render_reader(
     explored: bool | None = None,
     translation: dict | None = None,
     chat: bool = False,
+    second: str = "",
     archived: bool = False,
     learn: bool = False,
     highlights: dict | None = None,
@@ -368,6 +369,7 @@ def render_reader(
     toggle swaps them. The article always opens in its own language.
     chat: whether the chat about the story sits under the text; with
     ``linkwarden`` a discussion goes to the saved link as a PDF.
+    second: the second-opinion model that "Check answers" asks; "" = none.
     learn: whether the page reports a read of the text (``LEARN_JS``).
     highlights: the story's marks by text (``{"orig": [...], "tr": [...]}``)
     for the highlighter; None = no highlighter (a video).
@@ -431,7 +433,7 @@ def render_reader(
         .replace("__LANGBTN__", lang_button)
         .replace("__HEADLINE__", headline)
         .replace("__TITLE__", title)
-        .replace("__CHAT__", _chat(linkwarden) if chat else "")
+        .replace("__CHAT__", _chat(linkwarden, second) if chat else "")
         .replace("__CHATJS__", FORMAT_JS + CHAT_JS if chat else "")
         .replace("__LEARNJS__", LEARN_JS if learn else "")
         .replace("__HLBAR__", _HLBAR if highlights is not None else "")
@@ -478,9 +480,10 @@ _ICON_SEND = (
 )
 
 
-def _chat(linkwarden: bool) -> str:
+def _chat(linkwarden: bool, second: str = "") -> str:
     """The chat under the article. The conversation stays on the device for
-    30 days; with Linkwarden, Save also puts it into the link's PDF."""
+    30 days; with Linkwarden, Save also puts it into the link's PDF. With a
+    second model, "Check answers" asks it for a second opinion."""
     note = (
         "The conversation stays on this device for 30 days. Save puts it into the "
         "Linkwarden link as a PDF, after the article and your highlights, in place "
@@ -489,7 +492,8 @@ def _chat(linkwarden: bool) -> str:
         else "The conversation stays on this device for 30 days."
     )
     return f"""\
-<section class="chat" id="chat" data-linkwarden="{"1" if linkwarden else ""}">
+<section class="chat" id="chat" data-linkwarden="{"1" if linkwarden else ""}" \
+data-second="{html.escape(second, quote=True)}">
   <h2>Talk about this story</h2>
   <div class="turns" id="turns" aria-live="polite"></div>
   <form class="ask" onsubmit="ask(event)">
@@ -499,6 +503,9 @@ def _chat(linkwarden: bool) -> str:
     <button type="submit" id="send" aria-label="Send"
       onmousedown="event.preventDefault()">{_ICON_SEND}</button>
   </form>
+  <button type="button" class="check" id="check" hidden onclick="check()"
+    title="Ask {html.escape(second, quote=True)} whether the answers are right"
+    >Check answers</button>
   <p class="chat-note">{note}</p>
 </section>"""
 
@@ -1063,7 +1070,8 @@ CHAT_JS = r"""
 const turns = [];
 const chatId = document.querySelector('.end .card').dataset.id;
 const CHAT_KEY = 'chat:' + chatId, CHAT_DAYS = 30, CHAT_KEEP = 50;
-let pending = null;  // {question, job}: the answer the server is writing
+const SECOND = document.getElementById('chat').dataset.second;
+let pending = null;  // {question, job} or {check, job}: the answer the server is writing
 function store() {
   try {
     if (turns.length || pending) {
@@ -1096,11 +1104,32 @@ function addTurn(cls) {
   document.getElementById('turns').append(el);
   return el;
 }
+function labelSecond(el, model) {
+  el.classList.add('second');
+  let who = el.querySelector('.who');
+  if (!who) { who = document.createElement('div'); who.className = 'who'; el.prepend(who); }
+  who.textContent = 'Second opinion · ' + model;
+}
+// "Check answers" when there is an answer no second opinion has followed
+function updateCheck() {
+  const last = turns[turns.length - 1];
+  const btn = document.getElementById('check');
+  btn.hidden = !(SECOND && last && last.role === 'assistant' && !last.by);
+  btn.disabled = document.getElementById('send').disabled;
+}
+async function check() {
+  if (document.getElementById('send').disabled) return;
+  pending = {check: true, job: null}; store();
+  await answer(fetch(`/read/${chatId}/check`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({messages: turns, lang: chatLang()})}));
+}
 function showSearch(el, search) {
   let box = el.querySelector('.searches');
   if (!box) {
     box = document.createElement('div'); box.className = 'searches';
-    el.prepend(box);
+    const who = el.querySelector('.who');  // a second opinion's label stays on top
+    if (who) who.after(box); else el.prepend(box);
   }
   const row = document.createElement('div');
   row.textContent = 'Searched: ' + search.query;
@@ -1132,7 +1161,7 @@ async function ask(ev) {
   box.focus({preventScroll: true});
   const mine = addTurn('user'); mine.textContent = question;
   box.value = '';
-  const history = turns.map(t => ({role: t.role, content: t.content}));
+  const history = turns.map(t => ({role: t.role, content: t.content, by: t.by}));
   history.push({role: 'user', content: question});
   pending = {question, job: null}; store();
   await answer(fetch(`/read/${chatId}/chat`, {
@@ -1145,9 +1174,11 @@ function follow() { return fetch(`/read/${chatId}/chat/${pending.job}`, {cache: 
 // more, and if that fails too keep it pending for the next visit.
 async function answer(request, retry = true) {
   const box = document.getElementById('question'), send = document.getElementById('send');
-  send.disabled = true;
+  send.disabled = true; updateCheck();
+  const checking = Boolean(pending.check);
   const bot = addTurn('bot'), text = document.createElement('div');
   text.className = 'text'; text.innerHTML = '<p class="wait">Thinking…</p>'; bot.append(text);
+  if (checking) labelSecond(bot, SECOND);
   const reply = {role: 'assistant', content: '', searches: []};
   let failed = false, done = false, gone = false;
   try {
@@ -1167,6 +1198,8 @@ async function answer(request, retry = true) {
         const event = JSON.parse(line.slice(6));
         if (event.type === 'job') {
           pending.job = event.id; store();
+        } else if (event.type === 'by') {
+          reply.by = event.model; labelSecond(bot, event.model);
         } else if (event.type === 'text') {
           reply.content += event.text; text.innerHTML = fmt(reply.content);
         } else if (event.type === 'search') {
@@ -1184,23 +1217,26 @@ async function answer(request, retry = true) {
   }
   const question = pending.question;
   if (done && !failed && reply.content.trim()) {
-    turns.push({role: 'user', content: question}, reply);
+    if (checking) turns.push(reply); else turns.push({role: 'user', content: question}, reply);
     pending = null;
     if (typeof updateAttach === 'function') updateAttach();
+  } else if (checking) {
+    text.innerHTML = '<p class="failed">No second opinion came back. Try again?</p>';
+    if (done || gone || !pending.job) pending = null;
   } else {
     text.innerHTML = '<p class="failed">No answer came back. Ask again?</p>';
     if (!box.value) box.value = question;
     if (done || gone || !pending.job) pending = null;
   }
   store();
-  send.disabled = false;
+  send.disabled = false; updateCheck();
 }
 // the discussion kept on this device, and an answer still pending
 function restoreChat() {
   pruneChats();
   let kept = null;
   try { kept = JSON.parse(localStorage.getItem(CHAT_KEY)); } catch (e) {}
-  if (!kept) return;
+  if (!kept) { updateCheck(); return; }
   for (const turn of kept.turns || []) {
     turns.push(turn);
     const el = addTurn(turn.role === 'user' ? 'user' : 'bot');
@@ -1208,12 +1244,16 @@ function restoreChat() {
     const text = document.createElement('div');
     text.className = 'text'; text.innerHTML = fmt(turn.content); el.append(text);
     for (const search of turn.searches || []) showSearch(el, search);
+    if (turn.by) labelSecond(el, turn.by);
   }
   if (typeof updateAttach === 'function') updateAttach();
+  updateCheck();
   pending = kept.pending || null;
   if (pending && pending.job) {
-    addTurn('user').textContent = pending.question;
+    if (!pending.check) addTurn('user').textContent = pending.question;
     answer(follow());
+  } else if (pending && pending.check) {
+    pending = null; store();
   } else if (pending) {
     // asked, but the page went before the server took it on
     document.getElementById('question').value = pending.question;
@@ -1587,7 +1627,14 @@ main > .meta .chip { background: var(--card); }  /* on the page, not a card */
   cursor: pointer; font: inherit; font-size: 15px;
 }
 .ask button { width: 56px; flex-shrink: 0; display: grid; place-items: center; }
-.ask button:disabled, .attach:disabled { opacity: 0.6; }
+.ask button:disabled, .attach:disabled, .check:disabled { opacity: 0.6; }
+.check {
+  align-self: flex-start; height: 40px; padding: 0 14px; border: 0; border-radius: 14px;
+  background: var(--btn); color: var(--btn-ink); cursor: pointer; font: inherit; font-size: 14px;
+}
+.check[hidden] { display: none; }
+.turn.second { border-left: 3px solid var(--accent); padding-left: 12px; }
+.turn .who { font-size: 0.72em; color: var(--muted); margin-bottom: 4px; }
 .attach { background: var(--save-on); color: var(--save-on-ink); padding: 0 16px; }
 __MARKCSS__.hlbar {
   position: fixed; z-index: 5; display: flex; gap: 8px; padding: 8px; border-radius: 999px;

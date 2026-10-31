@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 from .config import Settings, get_settings
+from .linkviews import send_link_views
 from .pipeline.cycle import run_cycle, run_poll
 
 
@@ -26,4 +28,12 @@ def build_scheduler(settings: Settings | None = None) -> AsyncIOScheduler:
         max_instances=1,
         coalesce=True,
     )
+    if settings.transcribix_push_enabled:
+        scheduler.add_job(
+            send_link_views,
+            IntervalTrigger(minutes=1),
+            id="link_views",
+            max_instances=1,
+            coalesce=True,
+        )
     return scheduler

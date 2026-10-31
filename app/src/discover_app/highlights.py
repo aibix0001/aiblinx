@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from .config import Settings
 from .db import connection
+from .linkviews import HIGHLIGHT_DELAY_S, queue_put
 from .urls import norm_url
 
 Variant = Literal["orig", "tr"]
@@ -75,3 +76,4 @@ def store_marks(
             ],
         )
         conn.execute("UPDATE saves SET pdf_stale = 1 WHERE url_key = ?", (norm_url(url),))
+        queue_put(conn, settings, norm_url(url), delay_s=HIGHLIGHT_DELAY_S)

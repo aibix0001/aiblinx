@@ -20,6 +20,7 @@ from fastapi.responses import (
     StreamingResponse,
 )
 
+from . import secondopinion
 from .article import Page, Unreachable, get_page
 from .auth import feed_token, password_ok, require_login, set_session
 from .chat import (
@@ -88,6 +89,8 @@ from .reader import (
 )
 from .scheduler import build_scheduler
 from .setup_ui import render_login, render_setup
+from .signals import MAX_IDS as MAX_SIGNAL_IDS
+from .signals import link_signals
 from .topics import list_topics, set_topic
 from .ui import render_page, render_reader
 from .urls import norm_url
@@ -342,6 +345,7 @@ def create_app() -> FastAPI:
             password_on=bool(settings.app_password),
             atom_url=f"{atom_url}?token={token}" if token else atom_url,
             has_feed=has_feed,
+            second=_second_settings(settings),
         )
 
     @app.post("/setup/import", response_model=ImportResponse)
@@ -392,6 +396,38 @@ def create_app() -> FastAPI:
             skipped=skipped,
             message=f"Added {added} {what}{note}. They shape your feed from the next update.",
         )
+
+    @app.post("/setup/second-opinion/models", include_in_schema=False)
+    async def second_opinion_models(body: secondopinion.ModelsRequest) -> dict:
+        """The models a second-opinion endpoint offers, for the setup page's
+        picker. An empty token means the stored one, for its own address
+        only."""
+        token = body.token or secondopinion.stored_token(get_settings(), body.url)
+        try:
+            return {"models": await secondopinion.list_models(body.url, token)}
+        except httpx.HTTPStatusError as exc:
+            raise HTTPException(
+                status_code=502, detail=f"the endpoint answered {exc.response.status_code}"
+            ) from exc
+        except (httpx.HTTPError, ValueError) as exc:
+            raise HTTPException(
+                status_code=502, detail=f"could not reach the endpoint ({type(exc).__name__})"
+            ) from exc
+
+    @app.put("/setup/second-opinion", status_code=204, include_in_schema=False)
+    def second_opinion_save(body: secondopinion.SecondOpinion) -> Response:
+        """Keep the second model's settings. An empty token keeps the stored
+        one, for its own address only."""
+        settings = get_settings()
+        if not body.token:
+            body.token = secondopinion.stored_token(settings, body.url)
+        secondopinion.store(settings, body)
+        return Response(status_code=204)
+
+    @app.delete("/setup/second-opinion", status_code=204, include_in_schema=False)
+    def second_opinion_clear() -> Response:
+        secondopinion.clear(get_settings())
+        return Response(status_code=204)
 
     @app.post("/setup/build", status_code=202)
     async def setup_build() -> dict:
@@ -496,6 +532,28 @@ def create_app() -> FastAPI:
         result = await run_cycle()
         return RunCycleResponse(**result)
 
+    @app.get("/api/signals", include_in_schema=False)
+    def api_signals(
+        linkwarden_ids: str = "",
+        authorization: Annotated[str, Header()] = "",
+    ) -> list[dict]:
+        """Reading signals per Linkwarden link for transcribix (contract v1).
+        Its own bearer token; without TRANSCRIBIX_SIGNALS_TOKEN the route is off."""
+        settings = get_settings()
+        expected = settings.transcribix_signals_token
+        if not expected:
+            raise HTTPException(status_code=404, detail="Not Found")
+        # bytes, so a non-ASCII header is a 401 rather than a TypeError
+        if not secrets.compare_digest(authorization.encode(), f"Bearer {expected}".encode()):
+            raise HTTPException(status_code=401, detail="bearer token required")
+        try:
+            ids = [int(part) for part in linkwarden_ids.split(",") if part.strip()]
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="linkwarden_ids: integers") from exc
+        if len(ids) > MAX_SIGNAL_IDS:
+            raise HTTPException(status_code=422, detail=f"at most {MAX_SIGNAL_IDS} linkwarden_ids")
+        return link_signals(settings, ids)
+
     # Feedback endpoints share the read endpoints' exposure model (personal
     # deployment): they mutate only local feedback state / the user's own
     # Linkwarden, and the PR-2 HTML page must be able to call them without a
@@ -587,6 +645,7 @@ def create_app() -> FastAPI:
                 archived=archived,
                 translation=translation,
                 chat=settings.chat_enabled,
+                second=_second_model(settings),
                 learn=settings.reader_learn and text,
                 highlights=load_marks(settings, candidate_id) if text else None,
                 pdf={
@@ -596,6 +655,16 @@ def create_app() -> FastAPI:
             ),
             headers={"Referrer-Policy": "no-referrer", "Cache-Control": "no-store"},
         )
+
+    def _second_settings(settings: Settings) -> dict | None:
+        config = secondopinion.load(settings)
+        if config is None:
+            return None
+        return config.model_dump(exclude={"token"}) | {"token_set": bool(config.token)}
+
+    def _second_model(settings: Settings) -> str:
+        config = secondopinion.load(settings) if settings.chat_enabled else None
+        return config.model if config else ""
 
     def _follow(job: ChatJob, job_id: str | None = None) -> StreamingResponse:
         async def events():
@@ -669,6 +738,50 @@ def create_app() -> FastAPI:
                 yield {"type": "error"}
             finally:
                 await llm.aclose()
+                if searxng is not None:
+                    await searxng.aclose()
+            yield {"type": "done"}
+
+        job_id, job = start_job(candidate_id, answer())
+        return _follow(job, job_id)
+
+    @app.post("/read/{candidate_id}/check", include_in_schema=False)
+    async def read_check(candidate_id: int, body: ChatRequest) -> StreamingResponse:
+        """A second opinion on the chat's answers from the model set on the
+        setup page: the conversation and what the local model had go to it,
+        and its verdict comes back like a chat answer (followed the same
+        way). Its first event names the model."""
+        settings = get_settings()
+        config = secondopinion.load(settings) if settings.chat_enabled else None
+        if config is None:
+            raise HTTPException(status_code=404, detail="no second opinion is set up")
+        if body.messages[-1].role != "assistant":
+            raise HTTPException(status_code=422, detail="there is no answer to check")
+        try:
+            item = story(settings, candidate_id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail="no such item") from exc
+
+        async def answer():
+            local = LLMClient(settings)  # the article as the reader shows it
+            other = LLMClient(secondopinion.client_settings(settings, config))
+            searxng = SearxngClient(settings) if settings.searxng_url else None
+            yield {"type": "by", "model": config.model}
+            try:
+                text = await article_text(settings, item, body.lang, local)
+                system = secondopinion.system_prompt(item, text, config, search=searxng is not None)
+                chat = Chat(other, searxng, system, [], sampling={})
+                chat.messages.append(
+                    {"role": "user", "content": secondopinion.request(body.messages, config)}
+                )
+                async for event in secondopinion.capped(chat.run(), config.answer_chars):
+                    yield event
+            except Exception as exc:  # noqa: BLE001 - the page shows it; never the text
+                log.warning("second opinion: the model call failed: %s", type(exc).__name__)
+                yield {"type": "error"}
+            finally:
+                await local.aclose()
+                await other.aclose()
                 if searxng is not None:
                     await searxng.aclose()
             yield {"type": "done"}

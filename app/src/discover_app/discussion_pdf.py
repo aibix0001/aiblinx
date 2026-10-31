@@ -75,7 +75,7 @@ def render_discussion(
     item: dict, summary: str, why: str, turns: list[dict], saved_at: datetime | None = None
 ) -> bytes:
     """The PDF for one story. ``item``: title, url, source, published_at.
-    ``turns``: ``{"role": "user" | "assistant", "content", "searches"}``,
+    ``turns``: ``{"role": "user" | "assistant", "content", "searches", "by"}``,
     searches as ``[{"query", "results": [{"title", "url"}]}]``."""
     saved_at = saved_at or datetime.now(UTC)
     doc = _Doc()
@@ -101,7 +101,8 @@ def render_discussion(
     for turn in turns:
         doc.ln(2)
         mine = turn["role"] == "user"
-        doc.para("You" if mine else "aiblinx", size=10, style="B", color=100)
+        who = "You" if mine else f"Second opinion · {turn['by']}" if turn.get("by") else "aiblinx"
+        doc.para(who, size=10, style="B", color=100)
         for search in turn.get("searches") or []:
             doc.para(f"Searched: {search.get('query', '')}", size=9, color=100)
             for result in search.get("results") or []:

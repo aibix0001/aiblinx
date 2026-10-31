@@ -186,6 +186,14 @@ class Settings(BaseSettings):
     # Optional login: empty = open (a private self-hosted feed); set = every
     # page and action needs the password once per device (session cookie).
     app_password: str = ""
+    # transcribix reads per-link signals from GET /api/signals with this bearer
+    # token (its TRANSCRIBIX_AIBLINX_SIGNALS_TOKEN). Empty = the route is off.
+    transcribix_signals_token: str = ""
+    # aiblinx pushes the views of saved stories (highlights, saved discussions,
+    # signals) to transcribix: its base URL and the bearer token its receiver
+    # checks (its TRANSCRIBIX_AIBLINX_PUSH_TOKEN). Both empty = no push.
+    transcribix_url: str = ""
+    transcribix_push_token: str = ""
 
     # --- scheduler (5-field crontab, UTC) ---
     # poll offset from minute 0 so it never fires together with cycle_cron
@@ -237,6 +245,11 @@ class Settings(BaseSettings):
     def chat_enabled(self) -> bool:
         """The reader chat needs the chat model."""
         return self.reader_chat and bool(self.llm_chat_model)
+
+    @property
+    def transcribix_push_enabled(self) -> bool:
+        """The link-views push runs only with both its URL and its token."""
+        return bool(self.transcribix_url and self.transcribix_push_token)
 
     @property
     def linkwarden_enabled(self) -> bool:

@@ -76,7 +76,8 @@ for (const turn of JSON.parse(document.getElementById('turns-data').textContent)
   const mine = turn.role === 'user';
   el.className = 'turn ' + (mine ? 'user' : 'bot');
   const who = document.createElement('div');
-  who.className = 'who'; who.textContent = mine ? 'You' : 'aiblinx';
+  who.className = 'who';
+  who.textContent = mine ? 'You' : turn.by ? 'Second opinion · ' + turn.by : 'aiblinx';
   el.append(who);
   for (const search of turn.searches || []) {
     const row = document.createElement('div');

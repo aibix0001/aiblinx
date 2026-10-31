@@ -32,6 +32,7 @@ from datetime import UTC, datetime, timedelta
 from ..clients.linkwarden import LinkwardenClient
 from ..config import Settings
 from ..db import connection, get_meta, set_meta
+from ..linkviews import queue_delete, queue_put
 from ..urls import norm_url
 
 log = logging.getLogger(__name__)
@@ -238,6 +239,8 @@ def record_feedback(
                 section or served_section(conn, candidate_id),
             ),
         )
+        if axis == "interest":
+            queue_put(conn, settings, url_key)
     return url_key
 
 
@@ -371,6 +374,7 @@ async def _file_as(
                 "UPDATE links SET collection_id = ? WHERE id = ?",
                 [(target, link_id) for link_id in link_ids],
             )
+        queue_put(conn, settings, url_key)
     return min(link_ids) if link_ids else None
 
 
@@ -416,6 +420,11 @@ async def unsave_candidate(
                 if owns_client:
                     await linkwarden.aclose()
         with connection(settings) as conn:
+            for (save_link,) in conn.execute(
+                "SELECT linkwarden_id FROM saves WHERE url_key = ? AND linkwarden_id > 0",
+                (url_key,),
+            ).fetchall():
+                queue_delete(conn, settings, save_link)
             conn.execute("DELETE FROM saves WHERE url_key = ?", (url_key,))
             conn.execute("DELETE FROM feedback WHERE axis = 'saved' AND url = ?", (url_key,))
             for link_id in link_ids:
@@ -489,6 +498,7 @@ async def _capture(
                 section,
             ),
         )
+        queue_put(conn, settings, url_key)
     if settings.linkwarden_enabled:
         log.info("capture: candidate %d saved to Linkwarden as link %s", candidate_id, link_id)
         return {"status": "saved", "linkwarden_id": link_id}

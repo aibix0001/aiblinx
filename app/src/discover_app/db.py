@@ -199,6 +199,23 @@ CREATE TABLE IF NOT EXISTS highlights (
 );
 CREATE INDEX IF NOT EXISTS highlights_candidate ON highlights(candidate_id, variant);
 
+-- Records waiting to go to transcribix (linkviews.py): one row per Linkwarden
+-- link, so triggers coalesce. discussion holds the turns a Save / Archive /
+-- Update PDF carried, only until the row is delivered or fails for good.
+-- version is bumped on every upsert: an answer to an older send never drops
+-- a newer state.
+CREATE TABLE IF NOT EXISTS link_view_outbox (
+    linkwarden_id INTEGER PRIMARY KEY,
+    op            TEXT NOT NULL CHECK (op IN ('put', 'delete')),
+    discussion    TEXT,                         -- JSON turns, or NULL
+    updated_at    TEXT NOT NULL,                -- the record's updated_at (ISO, UTC)
+    due_at        REAL NOT NULL,                -- epoch seconds
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    last_error    TEXT,
+    state         TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'failed')),
+    version       INTEGER NOT NULL DEFAULT 1
+);
+
 -- Pages imported on the setup page (browser bookmarks export, pasted URLs):
 -- profile points like bookmarks, for installs without Linkwarden. They are
 -- not saves, so they are neither listed in Saved nor pushed to Linkwarden.

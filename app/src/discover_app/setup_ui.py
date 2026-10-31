@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import html
 
+from .secondopinion import ANSWER_CHARS
 from .ui import HEAD_TAGS, THEME_CSS
 
 _TOPIC = (
@@ -38,8 +39,12 @@ def render_setup(
     password_on: bool,
     atom_url: str,
     has_feed: bool,
+    second: dict | None = None,
 ) -> str:
-    """counts: bookmarks, imports, saves, upvotes (what the profile has to go on)."""
+    """counts: bookmarks, imports, saves, upvotes (what the profile has to go on).
+    second: the second-opinion model's settings (url, model, token_set,
+    article_chars, answer_chars), None when there is none; the token itself
+    never comes to the page."""
     topic_boxes = "\n".join(
         _TOPIC.format(
             name=html.escape(t["name"], quote=True),
@@ -120,7 +125,65 @@ def render_setup(
         .replace("__CONNECTIONS__", connections)
         .replace("__ATOM__", atom)
         .replace("__BUILD__", build)
+        .replace("__SECOND__", _second(second))
     )
+
+
+def _second(second: dict | None) -> str:
+    on = second is not None
+    second = second or {}
+    model = second.get("model", "")
+    return (
+        _SECOND.replace("__SO_URL__", html.escape(second.get("url", ""), quote=True))
+        .replace(
+            "__SO_TOKEN_HINT__",
+            "Set. Leave empty to keep it" if second.get("token_set") else "If it needs one",
+        )
+        .replace(
+            "__SO_MODEL__",
+            f'<option value="{html.escape(model, quote=True)}">{html.escape(model)}</option>'
+            if model
+            else '<option value="">Load the models first</option>',
+        )
+        .replace("__SO_ARTICLE__", str(second.get("article_chars", 0)))
+        .replace("__SO_ANSWER__", str(second.get("answer_chars", ANSWER_CHARS)))
+        .replace("__SO_OFF__", "" if on else " hidden")
+        .replace(
+            "__SO_STATE__",
+            f"On: the reader chat can check its answers with {html.escape(model)}."
+            if on
+            else "Off.",
+        )
+    )
+
+
+_SECOND = """\
+<section>
+  <h2>Second opinion</h2>
+  <p>An external model checks the reader chat's answers when you press "Check
+  answers", and corrects the wrong ones. It gets the article and the
+  conversation: they leave your network for that provider. Any
+  OpenAI-compatible endpoint works.</p>
+  <label class="hint" for="so-url">Endpoint</label>
+  <input type="url" id="so-url" placeholder="https://api.openai.com/v1" value="__SO_URL__">
+  <label class="hint" for="so-token">Token</label>
+  <input type="password" id="so-token" autocomplete="off" placeholder="__SO_TOKEN_HINT__">
+  <div class="row">
+    <button class="btn soft" id="so-load" onclick="loadModels()">Load models</button>
+    <select id="so-model" aria-label="Model" style="flex: 1; min-width: 0;">__SO_MODEL__</select>
+  </div>
+  <label class="hint" for="so-article">Article text it gets, in characters (0: all of it;
+  the local model gets the first 40,000)</label>
+  <input type="number" id="so-article" min="0" step="1000" value="__SO_ARTICLE__">
+  <label class="hint" for="so-answer">Longest answer, in characters (1,000 to 16,000). The
+  local model reads it with every later question.</label>
+  <input type="number" id="so-answer" min="1000" max="16000" step="1000" value="__SO_ANSWER__">
+  <div class="row">
+    <button class="btn" id="so-save" onclick="saveSecond()">Save</button>
+    <button class="btn soft" onclick="clearSecond()"__SO_OFF__>Turn off</button>
+  </div>
+  <p class="hint" id="so-status" role="status">__SO_STATE__</p>
+</section>"""
 
 
 def render_login() -> str:
@@ -166,7 +229,7 @@ textarea {
   width: 100%; min-height: 96px; border-radius: 14px; border: 1px solid var(--line);
   background: var(--bg); color: var(--ink); font: inherit; font-size: 15px; padding: 10px 12px;
 }
-input[type="password"], input[type="url"] {
+input[type="password"], input[type="url"], input[type="number"], select {
   width: 100%; height: 48px; border-radius: 14px; border: 1px solid var(--line);
   background: var(--bg); color: var(--ink); font: inherit; font-size: 16px; padding: 0 12px;
 }
@@ -259,6 +322,8 @@ __OPML_BUTTON__
   <ul class="status">__CONNECTIONS__</ul>
   __ATOM__
 </section>
+
+__SECOND__
 
 <section>
   <h2>Your feed</h2>
@@ -355,6 +420,47 @@ async function addFeed() {
   finally { button.disabled = false; }
 }
 loadFeeds();
+function detail(data, status) {
+  return typeof data.detail === 'string' ? data.detail : 'check the fields (' + status + ')';
+}
+function secondEndpoint() {
+  return {url: document.getElementById('so-url').value.trim(),
+    token: document.getElementById('so-token').value.trim()};
+}
+async function loadModels() {
+  const btn = document.getElementById('so-load'), pick = document.getElementById('so-model');
+  btn.disabled = true; say('so-status', 'Loading models…');
+  try {
+    const resp = await fetch('/setup/second-opinion/models', {method: 'POST',
+      headers: {'Content-Type': 'application/json'}, body: JSON.stringify(secondEndpoint())});
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(detail(data, resp.status));
+    const keep = pick.value;
+    pick.replaceChildren(...data.models.map(id => {
+      const option = document.createElement('option');
+      option.value = option.textContent = id;
+      return option;
+    }));
+    if (data.models.includes(keep)) pick.value = keep;
+    say('so-status', data.models.length + ' models. Pick one and save.');
+  } catch (e) { say('so-status', 'Could not load models: ' + e.message); }
+  finally { btn.disabled = false; }
+}
+async function saveSecond() {
+  const body = {...secondEndpoint(), model: document.getElementById('so-model').value,
+    article_chars: Number(document.getElementById('so-article').value) || 0,
+    answer_chars: Number(document.getElementById('so-answer').value) || 8000};
+  if (!body.model) { say('so-status', 'Load the models and pick one first.'); return; }
+  const resp = await fetch('/setup/second-opinion', {method: 'PUT',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  if (resp.ok) { location.reload(); return; }
+  say('so-status', 'Could not save: ' + detail(await resp.json().catch(() => ({})), resp.status));
+}
+async function clearSecond() {
+  if (!confirm('Turn the second opinion off and forget its token?')) return;
+  const resp = await fetch('/setup/second-opinion', {method: 'DELETE'});
+  if (resp.ok) location.reload(); else say('so-status', 'Could not turn it off.');
+}
 async function build() {
   const btn = document.getElementById('build');
   btn.disabled = true;

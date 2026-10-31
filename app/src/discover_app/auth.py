@@ -25,9 +25,10 @@ _COOKIE_MAX_AGE = 400 * 24 * 3600  # browsers cap cookie lifetime at ~400 days
 
 # Reachable without the password: the login itself, the health check (Docker),
 # the home-screen manifest and icons (fetched by the OS without cookies), and
-# the admin routes, which have their own X-Admin-Token.
+# the admin routes, which have their own X-Admin-Token, and the service API
+# (/api/), which has its own bearer token.
 _OPEN_PATHS = {"/login", "/healthz", "/manifest.webmanifest"}
-_OPEN_PREFIXES = ("/icons/", "/admin/")
+_OPEN_PREFIXES = ("/icons/", "/admin/", "/api/")
 
 
 def _derive(password: str, purpose: str) -> str:

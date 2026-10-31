@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.10.0
+
+- **Second opinion in the reader chat:** set up an external model on any
+  OpenAI-compatible endpoint on the setup page (address, token, a model
+  from its list). "Check answers" sends it the article and the
+  conversation; it gives each answer a verdict and corrects the wrong ones.
+  Its reply stays in the conversation and the PDF, labelled with the model.
+  The article text it gets (default: all of it) and its longest answer
+  (default 8,000 characters) are set on the same page.
+- **Views sent to transcribix (optional):** with `TRANSCRIBIX_URL` and
+  `TRANSCRIBIX_PUSH_TOKEN` set, aiblinx sends transcribix one record per
+  saved story: highlights, interest vote, section and collection, and the
+  discussion that Save, Archive or Update PDF carries. An outbox retries
+  until transcribix has it; Unsave sends a delete. Stories saved earlier
+  are queued once with a backfill command. `GET /api/signals`, behind
+  `TRANSCRIBIX_SIGNALS_TOKEN`, answers transcribix's reading signals per
+  Linkwarden link. Both are off while their settings are empty.
+
 ## 0.9.0
 
 - **Buttons light only what is the case:** Save, Save to Exploring, Promote

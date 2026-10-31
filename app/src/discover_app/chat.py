@@ -42,6 +42,7 @@ from .config import Settings
 from .db import connection
 from .highlights import Variant, load_marks
 from .html_text import card_summary, strip_html
+from .linkviews import queue_put
 from .pipeline.enrich import PAGE_HEADERS
 from .print_pdf import make_pdf
 from .reader import extract_article
@@ -108,6 +109,7 @@ class ChatTurn(BaseModel):
     role: Literal["user", "assistant"]
     content: str = Field(max_length=MAX_MESSAGE_CHARS)
     searches: list[Search] = Field(default=[], max_length=MAX_ROUNDS * 3)
+    by: str | None = Field(default=None, max_length=200)  # a second opinion's model
 
 
 class ChatRequest(BaseModel):
@@ -192,6 +194,22 @@ async def article_text(
     return plain_text(body) if body else ""
 
 
+def story_lines(item: dict) -> list[str]:
+    """The story's details for a prompt, one per line."""
+    lines = [
+        f"Title: {item['title']}",
+        f"Source: {item.get('source') or ''}",
+        f"URL: {item['url']}",
+    ]
+    if item.get("published_at"):
+        lines.append(f"Published: {item['published_at']}")
+    if item.get("summary"):
+        lines.append(f"Summary: {item['summary']}")
+    if item.get("why"):
+        lines.append(f"Why aiblinx picked it for the user: {item['why']}")
+    return lines
+
+
 def system_prompt(item: dict, text: str, search: bool) -> str:
     if len(text) > CONTEXT_CHARS:
         text = text[:CONTEXT_CHARS] + " […]"
@@ -213,15 +231,7 @@ def system_prompt(item: dict, text: str, search: bool) -> str:
         "for you to follow."
     )
     lines.append("")
-    lines.append(f"Title: {item['title']}")
-    lines.append(f"Source: {item.get('source') or ''}")
-    lines.append(f"URL: {item['url']}")
-    if item.get("published_at"):
-        lines.append(f"Published: {item['published_at']}")
-    if item.get("summary"):
-        lines.append(f"Summary: {item['summary']}")
-    if item.get("why"):
-        lines.append(f"Why aiblinx picked it for the user: {item['why']}")
+    lines.extend(story_lines(item))
     lines.append("")
     lines.append("Article text:" if text else "The article text is not available.")
     if text:
@@ -233,7 +243,16 @@ def _history(turn: ChatTurn, n: int) -> list[dict[str, Any]]:
     """A past turn as the model saw it: an answer's searches go back in as
     tool calls with their results (titles and addresses). Without them the
     model read its own "I searched" with nothing behind it and reasoned in
-    circles."""
+    circles. A second opinion goes in as the user's: another model's
+    check of the answers before it."""
+    if turn.by:
+        return [
+            {
+                "role": "user",
+                "content": f"A second opinion from {turn.by} on your answers above:\n\n"
+                + turn.content,
+            }
+        ]
     out: list[dict[str, Any]] = []
     if turn.role == "assistant" and turn.searches:
         ids = [f"h{n}_{i}" for i in range(len(turn.searches))]
@@ -270,9 +289,16 @@ class Chat:
     """One message's run: the model's answer, with its searches."""
 
     def __init__(
-        self, llm: LLMClient, searxng: SearxngClient | None, system: str, turns: list[ChatTurn]
+        self,
+        llm: LLMClient,
+        searxng: SearxngClient | None,
+        system: str,
+        turns: list[ChatTurn],
+        sampling: dict[str, Any] | None = None,
     ) -> None:
         self.llm = llm
+        # the local model's; another model keeps its own defaults
+        self.sampling = {"presence_penalty": PRESENCE_PENALTY} if sampling is None else sampling
         self.searxng = searxng
         self.messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
         for n, turn in enumerate(turns):
@@ -282,7 +308,7 @@ class Chat:
         """The model's reply. On HTTP 400 with the tool the call goes again
         without it, and the chat goes on without search (logged once)."""
         while True:
-            kwargs: dict[str, Any] = {"presence_penalty": PRESENCE_PENALTY}
+            kwargs: dict[str, Any] = dict(self.sampling)
             if tools:
                 kwargs["tools"] = [SEARCH_TOOL]
                 kwargs["tool_choice"] = "auto"
@@ -460,6 +486,13 @@ def _variant_lang(settings: Settings, candidate_id: int, variant: str) -> str | 
     return "en" if row["lang"] == "de" else "de"
 
 
+def dumped_turns(turns: list[ChatTurn], by: bool = True) -> list[dict]:
+    """The turns as plain data: {role, content, searches, by} each; without
+    ``by`` for transcribix (contract v1 has none, a second opinion goes as
+    an assistant turn)."""
+    return [turn.model_dump(exclude=None if by else {"by"}) for turn in turns]
+
+
 async def attach_pdf(
     settings: Settings,
     candidate_id: int,
@@ -477,6 +510,11 @@ async def attach_pdf(
     given), a PDF of ours whose marks were all erased is printed again."""
     marks = load_marks(settings, candidate_id)
     item = story(settings, candidate_id)
+    if turns:
+        with connection(settings) as conn:
+            queue_put(
+                conn, settings, norm_url(item["url"]), discussion=dumped_turns(turns, by=False)
+            )
     stale = False
     if variant is None:
         variant = "tr" if marks["tr"] and not marks["orig"] else "orig"
@@ -504,7 +542,7 @@ async def attach_pdf(
     finally:
         if llm is not None:
             await llm.aclose()
-    dumped = [turn.model_dump() for turn in turns]
+    dumped = dumped_turns(turns)
     pdf, with_marks = await make_pdf(settings, item, body, marks[variant], dumped)
     if pdf is None:
         return False
